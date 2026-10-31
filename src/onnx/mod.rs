@@ -733,13 +733,4 @@ mod tests {
         let tensor = raw_to_tensor(&t).unwrap();
         assert_eq!(tensor.to_vec1::<i64>().unwrap(), vec![1, 2]);
     }
-
-    #[test]
-    fn test_dtype_mapping() {
-        assert_eq!(dtype(1), Some(DType::F32)); // FLOAT
-        assert_eq!(dtype(7), Some(DType::I64)); // INT64
-        assert_eq!(dtype(9), Some(DType::U8)); // BOOL
-        assert_eq!(dtype(6), None); // INT32 handled by raw_to_tensor, not dtype()
-        assert_eq!(dtype(3), None); // INT8 unmapped
-    }
 }

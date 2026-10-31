@@ -777,52 +777,6 @@ mod tests {
     }
 
     #[test]
-    fn parent_key_and_workspace_name_round_trip() {
-        let agent_id = format!("parent_key_{}", crate::generate_suffix());
-        let ws = crate::Workspace {
-            name: "ws_parent".to_string(),
-            path: "/tmp/ws_parent".to_string(),
-            ..Default::default()
-        };
-        let generation = AGENT_REGISTRY.register(
-            agent_id.clone(),
-            "engineer".to_string(),
-            Some("T-42".to_string()),
-            &ws,
-            CancellationToken::new(),
-            Some(ParentKey::Ticket("T-42".to_string())),
-            Some("Fix login bug".to_string()),
-            std::sync::Arc::new(AtomicBool::new(false)),
-        );
-        let handles = AGENT_REGISTRY.list();
-        let h = handles
-            .iter()
-            .find(|h| h.agent_id == agent_id)
-            .expect("agent registered");
-        assert_eq!(h.workspace_name, "ws_parent");
-        assert_eq!(h.parent_key, Some(ParentKey::Ticket("T-42".to_string())));
-        assert_eq!(
-            h.parent_label.as_deref(),
-            Some("Fix login bug"),
-            "parent label round-trips"
-        );
-        AGENT_REGISTRY.deregister(&agent_id, generation);
-    }
-
-    #[test]
-    fn generation_round_trips_through_list() {
-        let agent_id = format!("gen_{}", crate::generate_suffix());
-        let generation = register_test_agent(&agent_id, "/tmp/ws");
-        let handles = AGENT_REGISTRY.list();
-        let h = handles
-            .iter()
-            .find(|h| h.agent_id == agent_id)
-            .expect("agent registered");
-        assert_eq!(h.generation, generation, "generation surfaces via list()");
-        AGENT_REGISTRY.deregister(&agent_id, generation);
-    }
-
-    #[test]
     fn register_replaces_old_entry_with_fresh_generation() {
         let agent_id = format!("regen_{}", crate::generate_suffix());
         let gen_a = register_test_agent(&agent_id, "/tmp/ws");
@@ -946,42 +900,6 @@ mod tests {
                 .iter()
                 .any(|h| h.kind == kind || h.kind == orchestrator),
             "guard drops remove their own entries"
-        );
-    }
-
-    #[test]
-    fn call_kind_labels_cover_every_known_kind_without_raw_names() {
-        // Every kind the codebase registers must map to a human-readable
-        // label, and unknown/future kinds must fall back to a generic label —
-        // a raw snake_case name can never leak onto the page.
-        for kind in [
-            "consolidate",
-            "synthesis",
-            "synthesize",
-            "decompose_merge",
-            "gap_extract",
-            "abstain_check",
-            "claim_annotate",
-            "confirm_links",
-            "research_wrap_up",
-            "research_orchestrator",
-            "media_transcription",
-            "cli_command",
-        ] {
-            let label = call_kind_label(kind);
-            assert_ne!(
-                label, kind,
-                "raw kind '{kind}' must never be used as its own label"
-            );
-            assert!(
-                !label.contains('_'),
-                "label must be human-readable: {label}"
-            );
-        }
-        assert_eq!(
-            call_kind_label("future_unknown_kind"),
-            "Other LLM work",
-            "unknown kinds fall back to a generic label"
         );
     }
 

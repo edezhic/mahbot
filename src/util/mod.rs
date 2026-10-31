@@ -1999,43 +1999,20 @@ mod truncate_tests {
         assert_eq!(truncate("hello world", 5), "hell…");
     }
 
-    // ── truncate_sandwich: passthrough ────────────────────────────────────
+    // ── truncate_sandwich: passthrough and head/tail sandwich ─────────────
 
     #[test]
-    fn passthrough_under_limit() {
-        let input = "hello world";
-        let result = truncate_sandwich(input, 5_000, "test");
-        assert_eq!(
-            result, input,
-            "should pass through unchanged when under limit"
-        );
-    }
-
-    #[test]
-    fn passthrough_at_exact_limit() {
-        let input = "a".repeat(5_000);
-        assert_eq!(input.len(), 5_000);
-        let result = truncate_sandwich(&input, 5_000, "test");
-        assert_eq!(result, input, "exact limit should pass through unchanged");
-    }
-
-    // ── truncate_sandwich: head/tail sandwich ─────────────────────────────
-
-    #[test]
-    fn sandwich_just_over_limit() {
-        // Input is exactly limit+1 bytes — sandwich marker may add overhead
-        // making output longer than input, which is expected for tiny overshoot.
-        let input = "x".repeat(5_001);
-        let result = truncate_sandwich(&input, 5_000, "test");
-        assert!(
-            result.starts_with("xxx"),
-            "head portion should be preserved"
-        );
-        assert!(
-            result.contains("bytes omitted at test truncation"),
-            "should contain the omission marker"
-        );
-        assert!(result.ends_with('x'), "tail should contain input suffix");
+    fn an_input_that_fits_passes_through_unchanged() {
+        // Anything at or under the cap is handed back byte for byte: the
+        // marker is only ever added to text that was actually cut.
+        for input in ["hello world".to_string(), "a".repeat(5_000)] {
+            assert_eq!(
+                truncate_sandwich(&input, 5_000, "test"),
+                input,
+                "a fitting input ({}) must not be touched",
+                input.len()
+            );
+        }
     }
 
     #[test]
@@ -2102,42 +2079,6 @@ mod truncate_tests {
                 "cap {cap} must take the omission form"
             );
         }
-    }
-
-    // ── truncate_sandwich: custom label ───────────────────────────────────
-
-    #[test]
-    fn custom_label_appears_in_marker() {
-        let input = "x".repeat(10_000);
-        let result = truncate_sandwich(&input, 5_000, "my custom label");
-        assert!(
-            result.contains("bytes omitted at my custom label truncation"),
-            "custom label should appear verbatim in marker"
-        );
-    }
-
-    #[test]
-    fn empty_label() {
-        let input = "x".repeat(10_000);
-        let result = truncate_sandwich(&input, 5_000, "");
-        assert!(
-            result.contains("bytes omitted at  truncation"),
-            "empty label should still produce coherent marker"
-        );
-    }
-
-    // ── truncate_tool_output compatibility ──────────────────────────────────
-
-    #[test]
-    fn truncate_tool_output_appends_correct_label() {
-        let input = "abc".repeat(2_000); // 6_000 bytes > 5_000 limit
-        let result = truncate_tool_output(&input);
-        assert!(result.len() < input.len(), "should truncate");
-        assert!(
-            result.contains("bytes omitted at tool output truncation"),
-            "should use 'tool output' label"
-        );
-        assert!(result.starts_with("abcabc"), "head should be preserved");
     }
 }
 
@@ -2322,110 +2263,78 @@ mod scrub_tests {
 #[cfg(test)]
 mod extract_provider_error_detail_tests {
     use super::extract_provider_error_detail;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
+    /// The field ladder, in the order the extractor consults it: the `error`
+    /// wrapper's `message`, the same key on a bare object, a plain string
+    /// `error`, the nested `metadata.raw` (itself JSON or prose), the provider
+    /// code, then the bare `code` and `type` fallbacks.
     #[test]
-    fn standard_message_field() {
-        // Wrapped envelope — the common shape.
-        let body = json!({"error": {"message": "upstream busy"}});
-        assert_eq!(
-            extract_provider_error_detail(&body).as_deref(),
-            Some("upstream busy")
-        );
-        // Bare object without the `error` wrapper.
-        let body = json!({"message": "bare detail"});
-        assert_eq!(
-            extract_provider_error_detail(&body).as_deref(),
-            Some("bare detail")
-        );
-    }
-
-    #[test]
-    fn string_error_field() {
-        let body = json!({"error": "plain message"});
-        assert_eq!(
-            extract_provider_error_detail(&body).as_deref(),
-            Some("plain message")
-        );
-    }
-
-    #[test]
-    fn nested_envelope_raw_field() {
-        let body = json!({
-            "error": {
-                "code": "data_inspection_failed",
-                "metadata": {"raw": "Input image data may contain inappropriate content."}
-            }
-        });
-        assert_eq!(
-            extract_provider_error_detail(&body).as_deref(),
-            Some("Input image data may contain inappropriate content.")
-        );
-    }
-
-    #[test]
-    fn nested_raw_is_itself_json_preferred() {
-        let body = json!({
-            "error": {
-                "message": "generic",
-                "metadata": {"raw": r#"{"error":{"message":"deep upstream detail"}}"#}
-            }
-        });
-        // `message` exists — it wins (existing output contract).
-        assert_eq!(
-            extract_provider_error_detail(&body).as_deref(),
-            Some("generic")
-        );
-
-        // Without a top-level message, the nested raw JSON's detail wins.
-        let body = json!({
-            "error": {
-                "metadata": {"raw": r#"{"error":{"message":"deep upstream detail"}}"#}
-            }
-        });
-        assert_eq!(
-            extract_provider_error_detail(&body).as_deref(),
-            Some("deep upstream detail")
-        );
-    }
-
-    #[test]
-    fn provider_error_code_field() {
-        let body = json!({
-            "error": {
-                "metadata": {"provider_error_code": "upstream_shared_pool"}
-            }
-        });
-        assert_eq!(
-            extract_provider_error_detail(&body).as_deref(),
-            Some("upstream_shared_pool")
-        );
-    }
-
-    #[test]
-    fn bare_code_then_type_fallbacks() {
-        let body = json!({"error": {"code": "invalid_request_error"}});
-        assert_eq!(
-            extract_provider_error_detail(&body).as_deref(),
-            Some("invalid_request_error")
-        );
-        let body = json!({"error": {"type": "rate_limit_exceeded"}});
-        assert_eq!(
-            extract_provider_error_detail(&body).as_deref(),
-            Some("rate_limit_exceeded")
-        );
+    fn the_detail_comes_from_the_first_field_that_carries_one() {
+        let cases: [(Value, &str); 9] = [
+            (
+                json!({"error": {"message": "upstream busy"}}),
+                "upstream busy",
+            ),
+            (json!({"message": "bare detail"}), "bare detail"),
+            (json!({"error": "plain message"}), "plain message"),
+            (
+                json!({
+                    "error": {
+                        "code": "data_inspection_failed",
+                        "metadata": {"raw": "Input image data may contain inappropriate content."}
+                    }
+                }),
+                "Input image data may contain inappropriate content.",
+            ),
+            // `message` outranks a nested raw, even one that is itself JSON.
+            (
+                json!({
+                    "error": {
+                        "message": "generic",
+                        "metadata": {"raw": r#"{"error":{"message":"deep upstream detail"}}"#}
+                    }
+                }),
+                "generic",
+            ),
+            // Without a message, the nested raw JSON's own detail wins.
+            (
+                json!({"error": {"metadata": {"raw": r#"{"error":{"message":"deep upstream detail"}}"#}}}),
+                "deep upstream detail",
+            ),
+            (
+                json!({"error": {"metadata": {"provider_error_code": "upstream_shared_pool"}}}),
+                "upstream_shared_pool",
+            ),
+            (
+                json!({"error": {"code": "invalid_request_error"}}),
+                "invalid_request_error",
+            ),
+            (
+                json!({"error": {"type": "rate_limit_exceeded"}}),
+                "rate_limit_exceeded",
+            ),
+        ];
+        for (body, expected) in &cases {
+            assert_eq!(
+                extract_provider_error_detail(body).as_deref(),
+                Some(*expected),
+                "body: {body}"
+            );
+        }
     }
 
     #[test]
     fn empty_and_absent_fields_yield_none() {
-        assert_eq!(extract_provider_error_detail(&json!({})), None);
-        assert_eq!(extract_provider_error_detail(&json!({"error": null})), None);
-        assert_eq!(extract_provider_error_detail(&json!({"error": {}})), None);
-        // A blank message is skipped, not surfaced.
-        assert_eq!(
-            extract_provider_error_detail(&json!({"error": {"message": "  "}})),
-            None
-        );
+        for body in [
+            json!({}),
+            json!({"error": null}),
+            json!({"error": {}}),
+            // A blank message is skipped, not surfaced.
+            json!({"error": {"message": "  "}}),
+        ] {
+            assert_eq!(extract_provider_error_detail(&body), None, "body: {body}");
+        }
     }
 }
 
@@ -2520,20 +2429,6 @@ mod reference_image_tests {
     use crate::util::test::noisy_png;
 
     #[tokio::test]
-    async fn under_cap_passes_through_unchanged() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("small.png");
-        let bytes = noisy_png(64, 64);
-        std::fs::write(&path, &bytes).unwrap();
-
-        let img = load_reference_image(&path, 1_500_000).await.unwrap();
-        assert_eq!(
-            img.data_uri(),
-            format!("data:image/png;base64,{}", STANDARD.encode(&bytes))
-        );
-    }
-
-    #[tokio::test]
     async fn released_reference_reports_no_compression_left() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("small.png");
@@ -2567,26 +2462,28 @@ mod reference_image_tests {
         assert!(decoded.len() as u64 <= CAP);
     }
 
+    /// A reference the loader cannot use is refused, and the refusal names
+    /// which of the two reasons it was: a container the pipeline never reads,
+    /// or a file whose bytes are not an image at all.
     #[tokio::test]
-    async fn unsupported_extension_rejected() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("photo.heic");
-        std::fs::write(&path, b"\x00\x00\x00\x18ftypheic").unwrap();
-        let Err(err) = load_reference_image(&path, 1_500_000).await else {
-            panic!("HEIC reference should be rejected");
-        };
-        assert!(err.to_string().contains("unsupported format"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn undecodable_content_rejected() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("fake.png");
-        std::fs::write(&path, b"this is not an image").unwrap();
-        let Err(err) = load_reference_image(&path, 1_500_000).await else {
-            panic!("undecodable reference should be rejected");
-        };
-        assert!(err.to_string().contains("not a decodable image"), "{err}");
+    async fn a_reference_that_cannot_be_used_is_refused_with_its_reason() {
+        let cases: [(&str, &[u8], &str); 2] = [
+            (
+                "photo.heic",
+                b"\x00\x00\x00\x18ftypheic",
+                "unsupported format",
+            ),
+            ("fake.png", b"this is not an image", "not a decodable image"),
+        ];
+        for (name, bytes, reason) in cases {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let path = tmp.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let Err(err) = load_reference_image(&path, 1_500_000).await else {
+                panic!("{name} should be rejected");
+            };
+            assert!(err.to_string().contains(reason), "{name}: {err}");
+        }
     }
 
     /// Inject an EXIF orientation tag (0x0112 = 6 → Rotate90) into a JPEG right

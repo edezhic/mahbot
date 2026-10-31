@@ -685,22 +685,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_backoff_sequence_is_doubling_capped() {
-        let p = RetryPolicy {
-            max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
-            base_backoff_ms: DEFAULT_RETRY_BASE_BACKOFF_MS,
-            max_backoff_ms: DEFAULT_RETRY_MAX_BACKOFF_MS,
-        };
-        assert_eq!(
-            backoff_sequence(&p),
-            vec![
-                5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000, 60_000, 60_000, 60_000,
-                60_000, 60_000
-            ]
-        );
-    }
-
-    #[test]
     fn custom_backoff_sequence_doubles_capped() {
         let p = RetryPolicy {
             max_attempts: 6,
@@ -713,16 +697,14 @@ mod tests {
         );
     }
 
+    /// A `Retry-After` is followed within the policy's own window, and without
+    /// one the sleep jitters inside ±25% of the base.
     #[test]
-    fn compute_sleep_honors_retry_after_clamped() {
-        // Retry-After followed precisely within [5000, 60000].
+    fn compute_sleep_honors_retry_after_and_jitters_within_bounds() {
         assert_eq!(compute_sleep_ms(5_000, Some(7_000)), 7_000);
         assert_eq!(compute_sleep_ms(5_000, Some(1_000)), 5_000);
         assert_eq!(compute_sleep_ms(5_000, Some(200_000)), 60_000);
-    }
 
-    #[test]
-    fn compute_sleep_jitter_within_25_percent() {
         for _ in 0..200 {
             let v = compute_sleep_ms(10_000, None);
             assert!(

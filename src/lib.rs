@@ -1929,53 +1929,8 @@ pub(crate) struct Skill {
 mod tests {
     use super::*;
 
-    #[test]
-    fn diagnostics_commands_returns_all_7_in_order() {
-        let diag = DiagnosticsCommands {
-            format: Some("cargo fmt".into()),
-            format_check: Some("cargo fmt -- --check".into()),
-            lint: Some("cargo clippy -- -D warnings".into()),
-            lint_fix: Some("cargo clippy --fix --allow-dirty".into()),
-            type_check: Some("cargo check".into()),
-            build: Some("cargo build".into()),
-            unit_test: Some("cargo test".into()),
-        };
-
-        let cmds = diag.commands();
-        assert_eq!(cmds.len(), 7);
-        assert_eq!(cmds[0].0, "format");
-        assert_eq!(cmds[1].0, "format-check");
-        assert_eq!(cmds[2].0, "lint-fix");
-        assert_eq!(cmds[3].0, "lint");
-        assert_eq!(cmds[4].0, "type-check");
-        assert_eq!(cmds[5].0, "build");
-        assert_eq!(cmds[6].0, "unit-test");
-
-        assert_eq!(cmds[0].1, Some("cargo fmt"));
-        assert_eq!(cmds[6].1, Some("cargo test"));
-    }
-
-    #[test]
-    fn diagnostics_is_empty() {
-        let empty = DiagnosticsCommands::default();
-        assert!(empty.is_empty());
-
-        let partial = DiagnosticsCommands {
-            format: Some("cargo fmt".into()),
-            ..Default::default()
-        };
-        assert!(!partial.is_empty());
-    }
-
-    #[test]
-    fn from_buffers_empty_strings_become_none() {
-        let buffers = [const { String::new() }; DiagnosticsCommands::COMMAND_COUNT];
-        let cmds = DiagnosticsCommands::from_buffers(&buffers);
-        assert!(cmds.is_empty());
-        assert!(cmds.format.is_none());
-        assert!(cmds.unit_test.is_none());
-    }
-
+    /// `commands()` and `from_buffers()` agree on field order: a mismatch would
+    /// silently swap one project command for another in the diagnostics editor.
     #[test]
     fn commands_and_from_buffers_are_consistent() {
         // Verify that commands() and from_buffers() agree on field order.

@@ -359,128 +359,156 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// What a replay carries as reasoning: the explicit `reasoning` field when
+    /// the upstream sent one, else the text of the `reasoning_details` blocks
+    /// (encrypted ones say nothing), and on a tool turn an empty string even
+    /// when there is nothing to say — OpenRouter sends `reasoning: ""` there and
+    /// a replayed tool call without the field is a shape its API rejects.
+    #[expect(clippy::type_complexity)] // (label, explicit, details, tool turn, expected)
     #[test]
-    fn plaintext_from_reasoning_details_behavior() {
-        let d = json!([
+    fn reasoning_plaintext_is_the_sent_text_and_a_tool_turn_always_replays() {
+        let blocks = json!([
             {"type": "reasoning.summary", "summary": "Plan: step A", "format": "x", "index": 0},
             {"type": "reasoning.text", "text": "Details here.", "format": "x", "index": 1}
         ]);
-        let s = plaintext_from_reasoning_details(&d);
-        assert!(s.contains("Plan: step A"));
-        assert!(s.contains("Details here."));
-        // Encrypted blocks are skipped
-        let d = json!([{"type": "reasoning.encrypted", "data": "abc", "format": "x", "index": 0}]);
-        assert_eq!(plaintext_from_reasoning_details(&d), "");
+        let plaintext = plaintext_from_reasoning_details(&blocks);
+        assert!(plaintext.contains("Plan: step A"));
+        assert!(plaintext.contains("Details here."));
+
+        let text_only = json!([{"type": "reasoning.text", "text": "from details", "format": "x"}]);
+        let encrypted = json!([{"type": "reasoning.encrypted", "data": "x", "format": "x"}]);
+        let nothing = json!([]);
+        assert_eq!(
+            plaintext_from_reasoning_details(&encrypted),
+            "",
+            "an encrypted block is not plaintext"
+        );
+
+        // (name, explicit, details, is a tool turn, expected plaintext)
+        let cases: &[(&str, Option<&str>, Option<&Value>, bool, Option<&str>)] = &[
+            (
+                "prefers explicit over details",
+                Some("explicit"),
+                Some(&text_only),
+                true,
+                Some("explicit"),
+            ),
+            (
+                "derives from details when no explicit",
+                None,
+                Some(&text_only),
+                true,
+                Some("from details"),
+            ),
+            (
+                "tool call uses empty string when details are non-textual",
+                None,
+                Some(&encrypted),
+                true,
+                Some(""),
+            ),
+            (
+                "no tool does not force empty for encrypted-only",
+                None,
+                Some(&encrypted),
+                false,
+                None,
+            ),
+            (
+                "empty explicit on a tool turn still replays",
+                Some(""),
+                None,
+                true,
+                Some(""),
+            ),
+            (
+                "whitespace explicit on a tool turn still replays",
+                Some("  \t"),
+                None,
+                true,
+                Some(""),
+            ),
+            (
+                "empty explicit on a plain turn replays none",
+                Some(""),
+                None,
+                false,
+                None,
+            ),
+            (
+                "empty explicit and empty details on a tool turn still replay",
+                Some(""),
+                Some(&nothing),
+                true,
+                Some(""),
+            ),
+        ];
+        for (name, explicit, details, tool, expected) in cases {
+            assert_eq!(
+                reasoning_plaintext_for_roundtrip(*explicit, *details, *tool).as_deref(),
+                *expected,
+                "case: {name}"
+            );
+        }
     }
 
+    /// A replayed assistant turn with tool calls always carries
+    /// `reasoning_content`: synthesized from the details when there are any,
+    /// empty when there is nothing to say, and absent only when the reasoning
+    /// slot itself holds nothing textual — the triple handed to the wire is the
+    /// plaintext, the details, and the same plaintext as `reasoning_content`.
     #[test]
-    fn reasoning_plaintext_for_roundtrip_scenarios() {
-        // prefers explicit over details
-        let d = json!([{"type": "reasoning.text", "text": "from details", "format": "x"}]);
-        assert_eq!(
-            reasoning_plaintext_for_roundtrip(Some("explicit"), Some(&d), true).as_deref(),
-            Some("explicit")
-        );
-        // derives from details when no explicit
-        assert_eq!(
-            reasoning_plaintext_for_roundtrip(None, Some(&d), true).as_deref(),
-            Some("from details")
-        );
-        // tool_call uses empty string when details are non-textual
-        let d = json!([{"type": "reasoning.encrypted", "data": "x", "format": "x"}]);
-        assert_eq!(
-            reasoning_plaintext_for_roundtrip(None, Some(&d), true).as_deref(),
-            Some("")
-        );
-        // no tool does not force empty for encrypted-only
-        assert!(reasoning_plaintext_for_roundtrip(None, Some(&d), false).is_none());
-        // OpenRouter may send reasoning: "" on tool turns — still synthesize reasoning_content for replay
-        assert_eq!(
-            reasoning_plaintext_for_roundtrip(Some(""), None, true).as_deref(),
-            Some("")
-        );
-        assert_eq!(
-            reasoning_plaintext_for_roundtrip(Some("  \t"), None, true).as_deref(),
-            Some("")
-        );
-        assert!(reasoning_plaintext_for_roundtrip(Some(""), None, false).is_none());
-        // empty explicit + empty details array + tool: still replay placeholder
-        assert_eq!(
-            reasoning_plaintext_for_roundtrip(Some(""), Some(&json!([])), true).as_deref(),
-            Some("")
-        );
-    }
-
-    #[test]
-    fn assistant_replay_payload_status() {
-        // OpenRouter+deepseek + tool calls + no parsed Reasoning → synthesize empty reasoning_content
+    fn assistant_replay_carries_reasoning_content_for_tool_turns() {
         let tc = ToolCall {
             id: "t1".into(),
             name: "x".into(),
             arguments: json!({}),
         };
-        let payload = assistant_replay_payload(Some("a"), std::slice::from_ref(&tc), None);
-        assert_eq!(
-            payload.get("reasoning_content").and_then(Value::as_str),
-            Some("")
-        );
-        // Synthesized from details
-        let details =
-            json!([{"type": "reasoning.text", "text": "from details", "format": "x", "index": 0}]);
-        let payload = assistant_replay_payload(
-            Some("a"),
-            std::slice::from_ref(&tc),
-            Some(&Reasoning::from_optional_parts(None, None, Some(details)).unwrap()),
-        );
-        assert_eq!(
-            payload.get("reasoning_content").and_then(Value::as_str),
-            Some("from details")
-        );
-        // empty reasoning string on tool turn → synthesized reasoning_content for DeepSeek/OpenRouter replay
-        let payload = assistant_replay_payload(
-            Some("a"),
-            std::slice::from_ref(&tc),
-            Some(
-                &Reasoning::from_optional_parts(Some(String::new()), None, None)
-                    .expect("non-empty reasoning slot"),
-            ),
-        );
-        assert_eq!(
-            payload.get("reasoning_content").and_then(Value::as_str),
-            Some("")
-        );
-        // Reasoning value present but only empty reasoning_details — augment cannot synthesize
-        // content, and the `reasoning: None` fallback is not reached, so no reasoning_content is set.
-        let payload = assistant_replay_payload(
-            Some("a"),
-            std::slice::from_ref(&tc),
-            Some(
-                &Reasoning::from_optional_parts(None, None, Some(json!([])))
-                    .expect("reasoning_details"),
-            ),
-        );
-        assert!(
-            payload
+        let replayed = |reasoning: Option<&Reasoning>| {
+            assistant_replay_payload(Some("a"), std::slice::from_ref(&tc), reasoning)
                 .get("reasoning_content")
                 .and_then(Value::as_str)
-                .is_none()
+                .map(str::to_string)
+        };
+
+        assert_eq!(
+            replayed(None).as_deref(),
+            Some(""),
+            "a tool turn with no parsed reasoning still replays the field"
         );
-    }
 
-    #[test]
-    fn json_lossless_reads_empty_reasoning_content() {
-        let msg = json!({"content": "x", "reasoning_content": ""});
-        let (r, rc, rd) = json_lossless_assistant_reasoning_fields(&msg);
-        assert!(r.is_none());
-        assert_eq!(rc.as_deref(), Some(""));
-        assert!(rd.is_none());
-    }
+        let details =
+            json!([{"type": "reasoning.text", "text": "from details", "format": "x", "index": 0}]);
+        assert_eq!(
+            replayed(Some(
+                &Reasoning::from_optional_parts(None, None, Some(details.clone()))
+                    .expect("non-empty reasoning slot")
+            ))
+            .as_deref(),
+            Some("from details"),
+            "the details are the text when the model sent no reasoning field"
+        );
 
-    #[test]
-    fn augment_fills_reasoning_content_from_reasoning_or_details() {
-        let d = json!([{"type": "reasoning.text", "text": "x", "format": "f", "index": 0}]);
+        assert_eq!(
+            replayed(Some(
+                &Reasoning::from_optional_parts(Some(String::new()), None, None)
+                    .expect("non-empty reasoning slot")
+            ))
+            .as_deref(),
+            Some(""),
+            "an empty reasoning string on a tool turn is still the field"
+        );
 
-        // reasoning present, no reasoning_content → synthesized from reasoning
+        assert!(
+            replayed(Some(
+                &Reasoning::from_optional_parts(None, None, Some(json!([])))
+                    .expect("reasoning_details")
+            ))
+            .is_none(),
+            "details with no text cannot synthesize content, and the field is not invented"
+        );
+
+        // The triple a native replay frame is built from.
         let reasoning = Reasoning::from_optional_parts(Some("openrouter".into()), None, None)
             .expect("reasoning");
         let (r, rc, rd) = native_reasoning_triple_for_replay(Some(&reasoning), true);
@@ -488,12 +516,11 @@ mod tests {
         assert_eq!(rc.as_deref(), Some("openrouter"));
         assert!(rd.is_none());
 
-        // details present, no reasoning → synthesized from details
         let reasoning =
-            Reasoning::from_optional_parts(None, None, Some(d.clone())).expect("reasoning_details");
+            Reasoning::from_optional_parts(None, None, Some(details.clone())).expect("reasoning");
         let (r, rc, rd) = native_reasoning_triple_for_replay(Some(&reasoning), true);
         assert!(r.is_none());
-        assert_eq!(rc.as_deref(), Some("x"));
-        assert_eq!(rd.as_ref(), Some(&d));
+        assert_eq!(rc.as_deref(), Some("from details"));
+        assert_eq!(rd.as_ref(), Some(&details));
     }
 }

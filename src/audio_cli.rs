@@ -892,10 +892,11 @@ mod engine {
 mod tests {
     use super::*;
 
-    /// The words a caller reads before he hears anything: what a flag tail means,
-    /// and what one that means nothing says.
+    /// The grammar a caller meets before he hears anything: what a flag tail
+    /// means, what one that means nothing says, and which required flags the
+    /// operation's own list refuses by name.
     #[test]
-    fn flag_tails() {
+    fn flag_tails_and_required_flags() {
         let values = |tokens: &[&str]| match parse_flags(Operation::Speak, &owned(tokens)) {
             Ok(Tail::Values(values)) => Ok(values),
             Ok(Tail::Help) => Err("help".to_string()),
@@ -917,12 +918,9 @@ mod tests {
         assert!(values(&["--text"]).is_err_and(|r| r.contains("needs a value")));
         assert!(values(&["text"]).is_err_and(|r| r.contains("--flag")));
         assert_eq!(values(&["--text", "hi", "-h"]).unwrap_err(), "help");
-    }
 
-    /// A required flag that was left out is refused by name, and it is the
-    /// operation's own list that says which those are.
-    #[test]
-    fn required_flags_are_named() {
+        // A required flag that was left out is refused by name, and it is the
+        // operation's own list that says which those are.
         let invocation = |tokens: &[&str]| parse(&owned(tokens));
         assert!(invocation(&["speak", "--text", "hi"]).is_err_and(|r| r.contains("--output")));
         assert!(invocation(&["transcribe"]).is_err_and(|r| r.contains("--input")));

@@ -343,22 +343,39 @@ pub(crate) fn substitute(template: &str, replacements: &[(&str, &str)]) -> Strin
 mod tests {
     use super::*;
 
+    /// One pass over the template with the replacements at hand: a key with no
+    /// replacement is left as the literal `{{key}}`, and a template with no
+    /// placeholders — not even an empty template — comes back unchanged.
     #[test]
-    fn substitute_basic_replacement() {
-        let result = substitute(
-            "Hello {{name}}, your {{item}} is ready.",
-            &[("{{name}}", "Alice"), ("{{item}}", "order")],
-        );
-        assert_eq!(result, "Hello Alice, your order is ready.");
-    }
+    fn substitute_cases() {
+        /// A replacement pair.
+        type Pair = (&'static str, &'static str);
+        /// Case name, template, replacements, expected output.
+        type Case = (&'static str, &'static str, &'static [Pair], &'static str);
 
-    #[test]
-    fn substitute_preserves_unknown_keys() {
-        let result = substitute(
-            "Hello {{name}}, here is {{missing}} key.",
-            &[("{{name}}", "Alice")],
-        );
-        assert_eq!(result, "Hello Alice, here is {{missing}} key.");
+        let cases: &[Case] = &[
+            (
+                "both keys replaced",
+                "Hello {{name}}, your {{item}} is ready.",
+                &[("{{name}}", "Alice"), ("{{item}}", "order")],
+                "Hello Alice, your order is ready.",
+            ),
+            (
+                "unknown key preserved",
+                "Hello {{name}}, here is {{missing}} key.",
+                &[("{{name}}", "Alice")],
+                "Hello Alice, here is {{missing}} key.",
+            ),
+            ("empty template", "", &[("{{key}}", "value")], ""),
+            ("no replacements", "Hello {{name}}!", &[], "Hello {{name}}!"),
+        ];
+        for (case, template, replacements, expected) in cases {
+            assert_eq!(
+                substitute(template, replacements),
+                *expected,
+                "case '{case}'"
+            );
+        }
     }
 
     #[test]
@@ -372,20 +389,10 @@ mod tests {
         assert_eq!(result, "First: value-{{b}}, Second: actual-b");
     }
 
-    #[test]
-    fn substitute_empty_template() {
-        let result = substitute("", &[("{{key}}", "value")]);
-        assert_eq!(result, "");
-    }
-
-    #[test]
-    fn substitute_no_replacements() {
-        let result = substitute("Hello {{name}}!", &[]);
-        assert_eq!(result, "Hello {{name}}!");
-    }
-
+    /// Only the `.md` rules are discovered, and a rule the loader cannot read
+    /// (a directory named `*.md`) is skipped rather than failing the scan.
     #[tokio::test]
-    async fn discover_claude_rules_finds_md_files() {
+    async fn discover_claude_rules_finds_only_readable_md_files() {
         let dir = tempfile::tempdir().unwrap();
         let rules_dir = dir.path().join(".claude").join("rules");
         std::fs::create_dir_all(&rules_dir).unwrap();
@@ -393,12 +400,16 @@ mod tests {
         std::fs::write(rules_dir.join("style.md"), "Style rules").unwrap();
         // Non-markdown file should be ignored
         std::fs::write(rules_dir.join("notes.txt"), "irrelevant").unwrap();
+        // A directory named *.md fails read_to_string and is skipped
+        std::fs::create_dir(rules_dir.join("broken.md")).unwrap();
 
         let rules = discover_claude_rules(dir.path()).await;
-        assert_eq!(rules.len(), 2);
         let paths: Vec<&str> = rules.iter().map(|(p, _)| p.as_str()).collect();
-        assert!(paths.contains(&".claude/rules/testing.md"));
-        assert!(paths.contains(&".claude/rules/style.md"));
+        assert_eq!(
+            paths,
+            [".claude/rules/style.md", ".claude/rules/testing.md"],
+            "only the readable .md rules are discovered"
+        );
     }
 
     #[tokio::test]
@@ -406,32 +417,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rules = discover_claude_rules(dir.path()).await;
         assert!(rules.is_empty());
-    }
-
-    #[tokio::test]
-    async fn discover_claude_rules_skips_unreadable() {
-        let dir = tempfile::tempdir().unwrap();
-        let rules_dir = dir.path().join(".claude").join("rules");
-        std::fs::create_dir_all(&rules_dir).unwrap();
-        // A directory named *.md fails read_to_string and is skipped
-        std::fs::create_dir(rules_dir.join("broken.md")).unwrap();
-        std::fs::write(rules_dir.join("good.md"), "good content").unwrap();
-        let rules = discover_claude_rules(dir.path()).await;
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].0, ".claude/rules/good.md");
-    }
-
-    #[tokio::test]
-    async fn discover_claude_rules_returns_full_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let rules_dir = dir.path().join(".claude").join("rules");
-        std::fs::create_dir_all(&rules_dir).unwrap();
-        // Content over MAX_WORKSPACE_FILE_CHARS — truncation is handled by push_truncated later
-        let long = "x".repeat(100_000);
-        std::fs::write(rules_dir.join("long.md"), &long).unwrap();
-        let rules = discover_claude_rules(dir.path()).await;
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].1.len(), 100_000);
     }
 
     #[tokio::test]

@@ -630,40 +630,6 @@ mod tests {
         }
     }
 
-    /// The records land in the store in the order they were produced — the point
-    /// of one queue drained by one task.
-    #[tokio::test]
-    #[serial_test::serial(provider)] // the telemetry store seam is process-global
-    async fn records_are_written_in_the_order_they_were_produced() {
-        let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
-        let _seam = crate::util::test::install_test_log_store(store.clone());
-        // A queue of this test's own: nothing another test produces can enter it.
-        let queue = Queue::new();
-
-        for command in ["first", "second", "third"] {
-            queue.push(grep_row(&format!("{MARKER}-{command}")));
-        }
-        write_queued(&queue).await;
-
-        let rows = store
-            .conn
-            .query(
-                "SELECT command FROM grep_telemetry WHERE command LIKE ?1 ORDER BY id",
-                params![format!("{MARKER}%")],
-            )
-            .await
-            .expect("read the recorded runs");
-        let commands: Vec<String> = rows
-            .iter()
-            .map(|row| row.get::<String>(0).unwrap())
-            .collect();
-        let expected: Vec<String> = ["first", "second", "third"]
-            .iter()
-            .map(|command| format!("{MARKER}-{command}"))
-            .collect();
-        assert_eq!(commands, expected);
-    }
-
     /// A full queue drops a record instead of waiting for it or for the store,
     /// and the drop is counted on its own number: it is not a write failure.
     #[tokio::test]
@@ -822,5 +788,39 @@ mod tests {
             "the queued rows the scope covers must not land after the wipe, and the \
              rows it leaves must"
         );
+    }
+
+    /// The records land in the store in the order they were produced — the point
+    /// of one queue drained by one task.
+    #[tokio::test]
+    #[serial_test::serial(provider)] // the telemetry store seam is process-global
+    async fn records_are_written_in_the_order_they_were_produced() {
+        let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let _seam = crate::util::test::install_test_log_store(store.clone());
+        // A queue of this test's own: nothing another test produces can enter it.
+        let queue = Queue::new();
+
+        for command in ["first", "second", "third"] {
+            queue.push(grep_row(&format!("{MARKER}-{command}")));
+        }
+        write_queued(&queue).await;
+
+        let rows = store
+            .conn
+            .query(
+                "SELECT command FROM grep_telemetry WHERE command LIKE ?1 ORDER BY id",
+                params![format!("{MARKER}%")],
+            )
+            .await
+            .expect("read the recorded runs");
+        let commands: Vec<String> = rows
+            .iter()
+            .map(|row| row.get::<String>(0).unwrap())
+            .collect();
+        let expected: Vec<String> = ["first", "second", "third"]
+            .iter()
+            .map(|command| format!("{MARKER}-{command}"))
+            .collect();
+        assert_eq!(commands, expected);
     }
 }

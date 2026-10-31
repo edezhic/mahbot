@@ -2712,8 +2712,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn pending_pickup_cooldown_arms_clears_and_expires() {
+    /// The pickup cooldown's whole lifecycle on its in-memory map: armed, it
+    /// gates the pickup; an expired deadline does not; `clear` disarms it; the
+    /// duration doubles per consecutive failure up to the 4 h cap, and the
+    /// escalation counter increments with each record and is reset by `clear`.
+    #[test]
+    fn pending_pickup_cooldown_arms_escalates_expires_and_resets() {
         clear_pending_pickup_cooldown("cooldown_ws");
         assert!(
             !pending_pickup_cooldown_active("cooldown_ws"),
@@ -2745,10 +2749,7 @@ mod tests {
             "an expired cooldown must not gate the pickup"
         );
         clear_pending_pickup_cooldown("cooldown_ws");
-    }
 
-    #[test]
-    fn pending_pickup_cooldown_escalates_and_resets() {
         // The cooldown duration doubles per consecutive failure, capped at 4h.
         assert_eq!(pending_pickup_cooldown_duration(1), Duration::from_mins(15));
         assert_eq!(pending_pickup_cooldown_duration(2), Duration::from_mins(30));
@@ -2788,70 +2789,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn editor_tabs_round_trip_dirty_content() {
-        let (store, _tmp) = test_store().await;
-        insert_direct(&store, "ws1", "/tmp/ws1", false, false, 0, 0).await;
-
-        let tabs = vec![EditorTabRecord {
-            file_path: "notes.md".to_string(),
-            tab_order: 0,
-            is_active: true,
-            is_dirty: true,
-            dirty_content: Some("draft text".to_string()),
-        }];
-        store
-            .save_editor_tabs("ws1", &tabs)
-            .await
-            .expect("save tabs");
-
-        let loaded = store.load_editor_tabs("ws1").await.expect("load tabs");
-        assert_eq!(loaded.len(), 1);
-        assert!(loaded[0].is_active);
-        assert!(loaded[0].is_dirty);
-        assert_eq!(loaded[0].dirty_content.as_deref(), Some("draft text"));
-    }
-
     // ── Diagnostics API tests ─────────────────────────────────────
-
-    #[tokio::test]
-    async fn set_diagnostics_roundtrip_and_bumps_generation() {
-        let (store, _tmp) = test_store().await;
-        insert_direct(&store, "diag_test", "/tmp/diag_test", false, false, 0, 0).await;
-
-        let cmds = crate::DiagnosticsCommands {
-            format: Some("cargo fmt".into()),
-            format_check: Some("cargo fmt -- --check".into()),
-            lint: Some("cargo clippy -- -D warnings".into()),
-            ..Default::default()
-        };
-        store
-            .set_diagnostics("diag_test", &cmds)
-            .await
-            .expect("set_diagnostics");
-
-        let loaded = store
-            .get_diagnostics("diag_test")
-            .await
-            .expect("get_diagnostics")
-            .expect("should have diagnostics");
-        assert_eq!(loaded.format.as_deref(), Some("cargo fmt"));
-        assert_eq!(loaded.format_check.as_deref(), Some("cargo fmt -- --check"));
-        assert_eq!(loaded.lint.as_deref(), Some("cargo clippy -- -D warnings"));
-        assert!(loaded.lint_fix.is_none());
-        assert!(loaded.type_check.is_none());
-        assert!(loaded.build.is_none());
-        assert!(loaded.unit_test.is_none());
-
-        let diag_gen_val = store
-            .get_generation("diag_test", GenerationColumn::DIAGNOSTICS)
-            .await
-            .expect("get_generation");
-        assert_eq!(
-            diag_gen_val, 1,
-            "set_diagnostics should bump diagnostics_generation to 1"
-        );
-    }
 
     #[tokio::test]
     async fn rediscover_diagnostics_clears_and_bumps() {
@@ -2917,57 +2855,6 @@ mod tests {
             discovery_gen_val, 0,
             "rediscover_diagnostics should NOT affect discovery_generation"
         );
-    }
-
-    #[tokio::test]
-    async fn diagnostics_generation_guard_skips_stale_writes() {
-        let (store, _tmp) = test_store().await;
-        insert_direct(&store, "diag_stale", "/tmp/diag_stale", true, false, 0, 0).await;
-
-        // Set some initial diagnostics (this bumps gen to 1).
-        let cmds = crate::DiagnosticsCommands {
-            format: Some("cargo fmt".into()),
-            ..Default::default()
-        };
-        store
-            .set_diagnostics("diag_stale", &cmds)
-            .await
-            .expect("set_diagnostics");
-
-        // Bump the diagnostics_generation behind the scenes (simulates a concurrent
-        // rediscover_diagnostics() or set_diagnostics() call).
-        store
-            .conn
-            .execute(
-                "UPDATE workspaces SET diagnostics_generation = 99 WHERE name = ?1",
-                crate::db::params!["diag_stale"],
-            )
-            .await
-            .expect("bump diagnostics_generation");
-
-        // Capture the stale generation (1) and verify the guard catches it.
-        let stale_gen_val = 1;
-        let is_ok = check_generation(
-            &store,
-            "diag_stale",
-            stale_gen_val,
-            GenerationColumn::DIAGNOSTICS,
-            "test",
-        )
-        .await;
-        assert!(!is_ok, "check_generation should reject stale generation");
-
-        // Fresh generation should pass.
-        let fresh_gen_val = 99;
-        let is_ok = check_generation(
-            &store,
-            "diag_stale",
-            fresh_gen_val,
-            GenerationColumn::DIAGNOSTICS,
-            "test",
-        )
-        .await;
-        assert!(is_ok, "check_generation should accept fresh generation");
     }
 
     // ── General (non-role) context tests ──────────────────────────

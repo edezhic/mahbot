@@ -429,41 +429,11 @@ mod tests {
         assert_eq!(reclaimed, vec![1, 2]);
     }
 
-    /// The same `update_id` under two accounts are separate events.
-    #[tokio::test]
-    async fn same_update_id_is_distinct_per_account() {
-        let (store, _tmp) = test_store().await;
-        intake(&store, "run-a", "1")
-            .hold(&[&json!({ "update_id": 3 })])
-            .await
-            .expect("hold account 1");
-        intake(&store, "run-a", "2")
-            .hold(&[&json!({ "update_id": 3 })])
-            .await
-            .expect("hold account 2");
-
-        assert_eq!(
-            intake(&store, "run-b", "1")
-                .take_over()
-                .await
-                .expect("take over 1")
-                .len(),
-            1
-        );
-        assert_eq!(
-            intake(&store, "run-b", "2")
-                .take_over()
-                .await
-                .expect("take over 2")
-                .len(),
-            1
-        );
-    }
-
     /// A second hold for the same event reports that the record already holds it
     /// rather than failing — the platform's re-offers make the collision ordinary —
     /// while two messages alike in everything but the id the platform gave them are
-    /// two events: the record's key is that id, not the content.
+    /// two events, and the same id under two accounts is two events as well: the
+    /// record's key is the id the platform gave, per account, not the content.
     #[tokio::test]
     async fn the_record_tells_events_apart_by_the_id_the_platform_gave_them() {
         let (store, _tmp) = test_store().await;
@@ -493,6 +463,28 @@ mod tests {
             .filter_map(|update| update["update_id"].as_i64())
             .collect();
         assert_eq!(recovered, vec![9, 10]);
+
+        // The same id under another account is another event.
+        intake(&store, "run-a", "2")
+            .hold(&[&json!({ "update_id": 9 })])
+            .await
+            .expect("hold under the other account");
+        assert_eq!(
+            intake(&store, "run-c", "1")
+                .take_over()
+                .await
+                .expect("take over the first account")
+                .len(),
+            2
+        );
+        assert_eq!(
+            intake(&store, "run-c", "2")
+                .take_over()
+                .await
+                .expect("take over the other account")
+                .len(),
+            1
+        );
     }
 
     /// One unit is recorded in one statement, so a member that cannot be written
@@ -530,9 +522,11 @@ mod tests {
 
     /// The bound covers a row in either state: a resolved row ages from its
     /// decision, a held row from its arrival, so a row no run settled cannot
-    /// outlive the record.
+    /// outlive the record. The burst record is swept on its own bound, in days
+    /// rather than hours: a release stays readable long after the events it stood
+    /// for are gone, and one past the bound goes with them.
     #[tokio::test]
-    async fn age_out_drops_rows_past_the_retention_bound() {
+    async fn age_out_drops_what_passed_its_own_bound() {
         let (store, _tmp) = test_store().await;
         let run_a = intake(&store, "run-a", "1");
         for id in [1, 2, 3] {
@@ -543,43 +537,6 @@ mod tests {
         }
         run_a.settle(&[1]).await;
 
-        let old = (chrono::Utc::now() - chrono::Duration::hours(RETENTION_HOURS + 1)).to_rfc3339();
-        store
-            .conn
-            .execute(
-                "UPDATE telegram_intake SET decided_at = ?1 WHERE update_id = 1",
-                params![old.clone()],
-            )
-            .await
-            .expect("age the resolved row");
-        store
-            .conn
-            .execute(
-                "UPDATE telegram_intake SET created_at = ?1 WHERE update_id = 3",
-                params![old],
-            )
-            .await
-            .expect("age the held row");
-
-        assert_eq!(store.age_out().await.expect("age_out"), 2);
-        // Only the freshly held row survives.
-        let held: Vec<i64> = intake(&store, "run-b", "1")
-            .take_over()
-            .await
-            .expect("take over")
-            .iter()
-            .filter_map(|update| update["update_id"].as_i64())
-            .collect();
-        assert_eq!(held, vec![2]);
-    }
-
-    /// The burst record is swept on its own bound, in days rather than hours: a
-    /// release stays readable long after the events it stood for are gone, and one
-    /// past the bound goes with them.
-    #[tokio::test]
-    async fn age_out_drops_bursts_past_their_own_bound() {
-        let (store, _tmp) = test_store().await;
-        let run_a = intake(&store, "run-a", "1");
         let record = |released_at: String| BurstRecord {
             user_name: "alice".to_string(),
             reply_target: "999".to_string(),
@@ -597,7 +554,36 @@ mod tests {
             .await;
         run_a.record_burst(&record(fresh.clone())).await;
 
-        assert_eq!(store.age_out().await.expect("age_out"), 1);
+        let old = (now - chrono::Duration::hours(RETENTION_HOURS + 1)).to_rfc3339();
+        store
+            .conn
+            .execute(
+                "UPDATE telegram_intake SET decided_at = ?1 WHERE update_id = 1",
+                params![old.clone()],
+            )
+            .await
+            .expect("age the resolved row");
+        store
+            .conn
+            .execute(
+                "UPDATE telegram_intake SET created_at = ?1 WHERE update_id = 3",
+                params![old],
+            )
+            .await
+            .expect("age the held row");
+
+        // Two aged events and one aged burst go; the fresh of each stays.
+        assert_eq!(store.age_out().await.expect("age_out"), 3);
+        // Only the freshly held row survives.
+        let held: Vec<i64> = intake(&store, "run-b", "1")
+            .take_over()
+            .await
+            .expect("take over")
+            .iter()
+            .filter_map(|update| update["update_id"].as_i64())
+            .collect();
+        assert_eq!(held, vec![2]);
+
         let rows = store
             .conn
             .query("SELECT released_at FROM telegram_bursts", ())

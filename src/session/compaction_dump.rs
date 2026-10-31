@@ -224,11 +224,14 @@ mod tests {
     use super::*;
     use crate::ChatRole;
 
+    /// The dump carries the complement of the retention window as a MULTISET:
+    /// the older turns only, never the system prompt, and one of two identical
+    /// user messages still counts as deleted while the window holds only the
+    /// other — set semantics would wrongly call it retained.
     #[test]
-    fn deleted_set_keeps_window_and_drops_older_turns() {
-        let system = ChatMessage::system("fresh system prompt");
+    fn deleted_set_is_the_window_complement_counted_as_a_multiset() {
         let history = vec![
-            system,
+            ChatMessage::system("fresh system prompt"),
             ChatMessage::user("u1"),
             ChatMessage::assistant("a1"),
             ChatMessage::user("u2"),
@@ -240,39 +243,35 @@ mod tests {
         ];
         // Mirrors select_retention_window output: last 3 users + assistants.
         let retained: Vec<ChatMessage> = history[3..].to_vec();
-
         let deleted = deleted_conversation_messages(&history, &retained);
         let contents: Vec<&str> = deleted.iter().map(|m| m.content.as_str()).collect();
         // Exactly the older user/assistant turns; system never dumped.
         assert_eq!(contents, vec!["u1", "a1"]);
-    }
 
-    #[test]
-    fn deleted_set_handles_duplicate_messages_as_multiset() {
-        let system = ChatMessage::system("sys");
-        let history = vec![
-            system,
+        let duplicated = vec![
+            ChatMessage::system("sys"),
             ChatMessage::user("same text"),
             ChatMessage::user("same text"),
             ChatMessage::assistant("answer"),
         ];
-        // Window holds only ONE of the two identical users: the second user
-        // and the unretained assistant are deleted. With set semantics the
-        // second user would wrongly be considered retained.
-        let retained = vec![ChatMessage::user("same text")];
-        let deleted = deleted_conversation_messages(&history, &retained);
-        assert_eq!(deleted.len(), 2);
-        assert_eq!(deleted[0].content, "same text");
-        assert_eq!(deleted[1].content, "answer");
-
-        // Window holds both users: only the unretained assistant is deleted.
-        let retained = vec![
-            ChatMessage::user("same text"),
-            ChatMessage::user("same text"),
+        let cases: [(Vec<ChatMessage>, &[&str]); 2] = [
+            (
+                vec![ChatMessage::user("same text")],
+                &["same text", "answer"],
+            ),
+            (
+                vec![
+                    ChatMessage::user("same text"),
+                    ChatMessage::user("same text"),
+                ],
+                &["answer"],
+            ),
         ];
-        let deleted = deleted_conversation_messages(&history, &retained);
-        assert_eq!(deleted.len(), 1);
-        assert_eq!(deleted[0].content, "answer");
+        for (retained, expected) in &cases {
+            let deleted = deleted_conversation_messages(&duplicated, retained);
+            let contents: Vec<&str> = deleted.iter().map(|m| m.content.as_str()).collect();
+            assert_eq!(contents, *expected, "one message per retained occurrence");
+        }
     }
 
     #[test]

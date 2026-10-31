@@ -476,9 +476,34 @@ fn parse_hunk_header(header: &str) -> (usize, usize) {
 mod tests {
     use super::*;
 
+    /// One hunk-shape decision per case — a modified file's context/removed/added
+    /// lines, a new file (all added, numbered from 1), a deleted file (all
+    /// removed), a binary file (a header with no parseable content), and the
+    /// synthetic untracked file [`make_untracked_diff_file`] assembles.
+    #[expect(clippy::too_many_lines)] // the table is the whole point: one row per hunk shape
     #[test]
-    fn test_parse_simple_diff() {
-        let diff = r#"diff --git a/src/main.rs b/src/main.rs
+    fn file_status_and_line_kinds_follow_the_diff() {
+        /// Where the case's one file comes from.
+        enum Source {
+            Diff(&'static str),
+            Untracked(&'static str),
+        }
+        struct Case {
+            name: &'static str,
+            source: Source,
+            path: &'static str,
+            status: DiffFileStatus,
+            content: DiffContent,
+            hunks: usize,
+            kinds: &'static [DiffLineKind],
+            /// The first line's new-side line number, when it has one.
+            first_new_line: Option<usize>,
+        }
+        let cases = [
+            Case {
+                name: "modified",
+                source: Source::Diff(
+                    r#"diff --git a/src/main.rs b/src/main.rs
 index abc123..def456 100644
 --- a/src/main.rs
 +++ b/src/main.rs
@@ -488,20 +513,25 @@ index abc123..def456 100644
 +    println!("hello world");
      println!("goodbye");
  }
-"#;
-        let output = parse_git_diff(diff);
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].path, "src/main.rs");
-        assert_eq!(output[0].hunks.len(), 1);
-        assert!(output[0].hunks[0].lines.len() >= 3);
-        assert_eq!(output[0].hunks[0].lines[0].kind, DiffLineKind::Context);
-        assert_eq!(output[0].hunks[0].lines[1].kind, DiffLineKind::Removed);
-        assert_eq!(output[0].hunks[0].lines[2].kind, DiffLineKind::Added);
-    }
-
-    #[test]
-    fn test_new_file() {
-        let diff = r#"diff --git a/new.rs b/new.rs
+"#,
+                ),
+                path: "src/main.rs",
+                status: DiffFileStatus::Modified,
+                content: DiffContent::Parseable,
+                hunks: 1,
+                kinds: &[
+                    DiffLineKind::Context,
+                    DiffLineKind::Removed,
+                    DiffLineKind::Added,
+                    DiffLineKind::Context,
+                    DiffLineKind::Context,
+                ],
+                first_new_line: Some(1),
+            },
+            Case {
+                name: "added",
+                source: Source::Diff(
+                    r#"diff --git a/new.rs b/new.rs
 new file mode 100644
 index 0000000..abc123
 --- /dev/null
@@ -510,17 +540,23 @@ index 0000000..abc123
 +fn hello() {
 +    println!("new");
 +}
-"#;
-        let output = parse_git_diff(diff);
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].status, DiffFileStatus::Added);
-        assert!(!output[0].hunks[0].lines.is_empty());
-        assert_eq!(output[0].hunks[0].lines[0].new_line_number, Some(1));
-    }
-
-    #[test]
-    fn test_deleted_file() {
-        let diff = r#"diff --git a/old.rs b/old.rs
+"#,
+                ),
+                path: "new.rs",
+                status: DiffFileStatus::Added,
+                content: DiffContent::Parseable,
+                hunks: 1,
+                kinds: &[
+                    DiffLineKind::Added,
+                    DiffLineKind::Added,
+                    DiffLineKind::Added,
+                ],
+                first_new_line: Some(1),
+            },
+            Case {
+                name: "deleted",
+                source: Source::Diff(
+                    r#"diff --git a/old.rs b/old.rs
 deleted file mode 100644
 index abc123..0000000
 --- a/old.rs
@@ -529,29 +565,70 @@ index abc123..0000000
 -fn hello() {
 -    println!("bye");
 -}
-"#;
-        let output = parse_git_diff(diff);
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].status, DiffFileStatus::Deleted);
-        assert!(!output[0].hunks[0].lines.is_empty());
-        assert_eq!(output[0].hunks[0].lines[0].kind, DiffLineKind::Removed);
-    }
-
-    #[test]
-    fn test_binary() {
-        let diff = r"diff --git a/image.png b/image.png
+"#,
+                ),
+                path: "old.rs",
+                status: DiffFileStatus::Deleted,
+                content: DiffContent::Parseable,
+                hunks: 1,
+                kinds: &[
+                    DiffLineKind::Removed,
+                    DiffLineKind::Removed,
+                    DiffLineKind::Removed,
+                ],
+                first_new_line: None,
+            },
+            Case {
+                name: "binary",
+                source: Source::Diff(
+                    r"diff --git a/image.png b/image.png
 index abc..def 100644
 Binary files a/image.png and b/image.png differ
-";
-        let output = parse_git_diff(diff);
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].content, DiffContent::Binary);
-    }
+",
+                ),
+                path: "image.png",
+                status: DiffFileStatus::Modified,
+                content: DiffContent::Binary,
+                hunks: 0,
+                kinds: &[],
+                first_new_line: None,
+            },
+            Case {
+                name: "untracked",
+                source: Source::Untracked("fn main() {}"),
+                path: "src/untracked.rs",
+                status: DiffFileStatus::Untracked,
+                content: DiffContent::Parseable,
+                hunks: 1,
+                kinds: &[DiffLineKind::Added],
+                first_new_line: Some(1),
+            },
+        ];
 
-    #[test]
-    fn test_empty_diff() {
-        let output = parse_git_diff("");
-        assert!(output.is_empty());
+        for case in &cases {
+            let files = match case.source {
+                Source::Diff(diff) => parse_git_diff(diff),
+                Source::Untracked(content) => vec![make_untracked_diff_file(case.path, content)],
+            };
+            assert_eq!(files.len(), 1, "case {}: one file", case.name);
+            let file = &files[0];
+            assert_eq!(file.path, case.path, "case {}", case.name);
+            assert_eq!(file.status, case.status, "case {}", case.name);
+            assert_eq!(file.content, case.content, "case {}", case.name);
+            assert_eq!(file.hunks.len(), case.hunks, "case {}", case.name);
+            let lines = file
+                .hunks
+                .first()
+                .map_or(&[][..], |hunk| hunk.lines.as_slice());
+            let kinds: Vec<DiffLineKind> = lines.iter().map(|line| line.kind).collect();
+            assert_eq!(kinds, case.kinds, "case {}: line kinds", case.name);
+            assert_eq!(
+                lines.first().and_then(|line| line.new_line_number),
+                case.first_new_line,
+                "case {}: the first line's new-side number",
+                case.name
+            );
+        }
     }
 
     // ── parse_diff_git_line tests ─────────────────────────────────────
@@ -697,63 +774,6 @@ rename to "new.rs"
         assert_eq!(output[0].status, DiffFileStatus::Modified);
         assert_eq!(output[0].old_path, None);
         assert_eq!(output[0].path, "new.rs");
-    }
-
-    #[test]
-    fn test_untracked_file() {
-        let file = make_untracked_diff_file("src/untracked.rs", "fn main() {}");
-        assert_eq!(file.status, DiffFileStatus::Untracked);
-        assert_eq!(file.hunks[0].lines.len(), 1);
-        assert_eq!(file.hunks[0].lines[0].kind, DiffLineKind::Added);
-    }
-
-    #[test]
-    fn test_multi_hunk_diff() {
-        let diff = r"diff --git a/src/lib.rs b/src/lib.rs
-index abc123..def456 100644
---- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -1,3 +1,3 @@
- fn top() {
--    old_top();
-+    new_top();
- }
-@@ -10,3 +10,3 @@
- fn bottom() {
--    old_bottom();
-+    new_bottom();
- }
-@@ -100,6 +100,6 @@
- fn middle() {
--    old_line1();
--    old_line2();
-+    new_line1();
-+    new_line2();
-     context_line();
- }
-";
-        let output = parse_git_diff(diff);
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].path, "src/lib.rs");
-        assert_eq!(output[0].hunks.len(), 3);
-        // First hunk
-        assert_eq!(output[0].hunks[0].header, "@@ -1,3 +1,3 @@");
-        assert_eq!(output[0].hunks[0].lines[1].kind, DiffLineKind::Removed);
-        assert_eq!(output[0].hunks[0].lines[2].kind, DiffLineKind::Added);
-        // Second hunk
-        assert_eq!(output[0].hunks[1].header, "@@ -10,3 +10,3 @@");
-        assert_eq!(output[0].hunks[1].lines[1].kind, DiffLineKind::Removed);
-        assert_eq!(output[0].hunks[1].lines[2].kind, DiffLineKind::Added);
-        // Third hunk — two changes + context
-        assert_eq!(output[0].hunks[2].header, "@@ -100,6 +100,6 @@");
-        assert_eq!(output[0].hunks[2].lines.len(), 7);
-        assert_eq!(output[0].hunks[2].lines[0].kind, DiffLineKind::Context);
-        assert_eq!(output[0].hunks[2].lines[1].kind, DiffLineKind::Removed);
-        assert_eq!(output[0].hunks[2].lines[2].kind, DiffLineKind::Removed);
-        assert_eq!(output[0].hunks[2].lines[3].kind, DiffLineKind::Added);
-        assert_eq!(output[0].hunks[2].lines[4].kind, DiffLineKind::Added);
-        assert_eq!(output[0].hunks[2].lines[5].kind, DiffLineKind::Context);
-        assert_eq!(output[0].hunks[2].lines[6].kind, DiffLineKind::Context);
     }
 
     #[test]

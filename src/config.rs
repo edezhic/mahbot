@@ -528,7 +528,7 @@ macro_rules! string_config_fields {
         // Both passes needed: `normalize()` writes canonical values so
         // the per-field persist paths' `!=` comparisons against current
         // CONFIG accessors see no spurious diffs; accessors below
-        // re-normalise raw values. See `config_reload_accessors_roundtrip`.
+        // re-normalise raw values. See `config_accessors_resolve_defaults_and_override_them`.
         impl ConfigReload {
             $(
                 string_config_fields!(@accessor $field $($annotation)*);
@@ -1615,6 +1615,28 @@ pub(crate) fn model_routing(model: &str, provider_order: Option<&str>) -> ModelR
 mod tests {
     use super::*;
 
+    /// The default model id is pinned as a compile-time constant: a typo fails
+    /// here, before any provider request is built.
+    #[test]
+    fn default_model_identifier_is_pinned() {
+        let reload = ConfigReload::const_new();
+        assert_eq!(
+            reload.manager_model(),
+            "deepseek/deepseek-v4.1-flash-1017",
+            "a fresh manager slot must resolve to the pinned default"
+        );
+        assert_eq!(
+            reload.worker_model(),
+            "deepseek/deepseek-v4.1-flash-1017",
+            "a fresh worker slot must resolve to the pinned default"
+        );
+        assert_eq!(
+            default_model_routing(DEFAULT_CHAT_MODEL),
+            Some("deepseek"),
+            "the default must keep the DeepSeek provider pin"
+        );
+    }
+
     #[test]
     fn onboarding_from_raw_maps_legacy_welcomed_to_finished() {
         // Legacy `"welcomed"` (pre-Support-removal) surfaces as `Finished`, not
@@ -1635,76 +1657,21 @@ mod tests {
         assert_eq!(OnboardingState::from_raw(None), OnboardingState::Init);
     }
 
-    /// All string keys that [`ConfigData::string_fields`] returns must be
-    /// round-trippable through [`ConfigData::set_string_field`]: setting each
-    /// individually and reading back via [`ConfigData::string_fields`] must
-    /// produce the same value.
-    ///
-    /// The test is self-maintaining: it generates synthetic values from each
-    /// field's key, so adding a field to `string_config_fields!` automatically
-    /// covers it without manual test-data upkeep.
+    /// Every accessor pattern the macro generates — `non_empty`, `or`, `list_or`
+    /// — resolved through the ONE reload singleton, and the role slots it maps
+    /// onto: an unset `non_empty` field is `None`, an empty one collapses to
+    /// `None`, an unset `or` field falls back to its default while a persisted
+    /// custom value wins, and an unset list falls back to the default while its
+    /// raw accessor injects nothing (a caller must not mistake the setter's
+    /// fallback for a chosen model). The setter itself only stores: an empty or
+    /// whitespace-only value reaches `normalize` untouched and is collapsed
+    /// there, and a key that is no field is refused rather than silently
+    /// dropped. The manager slot serves every role that plans and the worker
+    /// slot every role that does the work, so a role wired to the wrong slot is
+    /// caught here rather than by a run.
     #[test]
-    fn string_fields_roundtrip() {
-        let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
-
-        // Verify the initial state: all fields are None.
-        for (_key, value) in config.string_fields() {
-            assert!(value.is_none(), "field should start as None");
-        }
-
-        // Set each field to a synthetic value derived from its key and verify
-        // it round-trips back through string_fields.  Using synthetic values
-        // keeps the test self-maintaining — adding a field to the macro
-        // automatically covers it without separate test-data upkeep.
-        let keys: Vec<&str> = config.string_fields().iter().map(|(k, _)| *k).collect();
-        for &key in &keys {
-            let test_value = format!("test-{key}");
-            let recognized = config.set_string_field(key, &test_value);
-            assert!(recognized, "key '{key}' should be recognized");
-
-            // Find this key in string_fields and verify the value matches.
-            let found = config.get_string_field(key);
-            assert_eq!(
-                found,
-                Some(test_value.as_str()),
-                "value for '{key}' should match after set"
-            );
-        }
-
-        // ── Normalization is handled by normalize(), not set_string_field ──
-        // set_string_field stores the raw value as-is.
-        let _ = config.set_string_field("provider_key", "");
-        let pk = config.get_string_field("provider_key");
-        assert_eq!(
-            pk,
-            Some(""),
-            "empty string stored as-is by set_string_field"
-        );
-
-        let _ = config.set_string_field("provider_key", "   ");
-        let pk = config.get_string_field("provider_key");
-        assert_eq!(
-            pk,
-            Some("   "),
-            "whitespace-only string stored as-is by set_string_field"
-        );
-
-        // After normalize(), empty/whitespace values are collapsed to None.
-        config.normalize();
-        let pk = config.get_string_field("provider_key");
-        assert!(pk.is_none(), "normalize() collapses empty string to None");
-
-        // Unknown key returns false.
-        assert!(!config.set_string_field("nonexistent_key", "value"));
-    }
-
-    /// Smoke test: macro-generated accessors roundtrip correctly for one
-    /// representative field of each pattern (`non_empty`, `or`, `list_or`).
-    ///
-    /// Structural sync (every field has a correctly-typed accessor) is guaranteed
-    /// at compile time by the macro — this test only verifies runtime semantics.
-    #[test]
-    fn config_reload_accessors_roundtrip() {
+    #[expect(clippy::too_many_lines)] // one section per accessor pattern the macro generates
+    fn config_accessors_resolve_defaults_and_override_them() {
         let reload = ConfigReload::const_new();
 
         // ── non_empty: returns None when unset, Some(value) when set ──
@@ -1777,11 +1744,32 @@ mod tests {
             vec!["model-a", "model-b", "model-c"],
             "raw accessor returns exactly the configured entries, in order"
         );
-    }
 
-    #[test]
-    fn role_model_maps_roles_to_slots() {
-        let reload = ConfigReload::const_new();
+        // ── the setter stores; normalize() is what collapses ──
+        let mut raw = ConfigData::STRUCT_FIELDS_DEFAULT;
+        assert!(raw.set_string_field("provider_key", ""));
+        assert_eq!(
+            raw.get_string_field("provider_key"),
+            Some(""),
+            "empty string stored as-is by set_string_field"
+        );
+        let _ = raw.set_string_field("provider_key", "   ");
+        assert_eq!(
+            raw.get_string_field("provider_key"),
+            Some("   "),
+            "whitespace-only string stored as-is by set_string_field"
+        );
+        raw.normalize();
+        assert!(
+            raw.get_string_field("provider_key").is_none(),
+            "normalize() collapses an empty/whitespace value to None"
+        );
+        assert!(
+            !raw.set_string_field("nonexistent_key", "value"),
+            "a key that is no field is refused"
+        );
+
+        // ── the role slots ──
         let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(config.set_string_field("manager_model", "manager-slot-model"));
         assert!(config.set_string_field("worker_model", "worker-slot-model"));
@@ -1805,15 +1793,6 @@ mod tests {
         ] {
             assert_eq!(reload.role_model(role), "worker-slot-model");
         }
-    }
-
-    #[test]
-    fn trimmed_or_none_trims_whitespace() {
-        // trimmed_or_none is the canonical primitive — trims and returns None
-        // for empty or whitespace-only strings.
-        assert_eq!(trimmed_or_none("  value  "), Some("value".to_string()));
-        assert_eq!(trimmed_or_none(" "), None);
-        assert_eq!(trimmed_or_none(""), None);
     }
 
     /// Endpoint normalization: trivial variants of the default
@@ -1879,98 +1858,23 @@ mod tests {
         assert_eq!(chat_credential(&ConfigData::STRUCT_FIELDS_DEFAULT), None);
     }
 
-    /// Verify that [`ConfigData::normalize_entries`] normalises every entry in
-    /// `model_routings`.
+    /// `ModelRouting::upsert` targets exactly one entry by model name: it
+    /// updates that entry, pushes one when the name is not there yet, clears the
+    /// field when the closure sets `None`, and leaves every other entry's own
+    /// value alone — one upsert never rewrites a sibling, and never adds a
+    /// duplicate row.
     #[test]
-    fn normalize_entries_works() {
-        let mut config = ConfigData {
-            model_routings: vec![
-                ModelRouting {
-                    model: "test-model".into(),
-                    provider_order: Some("   ".into()),
-                },
-                ModelRouting {
-                    model: "test-model-2".into(),
-                    provider_order: Some("  OpenAi,  Anthropic  ".into()),
-                },
-            ],
-            ..ConfigData::STRUCT_FIELDS_DEFAULT
-        };
-
-        config.normalize_entries();
-
-        // Routing: whitespace-only provider_order → None
-        assert_eq!(config.model_routings[0].provider_order, None);
-
-        // Routing: trimmed provider_order preserved
-        assert_eq!(
-            config.model_routings[1].provider_order,
-            Some("OpenAi,  Anthropic".into())
-        );
-    }
-
-    // ── Upsert three-scenario tests ─────────────────────────
-    //
-    // `ModelRouting::upsert` is tested across three scenarios:
-    //   1. updates_existing — existing entry, upsert sets the target field
-    //   2. pushes_new_entry — empty vec, new entry is pushed with the
-    //      target field set
-    //   3. can_set_none — existing entry has the field set to non-None;
-    //      clearing it via None removes the value
-
-    #[test]
-    fn upsert_model_routing_fields() {
-        // 1. updates_existing — set provider_order
-        {
-            let mut items = vec![model_routing("test-model", Some("OpenAi"))];
-            ModelRouting::upsert(&mut items, "test-model", |item| {
-                item.provider_order = Some("Anthropic".into());
-            });
-            assert_eq!(items.len(), 1);
-            assert_eq!(
-                items[0].provider_order,
-                Some("Anthropic".into()),
-                "[provider_order] target field updated"
-            );
-        }
-
-        // 2. pushes_new_entry
-        {
-            let mut items = vec![];
-            ModelRouting::upsert(&mut items, "test-model", |item| {
-                item.provider_order = Some("OpenAi".into());
-            });
-            assert_eq!(items.len(), 1);
-            assert_eq!(items[0].model, "test-model");
-            assert_eq!(
-                items[0].provider_order,
-                Some("OpenAi".into()),
-                "[provider_order] set on new entry"
-            );
-        }
-
-        // 3. can_set_none — clear provider_order
-        {
-            let mut items = vec![model_routing("test-model", Some("OpenAi"))];
-            ModelRouting::upsert(&mut items, "test-model", |item| item.provider_order = None);
-            assert_eq!(
-                items[0].provider_order, None,
-                "[provider_order] cleared to None"
-            );
-        }
-    }
-
-    #[test]
-    fn upsert_multiple_entries_independent_keys() {
+    fn upsert_targets_one_entry_by_its_model() {
         let mut routings = vec![
             model_routing("test-router-a", Some("OpenAi")),
             model_routing("test-router-b", Some("Anthropic")),
         ];
 
-        // Each upsert targets exactly one entry by key.
+        // An existing entry is updated in place, its sibling untouched.
         ModelRouting::upsert(&mut routings, "test-router-a", |mr| {
             mr.provider_order = Some("Google".into());
         });
+        assert_eq!(routings.len(), 2, "no spurious push");
         assert_eq!(routings[0].provider_order, Some("Google".into()));
         assert_eq!(routings[1].provider_order, Some("Anthropic".into()));
 
@@ -1980,30 +1884,45 @@ mod tests {
         assert_eq!(routings[0].provider_order, Some("Google".into()));
         assert_eq!(routings[1].provider_order, Some("OpenAi".into()));
 
-        // Total entries unchanged — no spurious pushes.
+        // Clearing the field on an existing entry removes the value, not the row.
+        ModelRouting::upsert(&mut routings, "test-router-a", |mr| {
+            mr.provider_order = None;
+        });
         assert_eq!(routings.len(), 2);
+        assert_eq!(
+            routings[0].provider_order, None,
+            "a field cleared to None is cleared"
+        );
+
+        // A name that is not there gets its own entry, with the field set.
+        ModelRouting::upsert(&mut routings, "test-router-c", |mr| {
+            mr.provider_order = Some("OpenAi".into());
+        });
+        assert_eq!(routings.len(), 3);
+        assert_eq!(routings[2].model, "test-router-c");
+        assert_eq!(routings[2].provider_order, Some("OpenAi".into()));
     }
 
     // ── validate_config tests ──────────────────────────────────────
 
-    /// A valid URL (trimmed) passes validation.
+    /// A valid URL passes validation, padded or not: validation runs after
+    /// `normalize`, so it only ever sees the canonical value. This is a
+    /// regression test for the latent ordering bug where `validate_config`
+    /// (which used untrimmed `starts_with`) ran *before* `normalize` (which
+    /// trims). What validation REFUSES — an endpoint with no scheme, a provider
+    /// key still holding the placeholder — is pinned where it is reached in
+    /// production, through the settle-and-persist path
+    /// (`config_db::tests::test_persist_settled_rejects_invalid_values_before_writing`),
+    /// which also holds that nothing is written when it refuses.
     #[test]
-    fn validate_config_accepts_valid_url() {
+    fn validate_config_accepts_a_url_however_it_was_padded() {
         let mut config = ConfigData {
             provider_endpoint: Some("https://openrouter.ai/api/v1".into()),
             ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
         config.normalize();
         validate_config(&config).unwrap();
-    }
 
-    /// A whitespace-padded URL passes validation after `normalize` normalises
-    /// it.  This is a regression test for the latent ordering bug where
-    /// `validate_config` (which used untrimmed `starts_with`) ran *before*
-    /// `normalize` (which trims).  The fix ensures `normalize` always runs
-    /// first, so validation only ever sees canonical values.
-    #[test]
-    fn validate_config_accepts_whitespace_padded_url_after_normalize() {
         let mut config = ConfigData {
             provider_endpoint: Some("  https://openrouter.ai/api/v1   ".into()),
             ..ConfigData::STRUCT_FIELDS_DEFAULT
@@ -2011,74 +1930,6 @@ mod tests {
         config.normalize();
         // After normalize the value is trimmed — validation sees the canonical form.
         validate_config(&config).unwrap();
-    }
-
-    /// A URL without scheme is rejected regardless of whitespace.
-    #[test]
-    fn validate_config_rejects_url_without_scheme() {
-        let mut config = ConfigData {
-            provider_endpoint: Some("not-a-url".into()),
-            ..ConfigData::STRUCT_FIELDS_DEFAULT
-        };
-        config.normalize();
-        let err = validate_config(&config).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Provider endpoint must be a valid URL"),
-            "expected URL scheme error, got: {err}",
-        );
-    }
-
-    /// A placeholder provider key is rejected.
-    #[test]
-    fn validate_config_rejects_placeholder_key() {
-        let mut config = ConfigData {
-            provider_key: Some("sk-or-v1-...".into()),
-            ..ConfigData::STRUCT_FIELDS_DEFAULT
-        };
-        config.normalize();
-        let err = validate_config(&config).unwrap_err();
-        assert!(
-            err.to_string().contains("placeholder"),
-            "expected placeholder error, got: {err}",
-        );
-    }
-
-    /// The per-field persist path must never write or delete
-    /// `wake_word_templates` — the key is owned exclusively by the voice
-    /// pipeline (`persist_enrollment`), and `persist_settled_string_field`
-    /// refuses it structurally (defense in depth) so no future caller can
-    /// accidentally create a dual-writer race.
-    ///
-    /// This test swaps the shared global CONFIG, so it joins the
-    /// `config_persist` serial group used by the config_db persist tests —
-    /// an unserialized restore swap could clobber a concurrent serialized
-    /// test's CONFIG writes and fail its asserts nondeterministically.
-    #[tokio::test]
-    #[serial_test::serial(config_persist)]
-    async fn persist_settled_string_field_refuses_wake_word_templates() {
-        // Templates enrolled by the voice pipeline.
-        let template_json = r#"{"classifier":null}"#;
-        let original = CONFIG.snapshot();
-        let mut enrolled = ConfigData::STRUCT_FIELDS_DEFAULT;
-        assert!(enrolled.set_string_field("wake_word_templates", template_json));
-        CONFIG.swap(enrolled);
-
-        // The guard returns the current templates and never touches the DB —
-        // the call must not error and must not alter CONFIG.
-        let result = persist_settled_string_field("wake_word_templates", "garbage").await;
-        assert_eq!(
-            result.unwrap().value,
-            template_json,
-            "guard must return the current templates unchanged"
-        );
-        assert_eq!(
-            CONFIG.wake_word_templates(),
-            Some(template_json.to_string()),
-            "CONFIG wake_word_templates must be untouched"
-        );
-
-        CONFIG.swap(original);
     }
 
     /// The persist side-effect arms and the `wake_word_templates` guard are
@@ -2219,28 +2070,6 @@ mod tests {
         );
     }
 
-    /// The default model id is pinned as a compile-time constant: a typo fails
-    /// here, before any provider request is built.
-    #[test]
-    fn default_model_identifier_is_pinned() {
-        let reload = ConfigReload::const_new();
-        assert_eq!(
-            reload.manager_model(),
-            "deepseek/deepseek-v4.1-flash-1017",
-            "a fresh manager slot must resolve to the pinned default"
-        );
-        assert_eq!(
-            reload.worker_model(),
-            "deepseek/deepseek-v4.1-flash-1017",
-            "a fresh worker slot must resolve to the pinned default"
-        );
-        assert_eq!(
-            default_model_routing(DEFAULT_CHAT_MODEL),
-            Some("deepseek"),
-            "the default must keep the DeepSeek provider pin"
-        );
-    }
-
     /// One-time migration: persisted `config_kv` rows holding any historical
     /// manager/worker default are rewritten to the current default, and only
     /// those rows (exact full-string match) are touched; each rewritten slot
@@ -2349,36 +2178,6 @@ mod tests {
         );
     }
 
-    /// A custom-endpoint installation keeps its endpoint, key and chosen
-    /// models: the migration only rewrites exact historical slot defaults.
-    #[tokio::test]
-    async fn migrate_old_default_models_leaves_custom_endpoint_installation_untouched() {
-        let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
-        let installation = [
-            (CONFIG_KEY_PROVIDER_ENDPOINT, "https://llm.example/v1"),
-            (CONFIG_KEY_PROVIDER_ENDPOINT_KEY, "sk-local"),
-            (CONFIG_KEY_MANAGER_MODEL, "my-stack/manager"),
-            (CONFIG_KEY_WORKER_MODEL, "my-stack/worker"),
-        ];
-        for (key, value) in installation {
-            store.set_kv(key, value).await.unwrap();
-        }
-
-        migrate_old_default_models(&store).await.unwrap();
-
-        for (key, value) in installation {
-            assert_eq!(
-                store.get_kv(key).await.unwrap().as_deref(),
-                Some(value),
-                "{key} must survive the default-model migration"
-            );
-        }
-        assert!(
-            store.get_all_model_routings().await.unwrap().is_empty(),
-            "nothing was migrated, so no routing row may be written"
-        );
-    }
-
     /// Regression for the retired `video_transcription_model` slot: a row
     /// persisted by a pre-hardcode install must be deleted by the reload-time
     /// orphan purge, so a stale stored value can never resurface if the key is
@@ -2482,11 +2281,39 @@ mod tests {
     }
 
     /// The migration must be a no-op when a slot already holds the target
-    /// default or a genuine user override — it must never overwrite a
-    /// user-configured model.
+    /// default, a genuine user override, or a custom-endpoint installation's own
+    /// endpoint, key and models — it must never overwrite a user-configured
+    /// model, and a historical default of the *other* slot is not this slot's
+    /// default.
     #[tokio::test]
-    async fn migrate_old_default_models_noop_for_target_and_user_overrides() {
+    async fn migrate_old_default_models_never_touches_a_genuine_choice() {
         let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
+
+        // A custom-endpoint installation: its endpoint, its own key and the two
+        // models the owner picked for it all survive, and nothing is routed.
+        let installation = [
+            (CONFIG_KEY_PROVIDER_ENDPOINT, "https://llm.example/v1"),
+            (CONFIG_KEY_PROVIDER_ENDPOINT_KEY, "sk-local"),
+            (CONFIG_KEY_MANAGER_MODEL, "my-stack/manager"),
+            (CONFIG_KEY_WORKER_MODEL, "my-stack/worker"),
+        ];
+        for (key, value) in installation {
+            store.set_kv(key, value).await.unwrap();
+        }
+
+        migrate_old_default_models(&store).await.unwrap();
+
+        for (key, value) in installation {
+            assert_eq!(
+                store.get_kv(key).await.unwrap().as_deref(),
+                Some(value),
+                "{key} must survive the default-model migration"
+            );
+        }
+        assert!(
+            store.get_all_model_routings().await.unwrap().is_empty(),
+            "nothing was migrated, so no routing row may be written"
+        );
 
         // Already at the target default.
         store
@@ -2563,14 +2390,18 @@ mod tests {
 
     /// Effective routing on a private [`ConfigReload`]: a stored override wins,
     /// an unset/cleared field falls back to the model's default provider, a
-    /// non-DeepSeek model stays auto-routed.
+    /// non-DeepSeek model stays auto-routed. Every entry passes through the
+    /// normalisation first, so the order a caller stored is trimmed, and one
+    /// holding only whitespace is as unset as an empty one.
     #[test]
     fn model_routing_applies_the_default_provider_when_unset() {
         let config = ConfigReload::const_new();
         let mut data = ConfigData::STRUCT_FIELDS_DEFAULT;
         data.model_routings = vec![
-            model_routing("deepseek/deepseek-v4.1-flash", Some("GMICloud")),
+            model_routing("deepseek/deepseek-v4.1-flash", Some("  GMICloud  ")),
             model_routing("deepseek/deepseek-v4-flash-0731", Some("")),
+            model_routing("deepseek/deepseek-v4.1-pro", Some("   ")),
+            model_routing("qwen/qwen3.8-flash", Some("  ")),
         ];
         data.normalize();
         config.swap(data);
@@ -2581,7 +2412,7 @@ mod tests {
                 .provider_order
                 .as_deref(),
             Some("GMICloud"),
-            "an explicitly set provider must win, unchanged"
+            "an explicitly set provider must win, trimmed of its padding"
         );
         for model in [
             "deepseek/deepseek-v4.1-pro",
@@ -2591,14 +2422,23 @@ mod tests {
             assert_eq!(
                 config.model_routing(model).provider_order.as_deref(),
                 Some("deepseek"),
-                "{model} has no explicit setting and must fall back to the \
-                 canonical DeepSeek slug"
+                "{model} has no explicit setting — an empty or whitespace-only order \
+                 is no setting — and must fall back to the canonical DeepSeek slug"
             );
         }
         assert_eq!(
             config.model_routing("qwen/qwen3.8-flash").provider_order,
             None,
             "a non-DeepSeek model must stay auto-routed"
+        );
+
+        // The built-in default model carries its provider pin, so a fresh
+        // install's manager requests are routed rather than left to the
+        // provider's own choice.
+        assert_eq!(
+            default_model_routing(DEFAULT_CHAT_MODEL),
+            Some("deepseek"),
+            "the default must keep the DeepSeek provider pin"
         );
     }
 }

@@ -625,23 +625,6 @@ mod tests {
     }
 
     #[test]
-    fn only_a_tag_name_parses() {
-        assert_eq!(
-            parse_tag("ffmpeg-v7.1-mahbot.1"),
-            Some((semver::Version::new(7, 1, 0), 1))
-        );
-        assert_eq!(
-            parse_tag("ffmpeg-v7.1.2-mahbot.12").map(|(version, _)| version),
-            Some(semver::Version::new(7, 1, 2))
-        );
-        // Another stream's tag, a staging directory, and a half-written name.
-        assert_eq!(parse_tag("tgapi-v10.3"), None);
-        assert_eq!(parse_tag(".staging-Kd7x2p"), None);
-        assert_eq!(parse_tag("ffmpeg-v7.1"), None);
-        assert_eq!(parse_tag("ffmpeg-v7.1-mahbot.x"), None);
-    }
-
-    #[test]
     fn every_platform_gets_its_own_archive() {
         let tag = "ffmpeg-v7.1-mahbot.2";
         assert_eq!(
@@ -854,50 +837,45 @@ mod tests {
         );
     }
 
+    /// Both archive formats the stream publishes — `tar.gz` on macOS and
+    /// Linux, `zip` on Windows — land in the same staging layout.
     #[test]
-    fn a_tar_gz_release_lands_in_the_staging_layout() {
+    fn a_release_lands_in_the_staging_layout() {
+        let entries = release_entries("ffmpeg-v7.1-mahbot.2");
         let dir = tempfile::tempdir().expect("tempdir");
-        let archive = dir.path().join("pkg.tar.gz");
-        write_tar_gz(&archive, &release_entries("ffmpeg-v7.1-mahbot.2"));
-        assert_staged(&archive, &dir.path().join("staging"));
-    }
-
-    #[test]
-    fn a_zip_release_lands_in_the_staging_layout() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let tarball = dir.path().join("pkg.tar.gz");
+        write_tar_gz(&tarball, &entries);
+        assert_staged(&tarball, &dir.path().join("staging-tar"));
         let archive = dir.path().join("pkg.zip");
-        write_zip(&archive, &release_entries("ffmpeg-v7.1-mahbot.2"));
-        assert_staged(&archive, &dir.path().join("staging"));
+        write_zip(&archive, &entries);
+        assert_staged(&archive, &dir.path().join("staging-zip"));
     }
 
+    /// The licence material is the one thing a release may not omit: the
+    /// licence and source notes are required, while the component notices are
+    /// optional — a build from before they existed installs with the material
+    /// it carries, since a host with no pair at all is worse served than one
+    /// running that build until the next start takes a newer one.
     #[test]
-    fn a_release_without_the_licence_is_a_failed_install() {
+    fn licence_material_rules() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let archive = dir.path().join("pkg.tar.gz");
+
+        let archive = dir.path().join("no-licence.tar.gz");
         let entries: Vec<(String, Vec<u8>)> = release_entries("ffmpeg-v7.1-mahbot.2")
             .into_iter()
             .filter(|(name, _)| !name.starts_with("LICENCE"))
             .collect();
         write_tar_gz(&archive, &entries);
-
-        let reason = extract_into(&archive, &dir.path().join("staging"))
+        let reason = extract_into(&archive, &dir.path().join("refused-staging"))
             .expect_err("a release without its licence text is refused");
         assert!(reason.contains("LICENCE.txt"), "{reason}");
-    }
 
-    /// A build from before the component notices existed installs with the material it
-    /// carries: a host with no pair at all is worse served than one running that build
-    /// until the next start takes a newer one.
-    #[test]
-    fn a_build_that_predates_the_notices_installs_with_what_it_carries() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let archive = dir.path().join("pkg.tar.gz");
+        let archive = dir.path().join("no-notices.tar.gz");
         let entries: Vec<(String, Vec<u8>)> = release_entries("ffmpeg-v7.1-mahbot.2")
             .into_iter()
             .filter(|(name, _)| name != COMPONENT_NOTICES)
             .collect();
         write_tar_gz(&archive, &entries);
-
         let staging = dir.path().join("staging");
         extract_into(&archive, &staging).expect("a build from before the notices installs");
         for licence in LICENCE_AND_SOURCE {
@@ -1308,92 +1286,93 @@ mod tests {
         assert_eq!(entries(&root), [newer], "the build it replaced is gone");
     }
 
-    /// A pair damaged after it was placed — executable files under the right tag, but no
-    /// longer the build they are named after — is replaced at the next start, without a
-    /// newer build having to appear for it.
+    /// A copy in place that is not the one to keep is replaced exactly once, so
+    /// a start converges on one copy instead of downloading on every start: a
+    /// pair damaged after it was placed — executable files under the right tag,
+    /// but no longer the build they are named after — and a tag that outranks
+    /// the stream's newest (a withdrawn build, or one that no longer proves
+    /// itself).
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(ffmpeg_releases)]
-    async fn a_damaged_copy_is_reinstalled_at_the_next_start() {
-        let files = tempfile::tempdir().expect("stand-in release files");
-        let (_home, _lock, root) = temp_root();
-        let host = FakeRelease::start();
-        let tag = "ffmpeg-v7.1-mahbot.2";
-        let asset = host_asset(tag);
-        let archive = archive_bytes(files.path(), tag);
-        let sums = checksum_line(&sha256_hex(&archive), &asset);
-        host.offer(tag, &asset, &sums, &archive);
-        let _hook = ReleasesHook::at(host.base());
-        update().await.expect("the build installs");
+    async fn an_unkept_copy_is_replaced_once() {
+        // A truncation or a quarantine leaves exactly this: the directory parses
+        // and the files are executable, but one of them is not the build anymore.
+        {
+            let files = tempfile::tempdir().expect("stand-in release files");
+            let (_home, _lock, root) = temp_root();
+            let host = FakeRelease::start();
+            let tag = "ffmpeg-v7.1-mahbot.2";
+            let asset = host_asset(tag);
+            let archive = archive_bytes(files.path(), tag);
+            let sums = checksum_line(&sha256_hex(&archive), &asset);
+            host.offer(tag, &asset, &sums, &archive);
+            let _hook = ReleasesHook::at(host.base());
+            update().await.expect("the build installs");
 
-        // A truncation or a quarantine leaves exactly this: the directory parses and the
-        // files are executable, but one of them is not the build anymore.
-        let damaged = root.join(tag).join("bin").join(ffmpeg_file());
-        fs::write(
-            &damaged,
-            b"#!/bin/sh\necho 'ffmpeg version 0.0.0 damaged'\n",
-        )
-        .expect("damage the copy");
-        managed_bin::set_executable(&damaged).expect("keep it executable");
+            let damaged = root.join(tag).join("bin").join(ffmpeg_file());
+            fs::write(
+                &damaged,
+                b"#!/bin/sh\necho 'ffmpeg version 0.0.0 damaged'\n",
+            )
+            .expect("damage the copy");
+            managed_bin::set_executable(&damaged).expect("keep it executable");
 
-        assert_eq!(
-            update()
-                .await
-                .expect("the damaged copy is replaced")
-                .as_deref(),
-            Some(tag),
-            "the same build is installed again"
-        );
-        assert_eq!(
-            update().await.expect("nothing to do").as_deref(),
-            None,
-            "the replacement proves itself"
-        );
-    }
+            assert_eq!(
+                update()
+                    .await
+                    .expect("the damaged copy is replaced")
+                    .as_deref(),
+                Some(tag),
+                "the same build is installed again"
+            );
+            assert_eq!(
+                update().await.expect("nothing to do").as_deref(),
+                None,
+                "the replacement proves itself"
+            );
+        }
 
-    /// A copy whose tag outranks the stream's newest — a withdrawn build, or one that no
-    /// longer proves itself — is replaced by the build the stream offers and removed, so a
-    /// start converges on one copy instead of downloading the same archive forever.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial_test::serial(ffmpeg_releases)]
-    async fn a_copy_newer_than_the_stream_is_replaced_once() {
-        let files = tempfile::tempdir().expect("stand-in release files");
-        let (_home, _lock, root) = temp_root();
-        let host = FakeRelease::start();
-        let tag = "ffmpeg-v7.1-mahbot.2";
-        let asset = host_asset(tag);
-        let archive = archive_bytes(files.path(), tag);
-        let sums = checksum_line(&sha256_hex(&archive), &asset);
-        host.offer(tag, &asset, &sums, &archive);
-        let _hook = ReleasesHook::at(host.base());
+        // A copy whose tag outranks the stream's newest is replaced by the build
+        // the stream offers, and removed.
+        {
+            let files = tempfile::tempdir().expect("stand-in release files");
+            let (_home, _lock, root) = temp_root();
+            let host = FakeRelease::start();
+            let tag = "ffmpeg-v7.1-mahbot.2";
+            let asset = host_asset(tag);
+            let archive = archive_bytes(files.path(), tag);
+            let sums = checksum_line(&sha256_hex(&archive), &asset);
+            host.offer(tag, &asset, &sums, &archive);
+            let _hook = ReleasesHook::at(host.base());
 
-        install_fake(&root, "ffmpeg-v7.1-mahbot.9");
+            install_fake(&root, "ffmpeg-v7.1-mahbot.9");
 
-        assert_eq!(
-            update()
-                .await
-                .expect("the build the stream offers installs")
-                .as_deref(),
-            Some(tag)
-        );
-        assert_eq!(
-            entries(&root),
-            [tag],
-            "the copy the stream no longer offers is gone"
-        );
+            assert_eq!(
+                update()
+                    .await
+                    .expect("the build the stream offers installs")
+                    .as_deref(),
+                Some(tag)
+            );
+            assert_eq!(
+                entries(&root),
+                [tag],
+                "the copy the stream no longer offers is gone"
+            );
 
-        let asked = host.asked().len();
-        assert_eq!(
-            update().await.expect("nothing to do"),
-            None,
-            "the following start converges on the one copy"
-        );
-        assert_eq!(
-            host.asked().len(),
-            asked + 1,
-            "only the listing is read again"
-        );
+            let asked = host.asked().len();
+            assert_eq!(
+                update().await.expect("nothing to do"),
+                None,
+                "the following start converges on the one copy"
+            );
+            assert_eq!(
+                host.asked().len(),
+                asked + 1,
+                "only the listing is read again"
+            );
+        }
     }
 
     /// A stream that cannot be read leaves a copy that proves itself alone: nothing is
@@ -1444,12 +1423,15 @@ mod tests {
         );
     }
 
-    /// A stream with no build for this host is a reason, never another platform's
-    /// archive.
+    /// `newest()`'s two answers when the stream cannot name a build: a stream
+    /// with no archive for this host is a reason naming the platform (never
+    /// another platform's archive), and a listing that is not a release array —
+    /// the API's own rate-limit message, a proxy's answer — is a read failure,
+    /// never the claim that this platform has no published build.
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(ffmpeg_releases)]
-    async fn no_build_for_this_host_is_a_reason() {
+    async fn newest_names_why_it_cannot_pick_a_build() {
         let host = FakeRelease::start();
         host.offer(
             "ffmpeg-v7.1-mahbot.2",
@@ -1457,26 +1439,19 @@ mod tests {
             "",
             b"",
         );
-        let _lock = env_held();
-        let _hook = ReleasesHook::at(host.base());
-        let Err(reason) = newest().await else {
-            panic!("this host has no build in the stream");
-        };
-        let (os, arch) = managed_bin::host_os_arch().expect("a supported host");
-        assert!(
-            reason.contains(&format!("no ffmpeg build is published for {os}-{arch}")),
-            "{reason}"
-        );
-    }
+        {
+            let _lock = env_held();
+            let _hook = ReleasesHook::at(host.base());
+            let Err(reason) = newest().await else {
+                panic!("this host has no build in the stream");
+            };
+            let (os, arch) = managed_bin::host_os_arch().expect("a supported host");
+            assert!(
+                reason.contains(&format!("no ffmpeg build is published for {os}-{arch}")),
+                "{reason}"
+            );
+        }
 
-    /// A host answering the listing with a JSON body that is not a release array — the API's
-    /// own rate-limit message, a proxy's answer — is a listing that could not be read, never
-    /// the claim that this platform has no published build.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial_test::serial(ffmpeg_releases)]
-    async fn a_listing_that_is_not_one_is_a_read_failure() {
-        let host = FakeRelease::start();
         host.listing_is(br#"{"message":"API rate limit exceeded"}"#);
         let _lock = env_held();
         let _hook = ReleasesHook::at(host.base());

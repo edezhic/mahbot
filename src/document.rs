@@ -2165,6 +2165,21 @@ mod tests {
     use crate::ooxml::test_fixtures::zip_fixture;
     use std::io::Write;
 
+    /// A Markdown file and an extensionless UTF-8 file are accepted as text,
+    /// byte for byte.
+    #[test]
+    fn markdown_and_extensionless_utf8_are_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(matches!(
+            convert_document(b"# Title\n\nBody", "notes.md", dir.path()),
+            DocOutcome::Text { text, .. } if text == "# Title\n\nBody"
+        ));
+        assert!(matches!(
+            convert_document(b"plain words", "README", dir.path()),
+            DocOutcome::Text { text, .. } if text == "plain words"
+        ));
+    }
+
     /// One embedded image XObject for [`pdf_fixture`]: dictionary entries are
     /// written verbatim so a test can pick the filter chain and the colour space,
     /// and the stream bytes are raw so real Flate streams can be built.
@@ -2396,40 +2411,6 @@ mod tests {
         );
     }
 
-    /// A ZIP's own entries win over its name: a real `.xlsx` named `.docx` is
-    /// read as the spreadsheet it is, because only the package can say which of
-    /// the three OOXML families it holds.
-    #[test]
-    fn an_xlsx_named_docx_reads_as_a_spreadsheet() {
-        let bytes = one_cell_xlsx();
-        assert_eq!(real_family(&bytes), RealFamily::Xlsx);
-        let dir = tempfile::tempdir().expect("tempdir");
-        for name in ["book.docx", "book.docm"] {
-            assert!(
-                matches!(
-                    convert_document(&bytes, name, dir.path()),
-                    DocOutcome::Text { text, .. } if text == "Sheet \"S\":\n  A1: cell"
-                ),
-                "{name} must read as the spreadsheet it holds"
-            );
-        }
-    }
-
-    /// PDF magic decides a PDF: renaming one changes nothing, not even when the
-    /// new name is one whose extension would otherwise be decoded as text.
-    #[test]
-    fn a_pdf_under_another_name_is_still_a_pdf() {
-        let bytes = text_pdf(&[]);
-        assert_eq!(real_family(&bytes), RealFamily::Pdf);
-        let dir = tempfile::tempdir().expect("tempdir");
-        for name in ["notes.txt", "notes.docx", "notes.bin"] {
-            let DocOutcome::Text { text, .. } = convert_document(&bytes, name, dir.path()) else {
-                panic!("{name} must still read as a PDF");
-            };
-            assert!(text.contains("Hello PDF text layer"), "{name}: {text:?}");
-        }
-    }
-
     #[test]
     fn garbage_pdf_is_reported_unreadable() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2441,19 +2422,6 @@ mod tests {
         assert!(
             matches!(outcome, DocOutcome::Unreadable { reason } if reason == "could not be parsed")
         );
-    }
-
-    #[test]
-    fn markdown_and_extensionless_utf8_are_text() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert!(matches!(
-            convert_document(b"# Title\n\nBody", "notes.md", dir.path()),
-            DocOutcome::Text { text, .. } if text == "# Title\n\nBody"
-        ));
-        assert!(matches!(
-            convert_document(b"plain words", "README", dir.path()),
-            DocOutcome::Text { text, .. } if text == "plain words"
-        ));
     }
 
     /// A ZIP holding no OOXML package at all keeps the name's verdict: only a
@@ -2521,20 +2489,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn pdf_with_text_layer_extracts_text_without_rasterizing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = convert_document(&text_pdf(&[]), "hello.pdf", dir.path());
-        let DocOutcome::Text { text, images, .. } = outcome else {
-            panic!("expected Text outcome for a text-layer PDF");
-        };
-        assert!(
-            text.contains("Hello PDF text layer"),
-            "unexpected extracted text: {text:?}"
-        );
-        assert!(images.is_empty(), "text pages must not be rasterized");
-    }
-
     /// The source colour, within JPEG's own rounding.
     fn assert_solid_rgb(actual: [u8; 3]) {
         for (channel, expected) in actual.into_iter().zip(SOLID_RGB) {
@@ -2576,40 +2530,59 @@ mod tests {
     }
 
     /// A form XObject is a container the page's content paints through, so the
-    /// images in its own resources are the page's images — a rasterized page
-    /// shows them, and a text page has to extract them.
+    /// images in its own resources — and the inline images in its own content —
+    /// are the page's images. A text page is never rasterized, so both passes
+    /// have to walk the forms or the figure is lost.
     #[test]
-    fn pdf_text_page_writes_image_nested_in_a_form() {
+    fn a_form_xobject_hands_its_images_to_the_page() {
         let content = "BT /F1 24 Tf 72 700 Td (Hello PDF text layer) Tj ET";
-        let form = "/Im0 Do";
-        let objects = vec![
-            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-            b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>".to_vec(),
-            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources \
-              << /Font << /F1 3 0 R >> /XObject << /Fm0 5 0 R >> >> /Contents 7 0 R >>"
-                .to_vec(),
-            format!(
-                "<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources \
-                 << /XObject << /Im0 6 0 R >> >> /Length {} >>\nstream\n{form}\nendstream",
-                form.len()
-            )
-            .into_bytes(),
-            ImageXObject::rgb(4, 2, Some("FlateDecode"), flate(&solid_rgb_samples())).body(),
-            format!(
-                "<< /Length {} >>\nstream\n{content}\nendstream",
-                content.len()
-            )
-            .into_bytes(),
+        // (label, the form's content stream, the form's own resources)
+        let cases = [
+            (
+                "an embedded image in the form's resources",
+                "/Im0 Do".to_string(),
+                " /Resources << /XObject << /Im0 6 0 R >> >>",
+            ),
+            (
+                "an inline image in the form's content",
+                solid_rgb_inline_image(),
+                "",
+            ),
         ];
+        for (label, form, form_resources) in cases {
+            let objects = vec![
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>".to_vec(),
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources \
+                  << /Font << /F1 3 0 R >> /XObject << /Fm0 5 0 R >> >> /Contents 7 0 R >>"
+                    .to_vec(),
+                format!(
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 612 792]{form_resources} \
+                     /Length {} >>\nstream\n{form}\nendstream",
+                    form.len()
+                )
+                .into_bytes(),
+                ImageXObject::rgb(4, 2, Some("FlateDecode"), flate(&solid_rgb_samples())).body(),
+                format!(
+                    "<< /Length {} >>\nstream\n{content}\nendstream",
+                    content.len()
+                )
+                .into_bytes(),
+            ];
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = convert_document(&assemble_pdf(&objects), "scan.pdf", dir.path());
-        let DocOutcome::Text { images, notes, .. } = outcome else {
-            panic!("expected Text outcome for a text-layer PDF");
-        };
-        assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
-        assert_eq!(images, vec![dir.path().join("page_1_img_0.jpg")]);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let outcome = convert_document(&assemble_pdf(&objects), "scan.pdf", dir.path());
+            let DocOutcome::Text { images, notes, .. } = outcome else {
+                panic!("{label}: expected Text outcome for a text-layer PDF");
+            };
+            assert!(notes.is_empty(), "{label}: nothing was skipped: {notes:?}");
+            assert_eq!(
+                images,
+                vec![dir.path().join("page_1_img_0.jpg")],
+                "{label}: the image is the page's"
+            );
+        }
     }
 
     /// An inline image lives in the content stream, not in the resources, so a
@@ -2636,40 +2609,6 @@ mod tests {
             .to_rgb8();
         assert_eq!(written.dimensions(), (4, 2));
         assert_solid_rgb(written.get_pixel(0, 0).0);
-    }
-
-    /// A form XObject is a content stream an inline image can sit in just as
-    /// well, so the inline pass walks the forms the page paints through.
-    #[test]
-    fn pdf_text_page_writes_inline_image_nested_in_a_form() {
-        let content = "BT /F1 24 Tf 72 700 Td (Hello PDF text layer) Tj ET";
-        let form = solid_rgb_inline_image();
-        let objects = vec![
-            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
-            b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>".to_vec(),
-            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources \
-              << /Font << /F1 3 0 R >> /XObject << /Fm0 5 0 R >> >> /Contents 6 0 R >>"
-                .to_vec(),
-            format!(
-                "<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Length {} >>\nstream\n{form}\nendstream",
-                form.len()
-            )
-            .into_bytes(),
-            format!(
-                "<< /Length {} >>\nstream\n{content}\nendstream",
-                content.len()
-            )
-            .into_bytes(),
-        ];
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = convert_document(&assemble_pdf(&objects), "scan.pdf", dir.path());
-        let DocOutcome::Text { images, notes, .. } = outcome else {
-            panic!("expected Text outcome for a text-layer PDF");
-        };
-        assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
-        assert_eq!(images, vec![dir.path().join("page_1_img_0.jpg")]);
     }
 
     /// A PNG predictor in `/DecodeParms` is what most producers emit, and the
@@ -2704,27 +2643,6 @@ mod tests {
         assert!(
             images.is_empty(),
             "an undecodable embedded image yields no file"
-        );
-        assert_eq!(
-            notes,
-            ["skipped 1 embedded image(s) that could not be extracted"]
-        );
-    }
-
-    /// A corrupt Flate stream is one hayro's inflate reports leniently, as an
-    /// empty result rather than an error: the image must be reported like any
-    /// other undecodable one, not written as a blank page image.
-    #[test]
-    fn pdf_notes_a_leniently_empty_decode() {
-        let image = ImageXObject::rgb(4, 2, Some("FlateDecode"), b"not a flate stream".to_vec());
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = convert_document(&text_pdf(&[image]), "scan.pdf", dir.path());
-        let DocOutcome::Text { images, notes, .. } = outcome else {
-            panic!("expected Text outcome for a text-layer PDF");
-        };
-        assert!(
-            images.is_empty(),
-            "a decode that returned no samples yields no file"
         );
         assert_eq!(
             notes,
@@ -2806,11 +2724,16 @@ mod tests {
         );
     }
 
-    /// A page the reader cannot read costs that page: the pages around it keep
-    /// their text, only it is turned into an image, and the note says why — a
-    /// page whose text could not be read is not a page that has none.
+    /// A page the reader cannot read costs that page and no other: the pages
+    /// around it keep their text and only it is delivered as an image, a page that
+    /// produced text before failing keeps that text under its own label, and the
+    /// note names the pages that were lost. A page whose text could not be read is
+    /// never confused with a page that has no text — the first is named and the
+    /// second is not — and only a document whose every page the reader failed on
+    /// reports that all of its text was lost.
+    #[expect(clippy::too_many_lines)] // the reader's failure modes, one fixture each
     #[test]
-    fn pdf_keeps_the_text_of_pages_the_reader_can_read() {
+    fn pdf_keeps_what_the_reader_could_read_and_names_what_it_could_not() {
         // Page 2 has no MediaBox at all, so the reader panics before it reads
         // anything from that page; page 4 gives text and then fails mid-page.
         let bytes = multi_page_pdf(&[
@@ -2873,6 +2796,111 @@ mod tests {
             ]
         );
         assert!(!all_page_text_lost);
+
+        // Every page yields text and then fails the reader part-way: all of it is
+        // kept and every page is rasterized, but a page that delivered text is not
+        // a loss — the flag must clear even though the reader failed on each page.
+        let bytes = pdf_with_all_pages_failing_midway();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = convert_document(&bytes, "report.pdf", dir.path());
+        let DocOutcome::Text {
+            text,
+            images,
+            notes,
+            all_page_text_lost,
+            ..
+        } = outcome
+        else {
+            panic!("expected Text outcome for a PDF whose every page failed part-way");
+        };
+        assert_eq!(
+            text.matches("Kept page text long enough").count(),
+            2,
+            "both pages delivered the text they produced before failing: {text:?}"
+        );
+        assert_eq!(
+            images,
+            vec![dir.path().join("page_1.jpg"), dir.path().join("page_2.jpg")],
+            "every page whose text could not be read in full is rasterized"
+        );
+        assert_eq!(
+            notes,
+            vec!["the text of pages 1, 2 could not be read in full (2 of 2 pages)"]
+        );
+        assert!(
+            !all_page_text_lost,
+            "no page's text was lost: both delivered what they produced"
+        );
+
+        // The reader's page table cannot be followed at all while the pages
+        // themselves parse: the text of every page is lost, which the note says.
+        let mut bytes = text_pdf(&[]);
+        // One byte inserted after the header: every xref offset is now one short
+        // of its object, so the reader cannot find a single page (hayro's own
+        // structure scan still finds the one the document has).
+        bytes.insert(b"%PDF-1.4\n".len(), b' ');
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = convert_document(&bytes, "report.pdf", dir.path());
+        let DocOutcome::Text {
+            text,
+            images,
+            notes,
+            all_page_text_lost,
+            ..
+        } = outcome
+        else {
+            panic!("expected Text outcome for a PDF whose pages parse");
+        };
+        assert!(text.trim().is_empty(), "nothing was read: {text:?}");
+        assert_eq!(images, vec![dir.path().join("page_1.jpg")]);
+        assert_eq!(
+            notes,
+            vec!["the text of page 1 could not be read (1 of 1 pages)"]
+        );
+        assert!(all_page_text_lost);
+
+        // A text-free page beside one the reader could not read: only the second
+        // is named, and the document is not one whose text the reader failed on.
+        // Page 1 paints a rectangle and has no text at all; page 2 has no
+        // MediaBox, so the reader panics on it before reading anything.
+        let bytes = multi_page_pdf(&[
+            (
+                "/MediaBox [0 0 612 792]",
+                b"0.1 0.5 0.9 rg 0 0 612 792 re f",
+            ),
+            (
+                "",
+                b"BT /F1 24 Tf 72 700 Td (Page two text long enough) Tj ET",
+            ),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = convert_document(&bytes, "scan.pdf", dir.path());
+        let DocOutcome::Text {
+            text,
+            images,
+            notes,
+            all_page_text_lost,
+            ..
+        } = outcome
+        else {
+            panic!("expected Text outcome for a scan with one unreadable page");
+        };
+        assert!(text.trim().is_empty(), "no text layer to extract: {text:?}");
+        assert_eq!(
+            images,
+            vec![dir.path().join("page_1.jpg"), dir.path().join("page_2.jpg")],
+            "the text-free page and the unreadable one are both delivered as images"
+        );
+        assert_eq!(
+            notes,
+            vec!["the text of page 2 could not be read (1 of 2 pages)"],
+            "only the page that could not be read is named"
+        );
+        assert!(
+            !all_page_text_lost,
+            "page 1 was read and has nothing to read: the document is not one \
+             whose text the reader failed on"
+        );
     }
 
     /// The text of 1-based `page_number` as the reader's plain output produces
@@ -2974,122 +3002,6 @@ mod tests {
         };
         assert!(images.is_empty(), "nothing was written: {images:?}");
         assert_eq!(unshown.lines(), ["1 page(s) not shown"]);
-    }
-
-    /// Every page yields text and then fails the reader part-way: all of it is
-    /// kept and every page is rasterized, but a page that delivered text is not a
-    /// loss — the flag must clear even though the reader failed on each page.
-    #[test]
-    fn pdf_keeps_the_text_of_pages_that_fail_after_producing_it() {
-        let bytes = pdf_with_all_pages_failing_midway();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = convert_document(&bytes, "report.pdf", dir.path());
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            all_page_text_lost,
-            ..
-        } = outcome
-        else {
-            panic!("expected Text outcome for a PDF whose every page failed part-way");
-        };
-        assert_eq!(
-            text.matches("Kept page text long enough").count(),
-            2,
-            "both pages delivered the text they produced before failing: {text:?}"
-        );
-        assert_eq!(
-            images,
-            vec![dir.path().join("page_1.jpg"), dir.path().join("page_2.jpg")],
-            "every page whose text could not be read in full is rasterized"
-        );
-        assert_eq!(
-            notes,
-            vec!["the text of pages 1, 2 could not be read in full (2 of 2 pages)"]
-        );
-        assert!(
-            !all_page_text_lost,
-            "no page's text was lost: both delivered what they produced"
-        );
-    }
-
-    /// The reader's page table cannot be followed at all while the pages
-    /// themselves parse: the text of every page is lost, which the note has to
-    /// say — such a document is not one that has no text.
-    #[test]
-    fn pdf_names_every_page_when_the_reader_cannot_read_the_document() {
-        let mut bytes = text_pdf(&[]);
-        // One byte inserted after the header: every xref offset is now one short
-        // of its object, so the reader cannot find a single page (hayro's own
-        // structure scan still finds the one the document has).
-        bytes.insert(b"%PDF-1.4\n".len(), b' ');
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = convert_document(&bytes, "report.pdf", dir.path());
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            all_page_text_lost,
-            ..
-        } = outcome
-        else {
-            panic!("expected Text outcome for a PDF whose pages parse");
-        };
-        assert!(text.trim().is_empty(), "nothing was read: {text:?}");
-        assert_eq!(images, vec![dir.path().join("page_1.jpg")]);
-        assert_eq!(
-            notes,
-            vec!["the text of page 1 could not be read (1 of 1 pages)"]
-        );
-        assert!(all_page_text_lost);
-    }
-
-    /// A page whose text could not be read is not a page that has no text: the
-    /// one is named and the other is not, and a document is only reported as one
-    /// without text when the reader was not the reason.
-    #[test]
-    fn pdf_distinguishes_a_page_with_no_text_from_one_that_could_not_be_read() {
-        // Page 1 paints a rectangle and has no text at all; page 2 has no
-        // MediaBox, so the reader panics on it before reading anything.
-        let bytes = multi_page_pdf(&[
-            (
-                "/MediaBox [0 0 612 792]",
-                b"0.1 0.5 0.9 rg 0 0 612 792 re f",
-            ),
-            (
-                "",
-                b"BT /F1 24 Tf 72 700 Td (Page two text long enough) Tj ET",
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = convert_document(&bytes, "scan.pdf", dir.path());
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            all_page_text_lost,
-            ..
-        } = outcome
-        else {
-            panic!("expected Text outcome for a scan with one unreadable page");
-        };
-        assert!(text.trim().is_empty(), "no text layer to extract: {text:?}");
-        assert_eq!(
-            images,
-            vec![dir.path().join("page_1.jpg"), dir.path().join("page_2.jpg")],
-            "the text-free page and the unreadable one are both delivered as images"
-        );
-        assert_eq!(
-            notes,
-            vec!["the text of page 2 could not be read (1 of 2 pages)"],
-            "only the page that could not be read is named"
-        );
-        assert!(
-            !all_page_text_lost,
-            "page 1 was read and has nothing to read: the document is not one \
-             whose text the reader failed on"
-        );
     }
 
     /// The note is a bounded contract: ranges, a count, and a stop — never one
@@ -3270,9 +3182,15 @@ mod tests {
     /// as lost — the page simply has no text. The reading says so through
     /// `page_text`; the note itself belongs to the caller, which knows what it
     /// delivered.
+    /// The marks a PDF carries are document content even where there is no page
+    /// text: a text-free page still delivers its form values, the page is
+    /// rasterized, and the reading reports that no page text was produced. A
+    /// document's own description leads the reading when it has one, and a form
+    /// with no filled value still names its field.
     #[test]
-    fn pdf_whose_pages_have_no_text_still_delivers_its_form_values() {
+    fn pdf_delivers_its_marks_and_description_beside_the_page_text() {
         const CONTENT: &[u8] = b"0.1 0.5 0.9 rg 0 0 612 792 re f";
+        const PAGE: &[u8] = b"BT /F1 24 Tf 72 700 Td (Page one text long enough) Tj ET";
         let mut fixture = PdfFixture::new();
         let field = fixture.push(
             "<< /Subtype /Widget /FT /Tx /T (Name) /V (value) /Rect [0 0 0 0] >>".to_string(),
@@ -3305,49 +3223,9 @@ mod tests {
             !all_page_text_lost,
             "the page has no text, so none was lost"
         );
-    }
 
-    /// A text-free page carrying an annotation delivers the mark and rasterizes
-    /// the page, and the reading reports that no page text was produced — the
-    /// same report a form-only reading makes.
-    #[test]
-    fn pdf_whose_pages_have_no_text_delivers_its_annotations() {
-        const CONTENT: &[u8] = b"0.1 0.5 0.9 rg 0 0 612 792 re f";
-        let mut fixture = PdfFixture::new();
-        let note = fixture.push("<< /Subtype /Text /Contents (please verify) >>".to_string());
-        let bytes = one_page_pdf(
-            fixture,
-            CONTENT,
-            &format!("/MediaBox [0 0 612 792] /Annots [{note}]"),
-            "",
-        );
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = convert_document(&bytes, "scan.pdf", dir.path());
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            page_text,
-            ..
-        } = outcome
-        else {
-            panic!("expected Text outcome for a scan with an annotation");
-        };
-        assert_eq!(
-            text, "Annotations:\nnote on page 1:\n  please verify",
-            "the annotation is document content even with no page text"
-        );
-        assert_eq!(images, vec![dir.path().join("page_1.jpg")]);
-        assert!(notes.is_empty(), "{notes:?}");
-        assert!(!page_text, "the page produced no text of its own");
-    }
-
-    /// A document's own description leads its reading, before the page text and
-    /// the form list: it is the document's statement about itself. A form with
-    /// no filled value still names its field.
-    #[test]
-    fn pdf_delivers_its_description_and_a_blank_form() {
-        const CONTENT: &[u8] = b"BT /F1 24 Tf 72 700 Td (Page one text long enough) Tj ET";
+        // The description is the document's statement about itself, and it leads
+        // the reading; a blank field still names itself.
         let mut fixture = PdfFixture::new();
         let field =
             fixture.push("<< /Subtype /Widget /FT /Tx /T (Name) /Rect [0 0 0 0] >>".to_string());
@@ -3361,8 +3239,8 @@ mod tests {
             fixture.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
         let contents = fixture.push(format!(
             "<< /Length {} >>\nstream\n{}\nendstream",
-            CONTENT.len(),
-            String::from_utf8_lossy(CONTENT)
+            PAGE.len(),
+            String::from_utf8_lossy(PAGE)
         ));
         let page = fixture.reserve();
         let pages = fixture.push(format!("<< /Type /Pages /Kids [{page}] /Count 1 >>"));

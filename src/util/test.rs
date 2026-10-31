@@ -1346,17 +1346,34 @@ mod env_var_guard_tests {
     use super::*;
 
     #[test]
-    fn sets_and_restores_to_absent() {
+    fn sets_and_restores_the_value_it_replaced() {
+        // Absent before the guard (unique name, first use): drop returns it to
+        // absent.
         let guard = set_env_var("MAHBOT_TEST_SET_RESTORE", Some("hello"));
         assert_eq!(std::env::var("MAHBOT_TEST_SET_RESTORE"), Ok("hello".into()));
         drop(guard);
-
-        // Variable was absent before the guard (unique name, first use).
-        // The guard should restore to that state.
         assert!(
             std::env::var_os("MAHBOT_TEST_SET_RESTORE").is_none(),
             "guard should restore env var to absent on drop"
         );
+
+        // Present before the guard: drop puts the original value back.
+        // SAFETY: Bypasses env_lock (unique var name — see mod-level doc).
+        unsafe {
+            std::env::set_var("MAHBOT_TEST_CAPTURE", "original");
+        }
+        let guard = set_env_var("MAHBOT_TEST_CAPTURE", Some("override"));
+        assert_eq!(std::env::var("MAHBOT_TEST_CAPTURE"), Ok("override".into()));
+        drop(guard);
+        assert_eq!(
+            std::env::var("MAHBOT_TEST_CAPTURE"),
+            Ok("original".into()),
+            "guard should restore the original value on drop"
+        );
+        // SAFETY: Bypasses env_lock (same trade-off).
+        unsafe {
+            std::env::remove_var("MAHBOT_TEST_CAPTURE");
+        }
     }
 
     #[test]
@@ -1388,34 +1405,18 @@ mod env_var_guard_tests {
         }
     }
 
+    /// A panicking test must not leak either kind of previous state: absent
+    /// stays absent, a value comes back.
+    ///
+    /// One guard at a time: [`set_env_var`] holds the process-wide
+    /// [`env_lock`] for the guard's lifetime, so two live guards would deadlock
+    /// the thread against itself.
     #[test]
-    fn captures_and_restores_original_value() {
-        // SAFETY: Bypasses env_lock (unique var name — see mod-level doc).
-        unsafe {
-            std::env::set_var("MAHBOT_TEST_CAPTURE", "original");
-        }
-
-        let guard = set_env_var("MAHBOT_TEST_CAPTURE", Some("override"));
-        assert_eq!(std::env::var("MAHBOT_TEST_CAPTURE"), Ok("override".into()));
-        drop(guard);
-
-        assert_eq!(
-            std::env::var("MAHBOT_TEST_CAPTURE"),
-            Ok("original".into()),
-            "guard should restore the original value on drop"
-        );
-
-        // SAFETY: Bypasses env_lock (same trade-off).
-        unsafe {
-            std::env::remove_var("MAHBOT_TEST_CAPTURE");
-        }
-    }
-
-    #[test]
-    fn restores_on_panic() {
+    fn restores_the_previous_state_on_panic() {
         // SAFETY: Bypasses env_lock (unique var name — see mod-level doc).
         unsafe {
             std::env::remove_var("MAHBOT_TEST_PANIC_ABSENT");
+            std::env::set_var("MAHBOT_TEST_PANIC_ORIGINAL", "original");
         }
 
         let result = std::panic::catch_unwind(|| {
@@ -1423,26 +1424,16 @@ mod env_var_guard_tests {
             panic!("intentional panic");
         });
         assert!(result.is_err());
-
         assert!(
             std::env::var_os("MAHBOT_TEST_PANIC_ABSENT").is_none(),
             "MAHBOT_TEST_PANIC_ABSENT should be absent after panic-restore"
         );
-    }
-
-    #[test]
-    fn restores_original_on_panic() {
-        // SAFETY: Bypasses env_lock (unique var name — see mod-level doc).
-        unsafe {
-            std::env::set_var("MAHBOT_TEST_PANIC_ORIGINAL", "original");
-        }
 
         let result = std::panic::catch_unwind(|| {
             let _guard = set_env_var("MAHBOT_TEST_PANIC_ORIGINAL", Some("panic-value"));
             panic!("intentional panic");
         });
         assert!(result.is_err());
-
         assert_eq!(
             std::env::var("MAHBOT_TEST_PANIC_ORIGINAL"),
             Ok("original".into()),

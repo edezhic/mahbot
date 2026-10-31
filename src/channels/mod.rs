@@ -404,20 +404,14 @@ mod tests {
     use super::*;
     use crate::{CHANNEL_REGISTRY, ChannelRegistry, channel_registry};
 
-    /// Verify that [`register_global`] correctly registers the voice
-    /// channel — i.e. the same function called by the production
-    /// bootstrap path in `init_message_pipeline`.
+    /// The bootstrap registration the message pipeline calls must leave the
+    /// voice channel findable by its name.
     #[test]
     fn test_voice_channel_registration() {
-        // Initialise the registry (idempotent — reuses if already set).
         CHANNEL_REGISTRY.get_or_init(ChannelRegistry::default);
-
-        // Call the same registration function used by production.
         register_global();
-
-        let found = channel_registry().get("voice");
         assert!(
-            found.is_some(),
+            channel_registry().get("voice").is_some(),
             "VoiceChannel should be findable by 'voice' name"
         );
     }

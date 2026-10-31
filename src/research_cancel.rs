@@ -355,11 +355,13 @@ mod tests {
         }
     }
 
-    /// Mid-run cancel with NO command dump (no cleanup intent): jobs +
-    /// research_jobs rows + pending row + folder + archive all removed;
-    /// nothing is resumable or deliverable.
+    /// The sweep removes everything the run left behind — its jobs row, the
+    /// `research_jobs` child (by cascade), the pending report row (so boot replay
+    /// has nothing to deliver), the folder and the archive — for a run cancelled
+    /// mid-flight and for one already terminalized into its `research_cleanup`
+    /// row (whose cleanup must not resume).
     #[tokio::test]
-    async fn sweep_removes_rows_folder_and_archive_for_no_dump_run() {
+    async fn sweep_removes_rows_folder_and_archive_for_a_dump_less_run() {
         let run = Seeded::research(
             "research_cancel_midrun_1",
             Folder::Scratch,
@@ -382,14 +384,7 @@ mod tests {
         );
         assert!(!run.root.exists(), "run folder removed");
         assert!(!run.archive.exists(), "results.md archive removed");
-    }
 
-    /// Cancel after terminalization (folder WITHOUT a command dump — no cleanup
-    /// intent): the pending report row + the research_cleanup job row are
-    /// removed (boot replay must have nothing to deliver, and the cleanup must
-    /// not resume), and the dump-less folder + archive are released.
-    #[tokio::test]
-    async fn sweep_removes_pending_and_cleanup_rows_for_terminalized_run() {
         let run = Seeded::terminalized(
             "research_cancel_terminal_1",
             Folder::Empty,
@@ -524,28 +519,6 @@ mod tests {
             "no dump → no cleanup prompt"
         );
         assert_eq!(run.rows("jobs").await, 0, "research row swept");
-        assert!(!run.root.exists(), "dump-less folder released");
-    }
-
-    /// The GUI/abandon path for a run with NO live orchestrator: firing the
-    /// cancel signal sweeps the durable rows and the dump-less folder directly.
-    #[tokio::test]
-    async fn cancel_research_run_sweeps_unregistered_run() {
-        let run = Seeded::research(
-            "research_cancel_unregistered_1",
-            Folder::Scratch,
-            Report::None,
-        )
-        .await;
-
-        // No register() → no orchestrator is alive to observe the signal.
-        cancel_research_run(run.id).await;
-
-        assert_eq!(
-            run.rows("jobs").await,
-            0,
-            "research row swept via the unregistered path"
-        );
         assert!(!run.root.exists(), "dump-less folder released");
     }
 

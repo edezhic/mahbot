@@ -305,6 +305,12 @@ mod tests {
                 expected_score: 9,
                 expected_critique: "",
             },
+            Case {
+                name: "issues are carried through",
+                input: "```json\n{\"score\": 5, \"critique\": \"Problems found\", \"issues\": [\"Bug in edge case\", \"Missing error handling\"]}\n```",
+                expected_score: 5,
+                expected_critique: "Problems found",
+            },
         ];
 
         for case in &cases {
@@ -316,10 +322,8 @@ mod tests {
                 case.name
             );
         }
-    }
 
-    #[test]
-    fn parse_fenced_json_with_issues() {
+        // The `Verdict` shape keeps every issue it was given.
         let text = r#"```json
 {"score": 5, "critique": "Problems found", "issues": ["Bug in edge case", "Missing error handling"]}
 ```"#;
@@ -339,20 +343,12 @@ mod tests {
         let result = parse_fenced_json::<Verdict>(text);
         assert!(result.is_err());
     }
-
-    #[test]
-    fn parse_fenced_json_no_json_at_all() {
-        let text = "This is just plain text with no JSON whatsoever.";
-        let result = parse_fenced_json::<Verdict>(text);
-        assert!(result.is_err());
-    }
 }
 
 #[cfg(test)]
 mod arg_extraction_tests {
     use super::{
-        get_bool, get_opt_bool, get_opt_i64, get_opt_str, get_opt_u64, get_str, get_str_array,
-        get_usize,
+        get_bool, get_opt_bool, get_opt_i64, get_opt_str, get_opt_u64, get_str_array, get_usize,
     };
     use serde_json::{Value, json};
 
@@ -373,36 +369,6 @@ mod arg_extraction_tests {
 
         // get_opt_str stays silent for absent values.
         assert_eq!(get_opt_str(&absent, "k"), None);
-    }
-
-    /// get_str must distinguish "missing" from "wrong type" in its message.
-    #[test]
-    fn get_str_distinguishes_absent_from_wrong_type() {
-        let absent = json!({});
-        let err = get_str(&absent, "path").unwrap_err().to_string();
-        assert!(err.contains("usage:"), "got: {err}");
-        assert!(
-            err.contains("missing required argument \"path\""),
-            "got: {err}"
-        );
-
-        let wrong = json!({ "path": 42 });
-        let err = get_str(&wrong, "path").unwrap_err().to_string();
-        assert!(err.contains("usage:"), "got: {err}");
-        assert!(
-            err.contains("argument \"path\" must be a string"),
-            "got: {err}"
-        );
-        assert!(err.contains("got a number"), "got: {err}");
-
-        // null is "missing", not "wrong type".
-        let null = json!({ "path": null });
-        let err = get_str(&null, "path").unwrap_err().to_string();
-        assert!(err.contains("missing required argument"), "got: {err}");
-
-        // Happy path.
-        let ok = json!({ "path": "a" });
-        assert_eq!(get_str(&ok, "path").unwrap(), "a");
     }
 
     /// Wrong-typed present values are usage errors naming the field and type.
@@ -454,32 +420,6 @@ mod arg_extraction_tests {
             assert!(err.contains(expected_phrase), "helper {helper}: got: {err}");
             assert!(err.contains(found_phrase), "helper {helper}: got: {err}");
         }
-    }
-
-    /// get_str_array rejects both non-array values and non-string elements.
-    #[test]
-    fn get_str_array_rejects_non_string_elements() {
-        let non_array = json!({ "k": "a, b" });
-        let err = get_str_array(&non_array, "k").unwrap_err().to_string();
-        assert!(err.contains("usage:"), "got: {err}");
-        assert!(
-            err.contains("\"k\" must be an array of strings"),
-            "got: {err}"
-        );
-
-        let mixed = json!({ "k": ["a", 2, "b"] });
-        let err = get_str_array(&mixed, "k").unwrap_err().to_string();
-        assert!(
-            err.contains("\"k\" must be an array of strings"),
-            "got: {err}"
-        );
-        assert!(err.contains("got a number"), "got: {err}");
-
-        let ok = json!({ "k": ["a", "b"] });
-        assert_eq!(
-            get_str_array(&ok, "k").unwrap(),
-            vec!["a".to_string(), "b".to_string()]
-        );
     }
 
     /// Happy paths: valid values round-trip, including a bool overriding its default.

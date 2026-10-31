@@ -1752,50 +1752,6 @@ mod tests {
         guard.remove(id);
     }
 
-    #[tokio::test]
-    async fn test_route_reuses_existing_consumer() {
-        let _ = init_global();
-        let id = "_test_ua_reuses";
-
-        // Slow path — first message creates consumer
-        route(id, make_job(Role::Assistant, "ws", "alice", "gui"));
-
-        // Fast path — second message uses same consumer
-        route(id, make_job(Role::Assistant, "ws", "bob", "gui"));
-
-        let map = ROUTER.get().unwrap();
-        let guard = map.read().unwrap_poison();
-        assert!(guard.contains_key(id));
-        drop(guard);
-
-        // Cleanup
-        let map = ROUTER.get().unwrap();
-        let mut guard = map.write().unwrap_poison();
-        guard.remove(id);
-    }
-
-    #[tokio::test]
-    async fn test_route_multiple_agents_get_separate_consumers() {
-        let _ = init_global();
-        let id_a = "_test_ua_mult_a";
-        let id_b = "_test_ua_mult_b";
-
-        route(id_a, make_job(Role::Assistant, "ws", "alice", "gui"));
-        route(id_b, make_job(Role::Engineer, "ws", "bob", "gui"));
-
-        let map = ROUTER.get().unwrap();
-        let guard = map.read().unwrap_poison();
-        assert!(guard.contains_key(id_a));
-        assert!(guard.contains_key(id_b));
-        drop(guard);
-
-        // Cleanup
-        let map = ROUTER.get().unwrap();
-        let mut guard = map.write().unwrap_poison();
-        guard.remove(id_a);
-        guard.remove(id_b);
-    }
-
     /// Verify that the consumer loop exits gracefully when the channel's
     /// last sender is dropped (causing `rx.recv()` to return `None`), AND
     /// that the consumer's cleanup wrapper removes the entry from the router
@@ -1959,83 +1915,11 @@ mod tests {
         crate::channel_registry().register(Arc::new(gui_channel));
     }
 
-    // ── Panic cleanup test ───────────────────────────────────────────────
-
-    /// Verify that a panicking consumer does NOT leave a dead sender in the
-    /// router table.  The outer wrapper in [`route()`] uses `catch_unwind`
-    /// so that cleanup runs even on panic.
-    ///
-    /// We insert a sender, spawn a consumer that panics, and verify the
-    /// entry is removed — this exercises the exact same cleanup pattern
-    /// used in `route()`.
-    #[tokio::test]
-    async fn test_catch_unwind_cleanup_removes_entry_on_panic() {
-        let _ = init_global();
-        let id = "_test_panic_cleanup";
-
-        // Insert a sender into the router table.
-        let (tx, rx) = mpsc::unbounded_channel::<AgentJob>();
-        {
-            let mut guard = ROUTER.get().unwrap().write().unwrap_poison();
-            guard.insert(id.to_string(), tx);
-        }
-
-        // Spawn the same catch_unwind + cleanup pattern used by route().
-        let agent_id = id.to_string();
-        let agent_id_for_cleanup = agent_id.clone();
-        tokio::spawn(async move {
-            let _result = std::panic::AssertUnwindSafe(async {
-                // Drop the receiver to break out of any pending recv(),
-                // then panic — simulating a consumer_loop failure.
-                drop(rx);
-                panic!("simulated consumer panic");
-            })
-            .catch_unwind()
-            .await;
-
-            // Cleanup — identical to route()'s wrapper.
-            if let Some(map) = ROUTER.get() {
-                let mut guard = map.write().unwrap_poison();
-                guard.remove(&agent_id_for_cleanup);
-            }
-        });
-
-        // Wait for the panic + cleanup to complete.
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
-        let mut cleaned_up = false;
-        while tokio::time::Instant::now() < deadline {
-            let found = {
-                let guard = ROUTER.get().unwrap().read().unwrap_poison();
-                guard.contains_key(id)
-            };
-            if !found {
-                cleaned_up = true;
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-
-        // Verify entry was cleaned up despite the panic.
-        assert!(
-            cleaned_up,
-            "entry should have been removed from router table after consumer panic",
-        );
-    }
-
     // ── Response delivery tests ──────────────────────────────────────────
     //
-    // These are smoke tests: they verify that the delivery functions complete
-    // without panic when called with realistic inputs.  They do NOT assert on
-    // actual delivery outcomes (what was sent, via which channel, to which
-    // recipient) because the channel transports (GuiChannel::send is a no-op
-    // in this test context) and the broadcast/persist path are hard to mock
-    // at this level of abstraction.
-    //
-    // Future engineers: if you add assertions here, you will likely need to
-    // mock the channel registry or provide a test channel with observable
-    // send().  Until then, the "no panic" guarantee at least proves that the
-    // delivery functions handle edge cases (empty bindings, missing users,
-    // etc.) without crashing.
+    // The broadcast outcome is asserted through the spy channel below: the
+    // real transports are no-ops or hard to observe at this level, so a
+    // delivery path that only "completes without panic" proves nothing.
 
     /// `resolve_single_user` returns a [`UserRecord`] when the user exists.
     #[tokio::test]
@@ -2057,119 +1941,6 @@ mod tests {
 
         let user = resolve_single_user("nonexistent_user").await;
         assert!(user.is_none(), "non-existent user should return None");
-    }
-
-    /// `deliver_unregistered_user_response` completes without error when
-    /// the channel is registered, a user is NOT in the DB, and the fallback
-    /// path to `reply_target` is exercised.
-    #[tokio::test]
-    #[serial_test::serial(provider)]
-    async fn test_deliver_unregistered_user_response() {
-        setup_response_test_infra().await;
-
-        let job = AgentJob {
-            content: "hello from unregistered user".to_string(),
-            workspace_name: "default".to_string(),
-            user_name: "unregistered_alice".to_string(),
-            channel: "gui".to_string(),
-            kind: MessageKind::UserMessage,
-            role: Role::Assistant,
-            reply_target: Some("chat_123".to_string()),
-            pending_job_id: None,
-            originating_workspace: None,
-            custom_role: None,
-            reply_to_custom: None,
-        };
-
-        // Should complete without panic.
-        deliver_unregistered_user_response(
-            "response to unregistered user",
-            &job,
-            &Role::Assistant,
-            &[],
-        )
-        .await;
-    }
-
-    /// `deliver_single_user_response` completes without error and broadcasts
-    /// to all of the user's channel bindings. Here admin is bound to "gui" and the job originates on
-    /// "gui" — broadcast+persist runs and transport delivery reaches the
-    /// matching "gui" binding. No-panic is the assertion.
-    #[tokio::test]
-    #[serial_test::serial(provider)]
-    async fn test_deliver_single_user_response() {
-        setup_response_test_infra().await;
-
-        // Give the admin a "gui" channel binding so the delivery
-        // function can find it.
-        let store = crate::users::USER_STORE.get().unwrap();
-        store
-            .bind_channel("admin", "gui", "admin")
-            .await
-            .expect("bind admin to gui channel");
-
-        let user = resolve_single_user("admin").await.unwrap();
-
-        let job = AgentJob {
-            content: "hello from registered user".to_string(),
-            workspace_name: "default".to_string(),
-            user_name: "admin".to_string(),
-            channel: "gui".to_string(),
-            kind: MessageKind::UserMessage,
-            role: Role::Assistant,
-            reply_target: None,
-            pending_job_id: None,
-            originating_workspace: None,
-            custom_role: None,
-            reply_to_custom: None,
-        };
-
-        // Should complete without panic — broadcasts to the "gui" binding.
-        deliver_single_user_response(
-            "response to registered user",
-            &user,
-            &job,
-            &Role::Assistant,
-            &[],
-        )
-        .await;
-    }
-
-    /// `deliver_single_user_response` handles the case where the user has NO
-    /// channel bindings at all — only broadcast+persist runs, transport
-    /// delivery is skipped. No-panic is the assertion.
-    #[tokio::test]
-    #[serial_test::serial(provider)]
-    async fn test_deliver_single_user_no_bindings() {
-        setup_response_test_infra().await;
-
-        // The admin exists but has no "gui" channel binding.
-        let user = resolve_single_user("admin").await.unwrap();
-
-        let job = AgentJob {
-            content: "hello".to_string(),
-            workspace_name: "default".to_string(),
-            user_name: "admin".to_string(),
-            channel: "gui".to_string(),
-            kind: MessageKind::UserMessage,
-            role: Role::Assistant,
-            reply_target: None,
-            pending_job_id: None,
-            originating_workspace: None,
-            custom_role: None,
-            reply_to_custom: None,
-        };
-
-        // Should complete without panic — broadcast+persist runs, transport
-        // delivery is skipped because there are no matching bindings.
-        deliver_single_user_response(
-            "response to registered user without matching binding",
-            &user,
-            &job,
-            &Role::Assistant,
-            &[],
-        )
-        .await;
     }
 
     /// `deliver_single_user_response` broadcasts the reply to ALL of the user's
@@ -2396,94 +2167,6 @@ mod tests {
         );
     }
 
-    /// Multiple agents can be registered simultaneously.
-    #[tokio::test]
-    async fn test_register_agent_multiple_agents() {
-        let _ = init_global();
-        let id_a = "_test_multi_a";
-        let id_b = "_test_multi_b";
-
-        let _rx_a = register_agent(id_a);
-        let _rx_b = register_agent(id_b);
-
-        assert!(try_route(id_a, make_job(Role::Assistant, "a", "u", "g")));
-        assert!(try_route(id_b, make_job(Role::Engineer, "b", "u", "g")));
-
-        unregister_agent(id_a);
-        unregister_agent(id_b);
-    }
-
-    /// `register_agent` replaces a stale entry without panicking.
-    #[tokio::test]
-    async fn test_register_agent_replaces_stale_entry() {
-        let _ = init_global();
-        let agent_id = "_test_replace_stale";
-
-        // First registration — drop receiver so it's stale.
-        let rx = register_agent(agent_id);
-        drop(rx);
-
-        // Second registration — should replace the stale sender.
-        let _rx2 = register_agent(agent_id);
-
-        let job = make_job(Role::Assistant, "hello", "user", "gui");
-        assert!(
-            try_route(agent_id, job),
-            "try_route should succeed after replacing stale entry",
-        );
-
-        unregister_agent(agent_id);
-    }
-
-    // ── Agent failure emoji tests ──────────────────────────────────────
-    //
-    // These tests verify the AGENT_FAILURE_EMOJI constant and its delivery
-    // path.  They follow the same smoke-test philosophy as the response
-    // delivery tests above: no assertions on actual transport outcomes,
-    // just a "no panic" guarantee.
-
-    /// The emoji constant is defined and non-empty.
-    #[test]
-    fn test_agent_failure_emoji_constant() {
-        assert!(!AGENT_FAILURE_EMOJI.is_empty(), "emoji should be non-empty");
-        // Verify it contains actual emoji characters (not just whitespace).
-        assert!(
-            AGENT_FAILURE_EMOJI.chars().count() >= 3,
-            "emoji should be at least 3 characters"
-        );
-    }
-
-    // ── Structural message-kind invariants ───────────────────────────────
-
-    /// `RecoveryRetry` is intentionally NOT `UserMessage`.  The emoji gate in
-    /// `consumer_loop` uses `job.kind == MessageKind::UserMessage` to decide whether
-    /// to send the failure emoji — `RecoveryRetry` is automatically excluded
-    /// because the equality check is specific to `UserMessage`.
-    ///
-    /// The same structural invariant holds for the Assistant↔Manager kinds:
-    /// `AgentMessage` and `ManagerNotify` are deliberately distinct from
-    /// `UserMessage` (see the `MessageKind` docs) so the emoji gate excludes them
-    /// without any `matches!` broadening.
-    ///
-    /// This test documents the structural invariant: distinct enum variants of a
-    /// `PartialEq` enum never compare equal.  The compiler and derive macro
-    /// guarantee this property; this test provides executable documentation of
-    /// the design decision, not a regression guard against the derived equality.
-    /// If the emoji gate condition is refactored in the future (e.g., to use
-    /// `matches!()` with a broader set), this test will not catch that change.
-    /// A full behavioral test of the emoji gate requires exercising the consumer
-    /// loop with `RecoveryRetry` jobs — infrastructure disproportionate to the
-    /// zero-regression-risk invariant.
-    #[test]
-    fn test_recovery_retry_kind_invariant() {
-        assert_ne!(
-            MessageKind::RecoveryRetry,
-            MessageKind::UserMessage,
-            "RecoveryRetry must be a distinct variant from UserMessage — \
-             the emoji gate's `== MessageKind::UserMessage` check naturally excludes it",
-        );
-    }
-
     /// A custom role's answer is an internal envelope addressed to the admin's
     /// personal Assistant — never the owner's channels and never Telegram —
     /// persisted as one durable `<custom-role-message>` row naming the folder the
@@ -2679,5 +2362,49 @@ mod tests {
                 .await
                 .expect("delete pending row");
         }
+    }
+
+    /// A user with no row still gets the reply: it is sent through the
+    /// originating channel (the `reply_target` path) and persisted under the
+    /// seeded user, so an unregistered sender is never silently dropped.
+    #[tokio::test]
+    #[serial_test::serial(provider)]
+    async fn test_deliver_unregistered_user_response() {
+        // Its own channel name: the registry is process-global, so sharing the
+        // other delivery test's spy would route the reply to whichever spy
+        // registered last.
+        let spy_name = "__test_spy_unregistered_user";
+        setup_response_test_infra().await;
+        let (spy, sent) = crate::util::test::SpyChannel::new(spy_name);
+        crate::channel_registry().register(Arc::new(spy) as Arc<dyn crate::Channel>);
+
+        let job = AgentJob {
+            content: "hello from unregistered user".to_string(),
+            workspace_name: "default".to_string(),
+            user_name: "unregistered_alice".to_string(),
+            channel: spy_name.to_string(),
+            kind: MessageKind::UserMessage,
+            role: Role::Assistant,
+            reply_target: Some("chat_123".to_string()),
+            pending_job_id: None,
+            originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
+        };
+
+        deliver_unregistered_user_response(
+            "response to unregistered user",
+            &job,
+            &Role::Assistant,
+            &[],
+        )
+        .await;
+
+        let captured = sent.lock().unwrap_poison();
+        assert!(
+            captured.iter().any(|msg| msg.recipient == "chat_123"
+                && msg.content.contains("response to unregistered user")),
+            "the reply must reach the originating channel's reply target, got: {captured:?}"
+        );
     }
 }

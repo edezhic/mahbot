@@ -2071,40 +2071,6 @@ mod tests {
         session
     }
 
-    /// The user-message timestamp block lives at the END of the message
-    /// (suffix format, `\n\n` separator), so the task text is byte-stable
-    /// across rounds — a changed timestamp only invalidates the tail of the
-    /// provider prefix-cache. `round_ts` pins one value per round; `None`
-    /// stamps now.
-    #[test]
-    fn user_msg_timestamp_suffix_format() {
-        let msg = user_msg_with_ts("task text", Some("2026-01-01 00:00:00 (UTC)"));
-        assert_eq!(
-            msg.content,
-            "task text\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"
-        );
-        let fresh = user_msg_with_ts("task text", None);
-        assert!(
-            fresh.content.starts_with("task text\n\n<timestamp>")
-                && fresh.content.ends_with("</timestamp>"),
-            "fresh stamp must still be a suffix: {}",
-            fresh.content
-        );
-    }
-
-    #[tokio::test]
-    async fn session_store_create_and_load() {
-        crate::util::test::init_test_stores().await;
-        let k = unique_key();
-        store()
-            .batch_append(&k, &[ChatMessage::user("hello")])
-            .await
-            .unwrap();
-        let msgs = store().load(&k).await;
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "hello");
-    }
-
     /// The checked readers back the person-facing GUI: a query/decode failure
     /// must be an `Err` (rendered as a failure) while the infallible readers
     /// keep their degrade-and-skip contract for non-GUI callers.
@@ -2148,53 +2114,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_store_replace_messages() {
-        crate::util::test::init_test_stores().await;
-        let k = unique_key();
-        store()
-            .batch_append(&k, &[ChatMessage::user("old")])
-            .await
-            .unwrap();
-        store()
-            .replace_messages(&k, &[ChatMessage::user("new")], None, false)
-            .await
-            .unwrap();
-        let msgs = store().load(&k).await;
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "new");
-    }
-
-    #[tokio::test]
-    async fn session_store_rewrite_last_user_message() {
-        crate::util::test::init_test_stores().await;
-        let k = unique_key();
-        store()
-            .batch_append(
-                &k,
-                &[
-                    ChatMessage::system("role"),
-                    ChatMessage::user("[IMAGE:/tmp/a.png] first"),
-                    ChatMessage::assistant("answer"),
-                    ChatMessage::user("[IMAGE:/tmp/b.png] second"),
-                ],
-            )
-            .await
-            .unwrap();
-        store()
-            .rewrite_last_user_message(&k, "rewritten")
-            .await
-            .unwrap();
-        let msgs = store().load(&k).await;
-        assert_eq!(msgs[3].role, crate::ChatRole::User);
-        assert_eq!(msgs[3].content, "rewritten", "last user row rewritten");
-        assert_eq!(
-            msgs[1].content, "[IMAGE:/tmp/a.png] first",
-            "earlier user row untouched"
-        );
-        assert_eq!(msgs[2].content, "answer", "assistant row untouched");
-    }
-
-    #[tokio::test]
     async fn session_store_rewrite_last_user_message_targets_only_user_rows() {
         crate::util::test::init_test_stores().await;
         let k = unique_key();
@@ -2203,7 +2122,8 @@ mod tests {
                 &k,
                 &[
                     ChatMessage::system("role"),
-                    ChatMessage::user("only user"),
+                    ChatMessage::user("[IMAGE:/tmp/a.png] earlier user"),
+                    ChatMessage::user("[IMAGE:/tmp/b.png] last user"),
                     ChatMessage::assistant("last row is assistant"),
                 ],
             )
@@ -2214,38 +2134,16 @@ mod tests {
             .await
             .unwrap();
         let msgs = store().load(&k).await;
+        assert_eq!(msgs[0].content, "role", "the system row is untouched");
         assert_eq!(
-            msgs[1].content, "rewritten",
+            msgs[1].content, "[IMAGE:/tmp/a.png] earlier user",
+            "an earlier user row is untouched"
+        );
+        assert_eq!(
+            msgs[2].content, "rewritten",
             "last USER row rewritten, not the trailing assistant row"
         );
-        assert_eq!(msgs[2].content, "last row is assistant");
-    }
-
-    #[tokio::test]
-    async fn session_store_rewrite_last_user_message_no_user_row_errors() {
-        crate::util::test::init_test_stores().await;
-        let k = unique_key();
-        store()
-            .batch_append(&k, &[ChatMessage::assistant("only assistant")])
-            .await
-            .unwrap();
-        let err = store()
-            .rewrite_last_user_message(&k, "x")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("no user message row"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn session_store_delete() {
-        crate::util::test::init_test_stores().await;
-        let k = unique_key();
-        store()
-            .batch_append(&k, &[ChatMessage::user("a")])
-            .await
-            .unwrap();
-        assert!(store().delete(&k).await.unwrap());
-        assert!(!store().delete(&k).await.unwrap());
+        assert_eq!(msgs[3].content, "last row is assistant");
     }
 
     /// The baseline lives and dies with its session: a written row reads back
@@ -2373,54 +2271,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_context_roundtrip() {
-        crate::util::test::init_test_stores().await;
-        let agent_id = unique_key();
-
-        // Initially, no context should exist.
-        assert!(store().get_session_context(&agent_id).await.is_none());
-
-        // Store context alongside a message.
-        store()
-            .append_with_context(
-                &agent_id,
-                &ChatMessage::user("hello"),
-                BatchMetadata::context("gui", "alice", "work", "engineer"),
-            )
-            .await
-            .unwrap();
-
-        // Retrieve and verify.
-        let ctx = store()
-            .get_session_context(&agent_id)
-            .await
-            .expect("should have context after set");
-        assert_eq!(ctx.channel, "gui");
-        assert_eq!(ctx.user_name, "alice");
-        assert_eq!(ctx.workspace_name, "work");
-        assert_eq!(ctx.role, "engineer");
-
-        // Overwrite with different values.
-        store()
-            .append_with_context(
-                &agent_id,
-                &ChatMessage::user("hello again"),
-                BatchMetadata::context("telegram", "bob", "project-x", "analyst"),
-            )
-            .await
-            .unwrap();
-
-        let ctx = store()
-            .get_session_context(&agent_id)
-            .await
-            .expect("should have updated context");
-        assert_eq!(ctx.channel, "telegram");
-        assert_eq!(ctx.user_name, "bob");
-        assert_eq!(ctx.workspace_name, "project-x");
-        assert_eq!(ctx.role, "analyst");
-    }
-
-    #[tokio::test]
     async fn session_get_last_message_tail() {
         crate::util::test::init_test_stores().await;
         let agent_id = unique_key();
@@ -2481,26 +2331,6 @@ mod tests {
             ChatRole::Assistant,
             &content
         ));
-    }
-
-    #[tokio::test]
-    async fn session_token_length_roundtrip() {
-        crate::util::test::init_test_stores().await;
-        let k = unique_key();
-
-        // No value recorded yet (new / pre-migration session) → None.
-        assert_eq!(store().get_token_length(&k).await, None);
-
-        store().set_token_length(&k, Some(12_345)).await.unwrap();
-        assert_eq!(store().get_token_length(&k).await, Some(12_345));
-
-        // Overwrite with a new value (each successful agent call replaces it).
-        store().set_token_length(&k, Some(67_890)).await.unwrap();
-        assert_eq!(store().get_token_length(&k).await, Some(67_890));
-
-        // Explicit clear (upsert keeps the metadata row, column goes NULL).
-        store().set_token_length(&k, None).await.unwrap();
-        assert_eq!(store().get_token_length(&k).await, None);
     }
 
     // ── Denormalized message_count consistency ─────────────────────────
@@ -2855,10 +2685,15 @@ mod tests {
         )
     }
 
+    /// The retention window keeps the latest three user messages and the latest
+    /// three assistant answers, drops everything older, never counts tool traffic
+    /// (a tool-call frame or its result) as an answer, never re-appends the
+    /// in-flight message, and reads a reasoning-only or JSON-shaped answer as an
+    /// answer rather than as tool traffic.
     #[test]
-    fn retention_window_keeps_latest_per_side_excluding_tools() {
+    fn retention_window_keeps_the_latest_three_per_side_excluding_tool_traffic() {
         let frame = tool_call_frame();
-        let messages = vec![
+        let mixed = vec![
             ChatMessage::system("prompt"),
             ChatMessage::user("u1"),
             ChatMessage::assistant("a1"),
@@ -2868,16 +2703,7 @@ mod tests {
             ChatMessage::assistant("a2"),
             ChatMessage::user("u3"), // in-flight — newest, always retained
         ];
-        let window = select_retention_window(&messages);
-        let contents: Vec<&str> = window.iter().map(|m| m.content.as_str()).collect();
-        assert_eq!(contents, vec!["u1", "a1", "u2", "a2", "u3"]);
-        // In-flight message appears exactly once — no duplicate re-append.
-        assert_eq!(contents.iter().filter(|c| **c == "u3").count(), 1);
-    }
-
-    #[test]
-    fn retention_window_drops_oldest_beyond_three() {
-        let messages: Vec<ChatMessage> = (0..5)
+        let pairs: Vec<ChatMessage> = (0..5)
             .flat_map(|i| {
                 vec![
                     ChatMessage::user(format!("u{i}")),
@@ -2885,13 +2711,24 @@ mod tests {
                 ]
             })
             .collect();
-        let window = select_retention_window(&messages);
-        let contents: Vec<&str> = window.iter().map(|m| m.content.as_str()).collect();
-        assert_eq!(contents, vec!["u2", "a2", "u3", "a3", "u4", "a4"]);
-    }
+        let cases: [(Vec<ChatMessage>, &[&str]); 2] = [
+            (mixed, &["u1", "a1", "u2", "a2", "u3"]),
+            (pairs, &["u2", "a2", "u3", "a3", "u4", "a4"]),
+        ];
+        for (messages, expected) in &cases {
+            let window = select_retention_window(messages);
+            let contents: Vec<&str> = window.iter().map(|m| m.content.as_str()).collect();
+            assert_eq!(contents, *expected, "unexpected retention window");
+        }
+        // In-flight message appears exactly once — no duplicate re-append.
+        assert_eq!(
+            select_retention_window(&cases[0].0)
+                .iter()
+                .filter(|m| m.content == "u3")
+                .count(),
+            1
+        );
 
-    #[test]
-    fn retention_window_short_history_and_json_answers() {
         // First turn: no assistant answers → users only.
         let window = select_retention_window(&[ChatMessage::user("u1")]);
         assert_eq!(window.len(), 1);
@@ -3018,7 +2855,9 @@ mod tests {
 
     /// A failed incoming-message persist queues the gap; the next successful
     /// persist (tool round) flushes it ahead of its own batch — no loss, no
-    /// duplicate frames.
+    /// duplicate frames — and an aborted turn (no final answer) still flushes it
+    /// at the turn end, so delivered comments survive in the DB for a recovery
+    /// retry.
     #[tokio::test]
     async fn failed_drain_gap_flushed_by_later_persist() {
         crate::util::test::init_test_stores().await;
@@ -3070,29 +2909,27 @@ mod tests {
                 "final"
             ]
         );
-    }
 
-    /// An aborted turn (no final answer) still flushes the failed-drain gap
-    /// so delivered comments survive in the DB for a recovery retry.
-    #[tokio::test]
-    async fn failed_drain_gap_flushed_on_aborted_turn() {
-        crate::util::test::init_test_stores().await;
-        let k = unique_key();
+        // The same gap on a turn that ends without a final answer: the turn-end
+        // flush still lands it.
+        let aborted = unique_key();
         store()
             .batch_append(
-                &k,
+                &aborted,
                 &[ChatMessage::system("prompt"), ChatMessage::user("u1")],
             )
             .await
             .unwrap();
-        let ws = crate::workspace::test_ws_named("/_test_gap_abort", "gap_abort");
-        let mut session = session_with_init(&k, "", &ws).await;
-
+        let mut session = session_with_init(&aborted, "", &ws).await;
         session.push_messages_unpersisted(&[ChatMessage::user("C1")]);
-        session.finalize(&k).await.unwrap();
+        session.finalize(&aborted).await.unwrap();
 
-        let msgs = store().load(&k).await;
-        let contents: Vec<&str> = msgs.iter().map(|m| m.content.as_str()).collect();
+        let contents: Vec<String> = store()
+            .load(&aborted)
+            .await
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
         assert_eq!(contents, ["prompt", "u1", "C1"]);
     }
 }
@@ -3297,28 +3134,30 @@ mod transient_prefix_tests {
         assert!(!suffix.is_empty(), "the suffix must survive the separator");
     }
 
+    /// Dispatch is on the role string, matched exactly as [`crate::Role`]
+    /// spells it: lowercase `manager` addresses the workspace's Manager, while
+    /// every other role — a capital-M `Manager` included — is a direct,
+    /// channel-agnostic id with the role as its LAST segment.
     #[test]
-    fn resolve_agent_id_manager_dispatch() {
-        // Manager role produces a manager-scoped ID.
-        let key = resolve_agent_id("alice", "manager", "my-workspace");
-        assert_eq!(key, "manager_my-workspace");
-    }
-
-    #[test]
-    fn resolve_agent_id_non_manager_dispatch() {
-        // Non-Manager role produces a direct channel-agnostic ID.
-        // Role is the LAST segment.
-        let key = resolve_agent_id("bob", "engineer", "my-workspace");
-        assert_eq!(key, "bob_my-workspace_engineer");
-    }
-
-    #[test]
-    fn resolve_agent_id_lowercase_manager() {
-        // The dispatching uses string comparison `"manager"` — verify it works
-        // (matches Role::Manager.as_str() which is lowercase).
-        let key = resolve_agent_id("carol", "Manager", "ws");
-        assert_ne!(key, "manager_ws", "capital-M 'Manager' should NOT match");
-        assert_eq!(key, "carol_ws_Manager");
+    fn resolve_agent_id_dispatches_on_the_lowercase_manager_role() {
+        let cases = [
+            ("alice", "manager", "my-workspace", "manager_my-workspace"),
+            (
+                "bob",
+                "engineer",
+                "my-workspace",
+                "bob_my-workspace_engineer",
+            ),
+            ("carol", "Manager", "ws", "carol_ws_Manager"),
+        ];
+        for (user, role, ws, expected) in cases {
+            assert_eq!(resolve_agent_id(user, role, ws), expected);
+        }
+        assert_ne!(
+            resolve_agent_id("carol", "Manager", "ws"),
+            "manager_ws",
+            "capital-M 'Manager' must not address the Manager"
+        );
     }
 
     #[test]

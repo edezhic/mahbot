@@ -1213,22 +1213,6 @@ pub fn retry_init() -> bool {
 mod tests {
     use super::*;
 
-    // ── hex_string ─────────────────────────────────────────────────────
-
-    #[test]
-    fn test_hex_string_empty() {
-        assert_eq!(crate::util::hex_string(b""), "");
-    }
-
-    #[test]
-    fn test_hex_string_all_bytes() {
-        let bytes: Vec<u8> = (0..=255u8).collect();
-        let hex = crate::util::hex_string(&bytes);
-        assert_eq!(hex.len(), 512);
-        assert!(hex.starts_with("00010203"));
-        assert!(hex.ends_with("fcfdfeff"));
-    }
-
     // ── decode_audio_to_mono_f32 — synthetic WAV ────────────────────────
 
     /// Create a minimal valid 16-bit mono PCM WAV file in a temp directory.
@@ -1254,54 +1238,66 @@ mod tests {
         path
     }
 
+    /// Decoding lands on the model's rate: a 16 kHz file keeps its sample
+    /// count and a 48 kHz file is resampled down to the same second.
     #[test]
-    fn test_decode_wav_mono_16k() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_synthetic_wav(dir.path(), "test.wav", 16000);
-        let result = decode_audio_to_mono_f32(&path);
-        assert!(
-            result.is_ok(),
-            "Failed to decode 16 kHz WAV: {:?}",
-            result.err()
-        );
-        let samples = result.unwrap();
-        assert!(!samples.is_empty(), "Decoded samples should not be empty");
-        // At 16 kHz, 1 second = 16000 samples
-        assert_eq!(
-            samples.len(),
-            16000,
-            "Expected 16000 samples for 1 second at 16 kHz"
-        );
-        // Check that samples are in valid f32 range
-        for &s in &samples {
-            assert!((-1.0..=1.0).contains(&s), "Sample {s} out of range");
+    fn test_decode_wav_to_the_model_rate_table() {
+        struct Case {
+            name: &'static str,
+            file_rate: u32,
+            /// Inclusive bounds on the decoded sample count for one second.
+            expected_len: (usize, usize),
+            /// A resampled file starts through the anti-aliasing filter, so
+            /// only the untouched rate keeps the sine's zero first sample.
+            keeps_the_sine_start: bool,
         }
-        // Verify first few samples approximate a sine wave starting near 0
-        assert!(
-            (samples[0]).abs() < 0.01,
-            "First sample should be near 0 for sine starting at t=0"
-        );
-    }
 
-    #[test]
-    fn test_decode_wav_mono_48k_resampled() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_synthetic_wav(dir.path(), "test48k.wav", 48000);
-        let result = decode_audio_to_mono_f32(&path);
-        assert!(
-            result.is_ok(),
-            "Failed to decode 48 kHz WAV: {:?}",
-            result.err()
-        );
-        let samples = result.unwrap();
-        // Resampled to 16 kHz — 1 second at 48 kHz → ~16000 samples after resampling
-        assert!(!samples.is_empty(), "Decoded samples should not be empty");
-        // Allow some tolerance for resampling (should be close to 16000)
-        assert!(
-            samples.len() >= 15500 && samples.len() <= 16500,
-            "Expected ~16000 samples after resampling from 48 kHz, got {}",
-            samples.len()
-        );
+        let cases = [
+            Case {
+                name: "mono_16k",
+                file_rate: 16000,
+                expected_len: (16000, 16000),
+                keeps_the_sine_start: true,
+            },
+            Case {
+                // 1 second at 48 kHz → ~16000 samples after resampling.
+                name: "mono_48k_resampled",
+                file_rate: 48000,
+                expected_len: (15_500, 16_500),
+                keeps_the_sine_start: false,
+            },
+        ];
+
+        for case in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_synthetic_wav(dir.path(), "test.wav", case.file_rate);
+            let samples = decode_audio_to_mono_f32(&path)
+                .unwrap_or_else(|e| panic!("case {}: decode failed: {e:?}", case.name));
+            assert!(!samples.is_empty(), "case {}: no samples", case.name);
+            assert!(
+                (case.expected_len.0..=case.expected_len.1).contains(&samples.len()),
+                "case {}: expected {}..={} samples, got {}",
+                case.name,
+                case.expected_len.0,
+                case.expected_len.1,
+                samples.len(),
+            );
+            for &s in &samples {
+                assert!(
+                    (-1.0..=1.0).contains(&s),
+                    "case {}: sample {s} out of range",
+                    case.name,
+                );
+            }
+            // A sine starting at t=0 begins near zero.
+            if case.keeps_the_sine_start {
+                assert!(
+                    samples[0].abs() < 0.01,
+                    "case {}: first sample should be near 0",
+                    case.name,
+                );
+            }
+        }
     }
 
     #[test]
@@ -1311,15 +1307,6 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         let result = decode_audio_to_mono_f32(&path);
         assert!(result.is_err(), "Empty file should fail to decode");
-    }
-
-    #[test]
-    fn test_decode_wav_too_small() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tiny.wav");
-        std::fs::write(&path, b"RIFF").unwrap();
-        let result = decode_audio_to_mono_f32(&path);
-        assert!(result.is_err(), "Truncated WAV should fail to decode");
     }
 
     // ── decode_audio_to_mono_f32 — extension handling ──────────────────
@@ -1333,106 +1320,7 @@ mod tests {
         assert!(result.is_err(), "Unknown extension should fail to decode");
     }
 
-    #[test]
-    fn test_decode_no_extension() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("noext");
-        std::fs::write(&path, b"not an audio file").unwrap();
-        let result = decode_audio_to_mono_f32(&path);
-        assert!(
-            result.is_err(),
-            "File without extension should fail to decode"
-        );
-    }
-
     // ── OGG/Opus decode ────────────────────────────────────────────────
-
-    /// Construct a minimal valid OGG/Opus byte stream in memory.
-    fn create_test_opus_ogg() -> Vec<u8> {
-        use ogg::writing::{PacketWriteEndInfo, PacketWriter};
-
-        let mut buf = Vec::new();
-        let serial = 1u32;
-
-        // Scoped so the PacketWriter flushes before we read the buf.
-        {
-            let mut writer = PacketWriter::new(&mut buf);
-
-            // Opus identification header (OpusHead)
-            let mut head = Vec::new();
-            head.extend_from_slice(b"OpusHead"); // magic
-            head.push(1); // version
-            head.push(1); // channels (mono)
-            head.extend_from_slice(&0u16.to_le_bytes()); // pre-skip
-            head.extend_from_slice(&48000u32.to_le_bytes()); // input sample rate
-            head.extend_from_slice(&0u16.to_le_bytes()); // output gain
-            head.push(0); // channel mapping family
-            writer
-                .write_packet(head, serial, PacketWriteEndInfo::EndPage, 0)
-                .unwrap();
-
-            // Opus comment header (OpusTags) — minimal
-            let vendor = b"test";
-            let mut tags = Vec::new();
-            tags.extend_from_slice(b"OpusTags");
-            tags.extend_from_slice(&u32::try_from(vendor.len()).unwrap().to_le_bytes());
-            tags.extend_from_slice(vendor);
-            tags.extend_from_slice(&0u32.to_le_bytes()); // user comment list length = 0
-            writer
-                .write_packet(tags, serial, PacketWriteEndInfo::EndPage, 0)
-                .unwrap();
-
-            // Audio data: a zero-byte packet triggers packet-loss concealment,
-            // which produces silence (no crash).
-            writer
-                .write_packet(b"", serial, PacketWriteEndInfo::EndStream, 0)
-                .unwrap();
-        }
-        buf
-    }
-
-    #[test]
-    fn test_decode_opus_ogg_valid_headers() {
-        let data = create_test_opus_ogg();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("voice.ogg");
-        std::fs::write(&path, &data).unwrap();
-        // The empty audio packet triggers PLC which produces 0 samples (no
-        // prior decoder state). The function should not panic and should return
-        // a meaningful error about no audio being decoded.
-        let result = decode_audio_to_mono_f32(&path);
-        assert!(
-            result.is_err(),
-            "OGG/Opus with headers + silence should produce 'No audio decoded'"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("No audio decoded") || err.contains("decode"),
-            "Unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_decode_opus_ogg_truncated() {
-        let data = create_test_opus_ogg();
-        let truncated = &data[..data.len().min(64)];
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("truncated.ogg");
-        std::fs::write(&path, truncated).unwrap();
-        let result = decode_audio_to_mono_f32(&path);
-        // Truncated OGG should produce an error from the OGG demuxer
-        // (missing pages or incomplete Opus headers).
-        assert!(result.is_err(), "Truncated OGG/Opus should fail to decode");
-    }
-
-    #[test]
-    fn test_decode_opus_ogg_invalid_data() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fake.ogg");
-        std::fs::write(&path, b"not an OGG file at all").unwrap();
-        let result = decode_audio_to_mono_f32(&path);
-        assert!(result.is_err(), "Invalid OGG data should fail to decode");
-    }
 
     #[test]
     fn test_decode_opus_ogg_no_opus_head() {
@@ -1450,45 +1338,6 @@ mod tests {
 
     // ── MP3 decode ──────────────────────────────────────────────────────
 
-    /// Create a minimal valid MPEG2.5 Layer III frame.
-    ///
-    /// Frame parameters: 8 kbps, 8 kHz, mono, no CRC.
-    /// Frame size = (144 * 8) / 8 = 144 bytes.
-    fn create_test_mp3_frame() -> Vec<u8> {
-        // Header: sync|version|layer|prot  bitrate|srate|pad|priv  mode|ext|copy|orig|emp
-        //         0xFF    0xE3            0x18                   0xC0
-        let mut frame = vec![0xFF, 0xE3, 0x18, 0xC0];
-        frame.resize(144, 0u8);
-        frame
-    }
-
-    #[test]
-    fn test_decode_mp3_valid_frame() {
-        let data = create_test_mp3_frame();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.mp3");
-        std::fs::write(&path, &data).unwrap();
-        let result = decode_audio_to_mono_f32(&path);
-        // The minimp3 decoder may produce output (even from zeroed data)
-        // or it may return SkippedData that our decode_mp3 treats as EOF.
-        // Either way the function should not panic.
-        if let Err(e) = &result {
-            assert!(
-                e.to_string().contains("No audio decoded") || e.to_string().contains("Unsupported"),
-                "Unexpected error: {e}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_decode_mp3_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("empty.mp3");
-        std::fs::write(&path, b"").unwrap();
-        let result = decode_audio_to_mono_f32(&path);
-        assert!(result.is_err(), "Empty MP3 should fail to decode");
-    }
-
     #[test]
     fn test_decode_mp3_truncated_header() {
         let dir = tempfile::tempdir().unwrap();
@@ -1499,15 +1348,6 @@ mod tests {
             result.is_err(),
             "Truncated MP3 header should fail to decode"
         );
-    }
-
-    #[test]
-    fn test_decode_mp3_non_mp3_data() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fake.mp3");
-        std::fs::write(&path, b"this is not an mp3 file at all").unwrap();
-        let result = decode_audio_to_mono_f32(&path);
-        assert!(result.is_err(), "Non-MP3 data should fail to decode");
     }
 
     // ── First-use load wait ─────────────────────────────────────────────

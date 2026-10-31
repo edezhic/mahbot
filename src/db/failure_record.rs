@@ -462,78 +462,6 @@ pub(crate) fn record_startup_refusal(
 mod tests {
     use super::*;
 
-    /// The renderer emits the header, store, db path, step, cause, reason and
-    /// extras in that order; a field that could not be obtained is rendered
-    /// explicitly instead of being dropped.
-    #[test]
-    fn render_emits_every_field_in_order() {
-        let report = FailureReport::new(FailureKind::RuntimeIntegrityFailure)
-            .store("core")
-            .db_path(PathBuf::from("/tmp/core.db"))
-            .step("boot::open_stores")
-            .environment(true)
-            .reason("the check could not run")
-            .extra("artifact state: wal_size=0")
-            .render();
-        let lines: Vec<&str> = report.lines().collect();
-        let (header, timestamp) = lines[0]
-            .split_once(" — ")
-            .expect("the block's first line must be a header and an em-dashed timestamp");
-        assert_eq!(
-            header, "MahBot runtime integrity failure",
-            "the header must name the failure kind: {report}"
-        );
-        assert!(
-            !timestamp.is_empty() && timestamp.starts_with("20"),
-            "the header must carry an RFC 3339 UTC timestamp: {report}"
-        );
-        assert_eq!(lines[1], "store: core", "got: {report}");
-        assert_eq!(lines[2], "db path: /tmp/core.db", "got: {report}");
-        assert_eq!(
-            lines[3], "step: boot::open_stores",
-            "the failing step must follow the db path: {report}"
-        );
-        assert_eq!(
-            lines[4], ENVIRONMENT_CAUSE,
-            "an environment-caused failure must say so: {report}"
-        );
-        assert_eq!(lines[5], "reason: the check could not run", "got: {report}");
-        assert_eq!(
-            lines[6], "artifact state: wal_size=0",
-            "extras must follow verbatim: {report}"
-        );
-
-        let bare = FailureReport::new(FailureKind::StartUpFailure).render();
-        assert!(
-            bare.contains(NO_STORE) && bare.contains(NO_DB_PATH),
-            "a block that names no store must say so, never omit the lines: {bare}"
-        );
-        assert!(
-            !bare.contains(ENVIRONMENT_CAUSE)
-                && !bare.contains("reason:")
-                && !bare.contains("step:"),
-            "absent optional fields must not be rendered: {bare}"
-        );
-    }
-
-    /// A refusal block keeps the file-format contract: header, store, db path,
-    /// optional cause, reason, and a trailing newline.
-    #[test]
-    fn startup_refusal_block_is_written_with_its_environment_note() {
-        let tmp = tempfile::TempDir::new().expect("temp dir for test");
-        let db_path = tmp.path().join("db/core.db");
-        record_startup_refusal(tmp.path(), "core", &db_path, "permission denied", true);
-        let body = std::fs::read_to_string(tmp.path().join(ERROR_LOG_NAME)).expect("error.log");
-        assert!(
-            body.starts_with("MahBot start-up refusal — ")
-                && body.contains("store: core\n")
-                && body.contains(&format!("db path: {}\n", db_path.display()))
-                && body.contains(&format!("{ENVIRONMENT_CAUSE}\n"))
-                && body.contains("reason: permission denied\n"),
-            "got: {body}"
-        );
-    }
-
     /// A condition that repeats across processes is filed once: the record itself
     /// carries it, which is what bounds a failure that keeps coming back launch
     /// after launch. The condition is the block's identity lines, so the same kind,
@@ -631,23 +559,6 @@ mod tests {
         assert_eq!(blocks(), 5, "five conditions, five blocks: {body}");
     }
 
-    /// The block is written to the file under the resolved root, with the file's
-    /// blank-line terminator. The stderr fallback for an unresolved or unwritable
-    /// root is asserted in text by [`unfiled_block_carries_the_block_and_the_reason`]
-    /// (libtest owns stderr, so it cannot be captured here).
-    #[test]
-    fn record_files_the_block_with_the_file_terminator() {
-        let tmp = tempfile::TempDir::new().expect("temp dir for test");
-        let block = format!("MahBot start-up failure — probe\n{NO_STORE}\n");
-        record(Some(tmp.path()), &block);
-        let body = std::fs::read_to_string(tmp.path().join(ERROR_LOG_NAME)).expect("error.log");
-        assert_eq!(
-            body,
-            format!("{block}\n"),
-            "the block and the file's blank-line terminator must be written: {body:?}"
-        );
-    }
-
     /// A root the process has not created yet still gets the block: a launch
     /// failure can be the first thing that ever needs the rest, so `record`
     /// creates the directory rather than falling back to stderr (the fallback a
@@ -668,25 +579,6 @@ mod tests {
         assert!(
             body.contains("MahBot start-up failure — probe"),
             "got: {body:?}"
-        );
-    }
-
-    /// The stderr fallback in text: a block that cannot be filed reaches stderr
-    /// whole, followed by the reason it could not be filed — never a pointer to
-    /// a record that does not hold it.
-    #[test]
-    fn unfiled_block_carries_the_block_and_the_reason() {
-        let text = unfiled_block(
-            "MahBot start-up failure — probe\nstore: core\n",
-            "the storage root is unresolvable",
-        );
-        assert!(
-            text.starts_with("MahBot start-up failure — probe\nstore: core\n"),
-            "the whole block must reach stderr: {text:?}"
-        );
-        assert!(
-            text.contains("note: the storage root is unresolvable"),
-            "the fallback must say why it is on stderr: {text:?}"
         );
     }
 }

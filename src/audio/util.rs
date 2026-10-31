@@ -315,112 +315,72 @@ mod audio_util_tests {
     use super::{add_noise, apply_gain, generate_pink_noise, speed_perturbation};
     use rand::SeedableRng;
 
-    #[test]
-    fn test_speed_perturbation_identity() {
-        // rate=1.0 should return approximately the original
-        #[expect(clippy::cast_precision_loss)] // i ∈ 0..100 — exact in f32
-        let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
-        let result = speed_perturbation(&pcm, 16000, 1.0);
-        assert_eq!(result.len(), pcm.len(), "identity should preserve length");
-        for (a, b) in pcm.iter().zip(result.iter()) {
-            assert!((a - b).abs() < 1e-5, "identity should preserve values");
-        }
+    /// A ramp of `len` samples spanning −1..1.
+    #[expect(clippy::cast_precision_loss)] // small test lengths — exact in f32
+    fn ramp(len: usize) -> Vec<f32> {
+        let half = len as f32 / 2.0;
+        (0..len).map(|i| (i as f32 - half) / half).collect()
     }
 
+    /// Speed perturbation resamples: 1.0 is the input unchanged, below 1
+    /// lengthens the signal and above 1 shortens it.
     #[test]
-    fn test_speed_perturbation_rates() {
-        // Slow down: rate=0.5 should produce more samples
-        #[expect(clippy::cast_precision_loss)] // i ∈ 0..100 — exact in f32
-        let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
-        let slowed = speed_perturbation(&pcm, 16000, 0.5);
+    fn speed_perturbation_changes_length_by_the_factor() {
+        let pcm = ramp(100);
+
+        let identity = speed_perturbation(&pcm, 16000, 1.0);
+        assert_eq!(identity.len(), pcm.len(), "identity should preserve length");
+        for (a, b) in pcm.iter().zip(identity.iter()) {
+            assert!((a - b).abs() < 1e-5, "identity should preserve values");
+        }
+
         assert!(
-            slowed.len() > pcm.len(),
+            speed_perturbation(&pcm, 16000, 0.5).len() > pcm.len(),
             "rate < 1 should increase sample count"
         );
-        // Speed up: rate=2.0 should produce fewer samples
-        let sped_up = speed_perturbation(&pcm, 16000, 2.0);
         assert!(
-            sped_up.len() < pcm.len(),
+            speed_perturbation(&pcm, 16000, 2.0).len() < pcm.len(),
             "rate > 1 should decrease sample count"
         );
     }
 
+    /// The decibel conversion: 0 dB is unity gain, −6 dB halves the amplitude
+    /// and +6 dB doubles it.
     #[test]
-    fn test_speed_perturbation_determinism() {
-        // Same input + same rate → same output
-        #[expect(clippy::cast_precision_loss)] // i ∈ 0..100 — exact in f32
-        let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
-        let a = speed_perturbation(&pcm, 16000, 0.95);
-        let b = speed_perturbation(&pcm, 16000, 0.95);
-        assert_eq!(a, b, "deterministic speed perturbation");
-    }
-
-    #[test]
-    fn test_apply_gain_determinism() {
-        // apply_gain must be deterministic: same PCM + same gain_db → same output
-        #[expect(clippy::cast_precision_loss)] // i ∈ 0..50 — exact in f32
-        let pcm: Vec<f32> = (0..50).map(|i| (i as f32 - 25.0) / 25.0).collect();
-        let a = apply_gain(&pcm, -3.0);
-        let b = apply_gain(&pcm, -3.0);
-        assert_eq!(a, b, "apply_gain must be deterministic");
-    }
-
-    #[test]
-    fn test_apply_gain_db_conversion() {
-        // 0 dB → unity gain (output == input)
+    fn apply_gain_scales_by_the_decibel_factor() {
         let pcm: Vec<f32> = vec![0.5, -0.3, 0.1, -0.7, 0.9];
-        let unity = apply_gain(&pcm, 0.0);
-        for (a, b) in pcm.iter().zip(unity.iter()) {
-            assert!((a - b).abs() < 1e-6, "0 dB gain should be unity");
-        }
-        // -6 dB → amplitude halved (10^(-6/20) ≈ 0.5)
-        let attenuated = apply_gain(&pcm, -6.0);
-        let expected_amp = 10.0_f32.powf(-6.0 / 20.0);
-        for (orig, atten) in pcm.iter().zip(attenuated.iter()) {
-            assert!(
-                (atten - orig * expected_amp).abs() < 1e-6,
-                "-6 dB gain should multiply by {expected_amp}"
-            );
-        }
-        // +6 dB → amplitude doubled (10^(6/20) ≈ 2.0)
-        let amplified = apply_gain(&pcm, 6.0);
-        let expected_amp2 = 10.0_f32.powf(6.0 / 20.0);
-        for (orig, amp) in pcm.iter().zip(amplified.iter()) {
-            assert!(
-                (amp - orig * expected_amp2).abs() < 1e-6,
-                "+6 dB gain should multiply by {expected_amp2}"
-            );
+        for gain_db in [0.0, -6.0, 6.0] {
+            let expected_amp = 10.0_f32.powf(gain_db / 20.0);
+            for (orig, gained) in pcm.iter().zip(apply_gain(&pcm, gain_db).iter()) {
+                assert!(
+                    (gained - orig * expected_amp).abs() < 1e-6,
+                    "{gain_db} dB gain should multiply by {expected_amp}"
+                );
+            }
         }
     }
 
+    /// Seeded pink noise is reproducible, a different seed is a different
+    /// mixture, and the SNR target is honoured — at 100 dB the mix is nearly
+    /// the signal.
     #[test]
-    fn test_add_noise_determinism() {
-        // Same PCM + same SNR + same seed → same output
-        #[expect(clippy::cast_precision_loss)] // i ∈ 0..200 — exact in f32
-        let pcm: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) / 100.0).collect();
+    fn add_noise_tracks_the_seed_and_the_snr() {
+        let pcm = ramp(200);
         let a = add_noise(&pcm, 25.0, 42);
-        let b = add_noise(&pcm, 25.0, 42);
-        assert_eq!(a.len(), b.len(), "add_noise output length should match");
-        assert_eq!(a, b, "add_noise with same seed must be deterministic");
-    }
+        assert_eq!(a.len(), pcm.len(), "add_noise output length should match");
+        assert_eq!(
+            a,
+            add_noise(&pcm, 25.0, 42),
+            "same seed must be reproducible"
+        );
+        assert_ne!(
+            a,
+            add_noise(&pcm, 25.0, 99),
+            "a different seed should mix differently"
+        );
 
-    #[test]
-    fn test_add_noise_seed_variation() {
-        // Different seed → different output
-        #[expect(clippy::cast_precision_loss)] // i ∈ 0..200 — exact in f32
-        let pcm: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) / 100.0).collect();
-        let a = add_noise(&pcm, 25.0, 42);
-        let b = add_noise(&pcm, 25.0, 99);
-        assert_ne!(a, b, "different seeds should produce different output");
-    }
-
-    #[test]
-    fn test_add_noise_snr_approximation() {
-        // At very high SNR (100 dB), the output should be very close to input
-        #[expect(clippy::cast_precision_loss)] // i ∈ 0..1000 — exact in f32
-        let pcm: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) / 500.0).collect();
+        let pcm = ramp(1000);
         let noisy = add_noise(&pcm, 100.0, 42);
-        // Compute actual SNR of output vs input
         let signal_power: f32 = pcm.iter().map(|&s| s * s).sum();
         let noise_power: f32 = pcm
             .iter()

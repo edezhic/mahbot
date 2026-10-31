@@ -373,72 +373,90 @@ pub fn reset() {
 mod tests {
     use super::*;
 
+    /// One rendered block: the wrapper, one header per ticket with its hops in
+    /// order, and nothing at all for an empty run.
     #[test]
-    fn format_groups_consecutive_same_ticket_hops_under_one_header() {
-        let hops = vec![
-            Hop {
-                id: "mahbot-1736".into(),
-                source: "in_development".into(),
-                target: "verification".into(),
-                at: "2026-08-17T08:11:34.225709+00:00".into(),
-                actor: "engineer".into(),
-            },
-            Hop {
-                id: "mahbot-1736".into(),
-                source: "verification".into(),
-                target: "in_sanitation".into(),
-                at: "2026-08-17T08:21:19.225709+00:00".into(),
-                actor: "system".into(),
-            },
-        ];
-        let result = format_chronicle(&hops);
-        assert!(result.starts_with("<ticket-updates>\n"));
-        assert!(result.ends_with("</ticket-updates>\n"));
-        assert_eq!(result.matches("• mahbot-1736:").count(), 1);
-        assert!(result.contains(
-            "    in_development → verification (2026-08-17T08:11:34.225709+00:00) [engineer]"
-        ));
-        assert!(result.contains(
-            "    verification → in_sanitation (2026-08-17T08:21:19.225709+00:00) [system]"
-        ));
-    }
+    fn format_groups_hops_under_one_header_per_ticket() {
+        let hop = |id: &str, source: &str, target: &str, at: &str, actor: &str| Hop {
+            id: id.into(),
+            source: source.into(),
+            target: target.into(),
+            at: at.into(),
+            actor: actor.into(),
+        };
 
-    #[test]
-    fn format_interleaved_tickets_are_run_grouped() {
-        let hops = vec![
-            Hop {
-                id: "mahbot-A".into(),
-                source: "backlog".into(),
-                target: "analysis".into(),
-                at: "2026-08-17T08:00:00+00:00".into(),
-                actor: "system".into(),
-            },
-            Hop {
-                id: "mahbot-B".into(),
-                source: "analysis".into(),
-                target: "planning".into(),
-                at: "2026-08-17T08:01:00+00:00".into(),
-                actor: "analyst".into(),
-            },
-            Hop {
-                id: "mahbot-A".into(),
-                source: "planning".into(),
-                target: "queued".into(),
-                at: "2026-08-17T08:02:00+00:00".into(),
-                actor: "system".into(),
-            },
-        ];
-        let result = format_chronicle(&hops);
-        assert_eq!(result.matches("• mahbot-A:").count(), 2);
-        assert_eq!(result.matches("• mahbot-B:").count(), 1);
-        let hop_a1 = result.find("    backlog → analysis").unwrap();
-        let hop_b = result.find("    analysis → planning").unwrap();
-        let hop_a2 = result.find("    planning → queued").unwrap();
-        assert!(hop_a1 < hop_b && hop_b < hop_a2);
-    }
+        // Consecutive hops of one ticket share its header.
+        let single = format_chronicle(&[
+            hop(
+                "mahbot-1736",
+                "in_development",
+                "verification",
+                "2026-08-17T08:11:34.225709+00:00",
+                "engineer",
+            ),
+            hop(
+                "mahbot-1736",
+                "verification",
+                "in_sanitation",
+                "2026-08-17T08:21:19.225709+00:00",
+                "system",
+            ),
+        ]);
+        assert!(single.starts_with("<ticket-updates>\n"), "got: {single}");
+        assert!(single.ends_with("</ticket-updates>\n"), "got: {single}");
+        assert_eq!(single.matches("• mahbot-1736:").count(), 1, "got: {single}");
+        assert!(
+            single.contains(
+                "    in_development → verification (2026-08-17T08:11:34.225709+00:00) [engineer]"
+            ),
+            "got: {single}"
+        );
+        assert!(
+            single.contains(
+                "    verification → in_sanitation (2026-08-17T08:21:19.225709+00:00) [system]"
+            ),
+            "got: {single}"
+        );
 
-    #[test]
-    fn format_empty_returns_empty() {
+        // Interleaved tickets come out run-grouped, in the order the hops arrived.
+        let interleaved = format_chronicle(&[
+            hop(
+                "mahbot-A",
+                "backlog",
+                "analysis",
+                "2026-08-17T08:00:00+00:00",
+                "system",
+            ),
+            hop(
+                "mahbot-B",
+                "analysis",
+                "planning",
+                "2026-08-17T08:01:00+00:00",
+                "analyst",
+            ),
+            hop(
+                "mahbot-A",
+                "planning",
+                "queued",
+                "2026-08-17T08:02:00+00:00",
+                "system",
+            ),
+        ]);
+        assert_eq!(
+            interleaved.matches("• mahbot-A:").count(),
+            2,
+            "got: {interleaved}"
+        );
+        assert_eq!(
+            interleaved.matches("• mahbot-B:").count(),
+            1,
+            "got: {interleaved}"
+        );
+        let hop_a1 = interleaved.find("    backlog → analysis").unwrap();
+        let hop_b = interleaved.find("    analysis → planning").unwrap();
+        let hop_a2 = interleaved.find("    planning → queued").unwrap();
+        assert!(hop_a1 < hop_b && hop_b < hop_a2, "got: {interleaved}");
+
         assert!(format_chronicle(&[]).is_empty());
     }
 

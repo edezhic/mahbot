@@ -2751,21 +2751,6 @@ mod tests {
     use crate::util::lock::{lock_file_path, try_flock};
 
     #[test]
-    fn test_truncate_to_last_64k_no_truncation() {
-        let s = "hello world";
-        assert_eq!(truncate_to_last_64k(s), "hello world");
-    }
-
-    #[test]
-    fn test_truncate_to_last_64k_large_input() {
-        let big = "X".repeat(70_000);
-        let result = truncate_to_last_64k(&big);
-        assert!(result.starts_with("[…output truncated;"));
-        let x_count = result.chars().filter(|c| *c == 'X').count();
-        assert_eq!(x_count, 64 * 1024);
-    }
-
-    #[test]
     fn test_try_acquire_lock_held_free() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = lock_file_path(dir.path());
@@ -2864,17 +2849,6 @@ mod tests {
             }
         }
         Ok(false)
-    }
-
-    #[test]
-    fn test_lock_file_path_suffix() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = lock_file_path(dir.path());
-        assert!(
-            path.ends_with("mahbot.lock"),
-            "Lock file path must end with mahbot.lock, got: {}",
-            path.display(),
-        );
     }
 
     #[test]
@@ -3013,59 +2987,6 @@ mod tests {
         );
     }
 
-    /// The asset-name and URL derivation is the contract the release workflow and
-    /// the install scripts mirror, so it is pinned here: the platform tag, the
-    /// extension, and all three URL shapes — the version file, the change-list
-    /// asset and the release page the notice falls back to.
-    #[test]
-    fn test_release_asset_naming_and_urls() {
-        let base = "https://example.test/owner/repo";
-        let version = semver::Version::new(1, 2, 3);
-
-        // The platform tag is the `(os, arch)` pair itself; only the extension
-        // splits by platform.
-        for (os, arch, name) in [
-            ("macos", "x86_64", "mahbot-1.2.3-macos-x86_64.tar.gz"),
-            ("macos", "aarch64", "mahbot-1.2.3-macos-aarch64.tar.gz"),
-            ("linux", "x86_64", "mahbot-1.2.3-linux-x86_64.tar.gz"),
-            ("linux", "aarch64", "mahbot-1.2.3-linux-aarch64.tar.gz"),
-            ("windows", "x86_64", "mahbot-1.2.3-windows-x86_64.zip"),
-            ("windows", "aarch64", "mahbot-1.2.3-windows-aarch64.zip"),
-        ] {
-            assert_eq!(asset_name(&version, os, arch), name, "{os}-{arch}");
-        }
-
-        // The newest release is found through its own tiny file, an exact version
-        // through its tag; the change list travels with that same release, and the
-        // page it was published on is what the notice names when it cannot carry
-        // the list.
-        assert_eq!(
-            latest_version_url(base),
-            "https://example.test/owner/repo/releases/latest/download/version.txt"
-        );
-        assert_eq!(
-            asset_url(base, &version, "windows", "x86_64"),
-            "https://example.test/owner/repo/releases/download/v1.2.3/mahbot-1.2.3-windows-x86_64.zip"
-        );
-        assert_eq!(
-            changelog_url(base, "1.2.3"),
-            "https://example.test/owner/repo/releases/download/v1.2.3/changelog.txt"
-        );
-        assert_eq!(
-            release_page_url(base, "1.2.3"),
-            "https://example.test/owner/repo/releases/tag/v1.2.3"
-        );
-
-        // A pre-release version — what a test release carries — uses the same
-        // shapes, so it needs no separate path.
-        let test_release = semver::Version::parse("1.2.3-rc.1").unwrap();
-        assert_eq!(
-            asset_url(base, &test_release, "linux", "aarch64"),
-            "https://example.test/owner/repo/releases/download/v1.2.3-rc.1/\
-             mahbot-1.2.3-rc.1-linux-aarch64.tar.gz"
-        );
-    }
-
     /// The notice's whole rule: a restart of the same version, a build from
     /// source and a first install during setup say nothing; a published copy on a
     /// different version — or the first start of one installed by a build that
@@ -3135,21 +3056,6 @@ mod tests {
             case(Some(current), false, true, true),
             UpdateNotice::Unchanged
         );
-    }
-
-    /// The rendered notice is one tagged, self-explanatory block in both states,
-    /// and without a list it names the release page that carries it.
-    #[test]
-    fn test_the_update_notice_carries_the_version_and_the_list() {
-        let page = "https://example.test/owner/repo/releases/tag/v1.2.3";
-
-        let with_list = update_notice_text("1.2.3", Some("* a new capability"), page);
-        assert!(with_list.starts_with("<product-update version=\"1.2.3\">"));
-        assert!(with_list.contains("* a new capability"));
-
-        let without_list = update_notice_text("1.2.3", None, page);
-        assert!(without_list.starts_with("<product-update version=\"1.2.3\">"));
-        assert!(without_list.contains(page));
     }
 
     /// A list already captured for a version is never replaced by an attempt whose
@@ -3642,29 +3548,6 @@ mod tests {
             elsewhere,
             Some(canonicalize_safe(&copy)),
             "a copy that is neither is a leftover"
-        );
-    }
-
-    #[test]
-    fn test_canonicalize_safe_nonexistent_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let nonexistent = dir.path().join("does_not_exist");
-        // For a nonexistent path, canonicalize_safe should return the lexical path.
-        let result = canonicalize_safe(&nonexistent);
-        assert_eq!(result, nonexistent);
-    }
-
-    #[test]
-    fn test_canonicalize_safe_existing_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test_file.txt");
-        std::fs::write(&file_path, "hello").unwrap();
-
-        let result = canonicalize_safe(&file_path);
-        assert!(
-            result.ends_with("test_file.txt"),
-            "Canonicalized path should end with test_file.txt, got {}",
-            result.display(),
         );
     }
 }

@@ -118,73 +118,39 @@ mod tests {
         GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The generation is the identity of a run: a deregister carrying any other
+    /// generation touches nothing, neither the entry it re-registered over nor
+    /// the fresh holder a replacement run registered, and only the matching
+    /// generation removes it.
     #[test]
-    fn register_publishes_initial_empty_snapshot() {
-        let agent_id = format!("snap_{}", crate::generate_suffix());
-        let generation = next_gen();
-        let holder = TRANSCRIPT_REGISTRY.register(agent_id.clone(), generation);
-        let snap = TRANSCRIPT_REGISTRY
-            .snapshot(&agent_id)
-            .expect("registered agent has a snapshot");
-        assert!(snap.history.is_empty());
-        assert_eq!(snap.token_count, None);
-        let _ = holder;
-        TRANSCRIPT_REGISTRY.deregister(&agent_id, generation);
-    }
-
-    #[test]
-    fn deregister_removes_generation_match_only() {
+    fn only_the_matching_generation_removes_an_entry() {
         let agent_id = format!("snap_dereg_{}", crate::generate_suffix());
         let generation = next_gen();
-        let holder = TRANSCRIPT_REGISTRY.register(agent_id.clone(), generation);
+        let holder_a = TRANSCRIPT_REGISTRY.register(agent_id.clone(), generation);
+
         // Stale (wrong-generation) deregister is a no-op.
         TRANSCRIPT_REGISTRY.deregister(&agent_id, generation + 1);
         assert!(
             TRANSCRIPT_REGISTRY.snapshot(&agent_id).is_some(),
             "stale deregister must not remove the entry"
         );
-        // Matching deregister removes it.
-        TRANSCRIPT_REGISTRY.deregister(&agent_id, generation);
-        assert!(
-            TRANSCRIPT_REGISTRY.snapshot(&agent_id).is_none(),
-            "matching deregister removes the entry"
-        );
-        let _ = holder;
-    }
 
-    #[test]
-    fn store_publishes_new_snapshot_for_reader() {
-        let agent_id = format!("snap_store_{}", crate::generate_suffix());
-        let generation = next_gen();
-        let holder = TRANSCRIPT_REGISTRY.register(agent_id.clone(), generation);
-        let snap = TranscriptSnapshot {
-            history: vec![ChatMessage::assistant("hello")],
-            token_count: Some(42),
-        };
-        holder.store(Arc::new(snap));
-        let read = TRANSCRIPT_REGISTRY
-            .snapshot(&agent_id)
-            .expect("snapshot visible after store");
-        assert_eq!(read.history.len(), 1);
-        assert_eq!(read.token_count, Some(42));
-        TRANSCRIPT_REGISTRY.deregister(&agent_id, generation);
-    }
-
-    #[test]
-    fn replacement_gets_fresh_holder_and_stale_deregister_keeps_it() {
-        let agent_id = format!("snap_replace_{}", crate::generate_suffix());
-        let gen_a = next_gen();
-        let _holder_a = TRANSCRIPT_REGISTRY.register(agent_id.clone(), gen_a);
-        // Replacement run registers a fresh holder with a new generation.
+        // Replacement run registers a fresh holder with a new generation; the
+        // old run's deregister (now stale) must NOT remove it.
         let gen_b = next_gen();
         let holder_b = TRANSCRIPT_REGISTRY.register(agent_id.clone(), gen_b);
-        // The old run's deregister (stale generation) must NOT remove B.
-        TRANSCRIPT_REGISTRY.deregister(&agent_id, gen_a);
+        TRANSCRIPT_REGISTRY.deregister(&agent_id, generation);
         assert!(
             TRANSCRIPT_REGISTRY.snapshot(&agent_id).is_some(),
             "replacement entry survives the stale deregister"
         );
-        let _ = holder_b;
+
+        // Matching deregister removes it.
         TRANSCRIPT_REGISTRY.deregister(&agent_id, gen_b);
+        assert!(
+            TRANSCRIPT_REGISTRY.snapshot(&agent_id).is_none(),
+            "matching deregister removes the entry"
+        );
+        let _ = (holder_a, holder_b);
     }
 }

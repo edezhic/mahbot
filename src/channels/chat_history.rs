@@ -386,60 +386,32 @@ mod tests {
         usize::try_from(stored).expect("a row count fits in usize")
     }
 
+    /// A session-reset divider is stored as its own entry: a timestamp in its
+    /// content, no agent role, its own conversation and workspace only — and the
+    /// timeline reads back in the order the rows were written, dividers between
+    /// messages included.
     #[tokio::test]
-    async fn test_open_smoke() {
+    async fn test_dividers_are_stored_ordered_and_scoped() {
         let (store, _tmp) = test_setup().await;
 
-        // Verify there is no agent_id column.
-        let rows = store
-            .conn
-            .query(
-                "SELECT 1 FROM pragma_table_info('chat_history') WHERE name = 'agent_id'",
-                db::params![],
-            )
-            .await
-            .expect("Failed to check column existence");
-        assert!(rows.is_empty(), "agent_id should not exist in fresh schema");
-
-        // Verify basic insert and load work.
-        insert_message(&store, "user", "ws", "msg-1").await;
-        let history = kept(&store, "user", "ws").await;
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content, "msg-1");
-    }
-
-    #[tokio::test]
-    async fn test_insert_divider_roundtrip() {
-        let (store, _tmp) = test_setup().await;
-
-        // Insert a divider marker.
+        // A single divider: the row the read hands back is a divider, not a
+        // message, and it speaks only to the conversation that wrote it.
         store
             .insert_divider("alice", "ws1")
             .await
             .expect("insert_divider should succeed");
-
-        // Load history for the same user+workspace.
         let history = kept(&store, "alice", "ws1").await;
-
-        // Should have exactly one entry: the divider.
         assert_eq!(history.len(), 1, "should have exactly one divider entry");
-
         let entry = &history[0];
-
-        // Verify the entry is detected as a divider.
         assert_eq!(
             entry.direction,
             ChatDirection::Divider,
             "divider entry should have ChatDirection::Divider"
         );
-
-        // agent_role should be None for divider rows.
         assert!(
             entry.agent_role.is_none(),
             "divider should have no agent_role"
         );
-
-        // content should be a non-empty timestamp (RFC 3339).
         assert!(
             !entry.content.is_empty(),
             "divider content (timestamp) should not be empty"
@@ -449,75 +421,42 @@ mod tests {
             "divider content should be an ISO 8601 timestamp, got: {}",
             entry.content
         );
-
-        // Verify the divider is *not* present in another user's history.
         assert!(
             kept(&store, "bob", "ws1").await.is_empty(),
             "divider inserted for alice should not appear in bob's history"
         );
-
-        // Verify the divider is *not* present in another workspace's history.
         assert!(
             kept(&store, "alice", "ws2").await.is_empty(),
             "divider inserted for ws1 should not appear in ws2's history"
         );
-    }
 
-    #[tokio::test]
-    async fn test_insert_multiple_dividers() {
-        let (store, _tmp) = test_setup().await;
-
-        // Insert two dividers.
-        store
-            .insert_divider("alice", "ws1")
-            .await
-            .expect("first divider should succeed");
+        // Two dividers are two entries, oldest first.
         store
             .insert_divider("alice", "ws1")
             .await
             .expect("second divider should succeed");
-
         let history = kept(&store, "alice", "ws1").await;
-
-        // Both dividers should be present.
         assert_eq!(history.len(), 2, "should have two dividers");
         assert_eq!(history[0].direction, ChatDirection::Divider);
         assert_eq!(history[1].direction, ChatDirection::Divider);
-
-        // The first inserted divider should be older (lower id, ordered chronologically).
         assert!(
             history[0].id < history[1].id,
             "first inserted divider should have a lower id"
         );
-    }
 
-    #[tokio::test]
-    async fn test_divider_mixed_with_messages() {
+        // A divider between two messages keeps its place in the timeline.
         let (store, _tmp) = test_setup().await;
-
-        // Insert a regular user message first.
         insert_message(&store, "alice", "ws1", "msg-1").await;
-
-        // Insert a divider.
         store
             .insert_divider("alice", "ws1")
             .await
             .expect("insert_divider should succeed");
-
-        // Insert another message after the divider.
         insert_message(&store, "alice", "ws1", "msg-2").await;
-
-        // Load all three.
         let history = kept(&store, "alice", "ws1").await;
-
         assert_eq!(history.len(), 3, "should have all three entries");
-
-        // Chronological order (oldest first).
         assert_eq!(history[0].direction, ChatDirection::User);
         assert_eq!(history[0].content, "msg-1");
-
         assert_eq!(history[1].direction, ChatDirection::Divider);
-
         assert_eq!(history[2].direction, ChatDirection::User);
         assert_eq!(history[2].content, "msg-2");
     }

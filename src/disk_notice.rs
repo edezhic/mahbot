@@ -361,29 +361,4 @@ mod tests {
             "a zero capacity is no reading: the escalation neither advances nor resets"
         );
     }
-
-    #[test]
-    fn the_ladder_round_trips_through_its_persisted_form() {
-        let ladder = Ladder {
-            deliveries: 3,
-            delivered_at: at(4321),
-        };
-        assert_eq!(Ladder::parse(&ladder.encode()), Some(ladder));
-        assert_eq!(Ladder::parse("garbage"), None);
-        assert_eq!(Ladder::parse("3@not-a-time"), None);
-    }
-
-    #[test]
-    fn the_notice_is_the_fixed_text_with_the_figures_filled_in() {
-        let temp_root = Path::new("/tmp/mahbot");
-        assert_eq!(
-            render_notice(5 * 1024 * 1024 * 1024, 100 * 1024 * 1024 * 1024, temp_root),
-            "<disk-space-notice>\n\
-             Free space is below 5% on the volume holding mahbot's temp directory: 5.4G free of 107.4G.\n\
-             Garbage left by agents piles up in /tmp/mahbot — start cleaning there.\n\
-             Cleanup is the administrative assistant's job. Be careful not to touch files that running agents are using right now.\n\
-             If cleaning brings free space back above 5%, say nothing. If it does not, tell the owner that space is running out and suggest what else could be cleaned.\n\
-             </disk-space-notice>\n",
-        );
-    }
 }

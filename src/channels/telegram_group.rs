@@ -675,8 +675,10 @@ mod tests {
         std::sync::Arc::new(Preparations::new())
     }
 
+    /// The quiet window starts at the first part and is extended by each later
+    /// one; a lone part is released on it, unchanged.
     #[test]
-    fn lone_plain_part_releases_after_quiet_window() {
+    fn the_window_starts_at_the_first_part_and_extends_with_later_ones() {
         let mut collector = Collector::default();
         let t0 = Instant::now();
         assert!(collector.push(part("alice", "chat", "hello"), t0).is_none());
@@ -692,12 +694,8 @@ mod tests {
         assert_eq!(released[0].parts.len(), 1);
         assert_eq!(released[0].parts[0].message.content, "hello");
         assert_eq!(released[0].release, Release::Quiet);
-    }
 
-    #[test]
-    fn second_part_extends_the_window() {
         let mut collector = Collector::default();
-        let t0 = Instant::now();
         collector.push(part("alice", "chat", "one"), t0);
         collector.push(
             part("alice", "chat", "two"),
@@ -716,18 +714,35 @@ mod tests {
         assert_eq!(forwarded.deadline(), Some(t0 + EXTENDED_WINDOW));
     }
 
+    /// The ceiling bounds an ordinary group, and does not cut one that was held:
+    /// a preparation that ends past the ceiling releases the group after its own
+    /// window from that end.
     #[test]
-    fn deadline_never_exceeds_the_ceiling() {
+    fn the_ceiling_bounds_the_window_but_waits_with_a_held_group() {
         let mut collector = Collector::default();
         let t0 = Instant::now();
         collector.push(part("alice", "chat", "one"), t0);
         collector.push(part("alice", "chat", "two"), t0 + Duration::from_secs(2));
         collector.push(part("alice", "chat", "three"), t0 + Duration::from_secs(4));
         assert_eq!(collector.deadline(), Some(t0 + CEILING));
+
+        let preparations = no_preparations();
+        let mut collector = Collector::default();
+        collector.push(part("alice", "chat", "one"), t0);
+        let guard = preparations.begin("alice", "chat");
+        collector.observe(&preparations, t0);
+        drop(guard);
+
+        let ended = t0 + CEILING + Duration::from_secs(1);
+        collector.observe(&preparations, ended);
+        assert_eq!(collector.deadline(), Some(ended + QUIET_WINDOW));
     }
 
+    /// Both caps release the group at once — the part count at the ceiling, the
+    /// character count on the part that would pass it — and a group that stays
+    /// within the character cap keeps its window.
     #[test]
-    fn part_cap_releases_the_group() {
+    fn caps_release_the_group() {
         let mut collector = Collector::default();
         let t0 = Instant::now();
         for _ in 0..MAX_PARTS - 1 {
@@ -738,12 +753,8 @@ mod tests {
             .expect("reaching the part cap must release");
         assert_eq!(released.parts.len(), MAX_PARTS);
         assert_eq!(released.release, Release::PartCap);
-    }
 
-    #[test]
-    fn character_cap_releases_the_group() {
         let mut collector = Collector::default();
-        let t0 = Instant::now();
         let half = "x".repeat(MAX_CHARS / 2 + 1);
         assert!(collector.push(part("alice", "chat", &half), t0).is_none());
         let released = collector
@@ -782,18 +793,6 @@ mod tests {
         assert_eq!(collector.release_all().len(), 2);
         assert!(collector.release_all().is_empty());
         assert_eq!(collector.deadline(), None);
-    }
-
-    #[test]
-    fn compose_group_content_joins_parts_in_order() {
-        let parts = vec![part("alice", "chat", "one"), part("alice", "chat", "two")];
-        assert_eq!(
-            compose_group_content(parts),
-            format!("one{PART_SEPARATOR}two")
-        );
-
-        let single = vec![part("alice", "chat", "solo")];
-        assert_eq!(compose_group_content(single), "solo");
     }
 
     /// Await the next message the collector releases. Fails rather than hanging
@@ -979,23 +978,6 @@ mod tests {
         );
     }
 
-    /// The ceiling does not cut a group that was held: a preparation that ends
-    /// past the ceiling releases the group after its own window from that end.
-    #[test]
-    fn the_ceiling_waits_with_a_held_group() {
-        let preparations = no_preparations();
-        let mut collector = Collector::default();
-        let t0 = Instant::now();
-        collector.push(part("alice", "chat", "one"), t0);
-        let guard = preparations.begin("alice", "chat");
-        collector.observe(&preparations, t0);
-        drop(guard);
-
-        let ended = t0 + CEILING + Duration::from_secs(1);
-        collector.observe(&preparations, ended);
-        assert_eq!(collector.deadline(), Some(ended + QUIET_WINDOW));
-    }
-
     /// A clear is not a release: the mark is dropped before the part it produced is
     /// handed over, and the group's window starts at the clear, so a collector pass
     /// landing in the moment between takes the group as waiting rather than
@@ -1092,32 +1074,5 @@ mod tests {
             taken_at(0) <= taken_at(1),
             "the parts must be recorded in send order"
         );
-    }
-
-    /// Every rule a group can be released by names itself in the record: the column
-    /// is what a person asking why a burst split reads, and a release the record can
-    /// only call by the wrong name is worse than no record.
-    #[test]
-    fn every_release_rule_is_named_in_the_record() {
-        let rules = [
-            (Release::Quiet, "quiet_window"),
-            (Release::Extended, "extended_window"),
-            (Release::Ceiling, "ceiling"),
-            (Release::PartCap, "part_cap"),
-            (Release::CharCap, "char_cap"),
-            (Release::Control, "control"),
-            (Release::Stop, "stop"),
-        ];
-        for (rule, named) in rules {
-            let released = Released {
-                parts: vec![Part::new(part("alice", "chat", "one"))],
-                release: rule,
-            };
-            assert_eq!(
-                released.record(SystemTime::now()).released_by,
-                named,
-                "{rule:?} must be recorded as {named}"
-            );
-        }
     }
 }

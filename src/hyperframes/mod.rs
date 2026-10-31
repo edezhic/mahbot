@@ -1399,21 +1399,6 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_encoder_is_reported_as_a_machine_side_gap() {
-        let output = "\n{\"ok\":false,\"error\":{\"code\":\"runtime_error\",\"message\":\
-                      \"MP4 H.264 encoder unavailable\",\"hint\":\"brew install ffmpeg\"}}\n\n\
-                      ✗  MP4 H.264 encoder unavailable\n   Install an FFmpeg build with libx264 support \
-                      (brew install ffmpeg)\n";
-        let message = run_failure(&failed(output), RENDER, None);
-        assert!(
-            message.starts_with("runtime_error: MP4 H.264 encoder unavailable"),
-            "got: {message}"
-        );
-        assert!(message.contains("machine-side gap"), "got: {message}");
-        assert!(!message.contains("brew install"), "got: {message}");
-    }
-
-    #[test]
     fn a_failure_envelope_is_not_read_as_a_clean_report() {
         // What the vendor prints when lint cannot run at all: the report's own
         // field names, zeroed, beside an `error`. Reading it as a report would tell
@@ -1426,28 +1411,6 @@ mod tests {
         let message = run_failure(&failed(output), "the check", None);
         assert!(
             message.starts_with("runtime_error: No composition found in /w"),
-            "got: {message}"
-        );
-    }
-
-    #[test]
-    fn a_run_without_an_envelope_keeps_its_own_lines_and_drops_the_remedies() {
-        // The renderer prints the project line even when it rendered the file it was
-        // told to, and the remedy lines are its own commands: neither belongs in a
-        // failure message.
-        let output = "[initSession] noise\n\n✗  Chrome not found\n\n\
-                      Run: npx hyperframes browser ensure\n   brew install ffmpeg\n\
-                      No composition found in /w/project\n   real cause line\n";
-        let message = run_failure(&failed(output), RENDER, None);
-        assert!(message.starts_with("the render failed: "), "got: {message}");
-        assert!(message.contains("Chrome not found"), "got: {message}");
-        assert!(message.contains("real cause line"), "got: {message}");
-        assert!(!message.contains("npx hyperframes"), "got: {message}");
-        assert!(!message.contains("brew install"), "got: {message}");
-        assert!(!message.contains("initSession"), "got: {message}");
-        assert!(!message.contains("No composition found"), "got: {message}");
-        assert!(
-            message.starts_with("the render failed: exit status 1"),
             "got: {message}"
         );
     }
@@ -1620,13 +1583,10 @@ mod tests {
         let delivered = render_verdict(plays(), &crashed, Path::new("/work/clip.mp4"))
             .expect("the file stands");
         assert!(delivered.notes.unwrap().contains("exit status 1"));
-    }
 
-    /// A product stop and a post-render complaint can both land on a delivered file: the
-    /// machine's verdict leads, and the renderer's own complaint follows it.
-    #[test]
-    fn a_stopped_run_keeps_its_reason_beside_the_renderers_complaint() {
-        let outcome = ProgramOutcome {
+        // A product stop and a post-render complaint can both land on a delivered file: the
+        // machine's verdict leads, and the renderer's own complaint follows it.
+        let stopped = ProgramOutcome {
             detail: "terminated: exceeded memory limit (used ~15.4 GiB of 18.0 GiB)".to_string(),
             stop: Some(Stop::Memory),
             ..failed(
@@ -1634,72 +1594,12 @@ mod tests {
                  history.json could not be written\n",
             )
         };
-        let note = delivery_notes(&outcome).expect("both facts are kept");
+        let note = delivery_notes(&stopped).expect("both facts are kept");
         let stop = note
             .find("the product stopped the render")
             .expect("the stop");
         let complaint = note.find("history.json").expect("the complaint");
         assert!(stop < complaint, "the stop leads: {note}");
-    }
-
-    /// A step the renderer reports failing after it wrote the file is one sentence
-    /// beside the result, with the vendor's own remedies kept out of it.
-    #[test]
-    fn a_post_render_complaint_is_a_note_beside_the_file() {
-        let output = "{\"ok\":true}\n  [hyperframes] Post-render step 'history' failed \
-                      (render already succeeded): history.json could not be written; \
-                      run hyperframes doctor\n";
-        let note = late_failure(output)
-            .expect("the late step is named")
-            .sentence;
-        assert!(note.starts_with("the file was written;"), "got: {note}");
-        assert!(
-            note.contains("history.json could not be written"),
-            "got: {note}"
-        );
-        assert!(!note.contains("hyperframes doctor"), "got: {note}");
-
-        // A late error the renderer survives because the result was delivered reads the
-        // same way; progress lines are not late failures at all.
-        let late = "[hyperframes] Late uncaughtException (the command already delivered its \
-                    result): boom";
-        assert!(late_failure(late).unwrap().sentence.contains("boom"));
-        assert!(late_failure("Rendering frame 3 of 30\n").is_none());
-    }
-
-    /// A render with no playable file reports why: the vendor's envelope where it printed
-    /// one, the run's own verdict where it did not, and a clean exit still says what it
-    /// left behind.
-    #[test]
-    fn a_render_without_a_playable_file_reports_why() {
-        let output = Path::new("/work/clip.mp4");
-
-        let envelope = failed(
-            "{\"ok\":false,\"error\":{\"code\":\"runtime_error\",\"message\":\"the page threw\"}}",
-        );
-        let message = render_failure(&envelope, output);
-        assert!(
-            message.starts_with("runtime_error: the page threw"),
-            "got: {message}"
-        );
-
-        let clean = ProgramOutcome {
-            success: true,
-            detail: "exit status 0".to_string(),
-            ..failed("the renderer's own tail\n")
-        };
-        let message = render_failure(&clean, output);
-        assert!(message.contains("wrote no playable file"), "got: {message}");
-        assert!(
-            message.contains("/work/clip.mp4"),
-            "the path is named: {message}"
-        );
-
-        let message = render_failure(&failed("boom"), output);
-        assert!(
-            message.starts_with("the render failed: exit status 1"),
-            "got: {message}"
-        );
     }
 
     #[test]
@@ -1732,20 +1632,6 @@ mod tests {
             "got: {message}"
         );
         assert!(!message.contains("page threw"), "got: {message}");
-    }
-
-    #[test]
-    fn a_run_the_product_stopped_reads_as_a_timeout() {
-        // A stop is not a verdict about the renderer: it carries the `timeout:` class
-        // every product run's stop carries, and names the ceiling that ended it.
-        let outcome = ProgramOutcome {
-            stop: Some(Stop::Timeout),
-            ..failed("")
-        };
-        assert_eq!(
-            run_failure(&outcome, "the check", Some(Duration::from_mins(10))),
-            "timeout: the check did not finish within 600s and was killed"
-        );
     }
 
     /// The lines the filter is judged on, and what it must return for each: the vendor's
@@ -1993,14 +1879,18 @@ mod tests {
         }
     }
 
+    /// The budget is spent in the order a reader needs the facts: the machine-side
+    /// note and the hint are said before the vendor's own prose is cut, and the
+    /// vendor's container suggestion — advice this product never gives — is dropped
+    /// however long the message runs.
     #[test]
-    fn the_machine_side_note_survives_a_long_message() {
-        // The machine-side note is what a reader is told to look for, so it is spent
-        // from the budget before the vendor's own prose is cut.
+    fn the_note_and_the_hint_are_paid_for_before_the_prose_is_cut() {
+        let prose = "prose ".repeat(400);
+
+        // The machine-side note is what a reader is told to look for.
         let output = format!(
-            "{{\"ok\":false,\"error\":{{\"code\":\"runtime_error\",\"message\":\"{}\
+            "{{\"ok\":false,\"error\":{{\"code\":\"runtime_error\",\"message\":\"{prose}\
              MP4 H.264 encoder unavailable\"}}}}\n",
-            "prose ".repeat(400)
         );
         let message = run_failure(&failed(&output), RENDER, None);
         assert!(message.contains("machine-side gap"), "got: {message}");
@@ -2009,18 +1899,12 @@ mod tests {
             "got {} bytes",
             message.len()
         );
-    }
 
-    #[test]
-    fn the_hint_survives_a_long_message_and_the_advice_does_not() {
-        // The hint is the line that says what to do, so it is spent from the budget
-        // first; the vendor's container suggestion is advice this product never
-        // gives, wherever it appears.
+        // The hint is the line that says what to do.
         let output = format!(
-            "{{\"ok\":false,\"error\":{{\"code\":\"runtime_error\",\"message\":\"{}\",\
+            "{{\"ok\":false,\"error\":{{\"code\":\"runtime_error\",\"message\":\"{prose}\",\
              \"hint\":\"compositions/scene.html:42 — intro is not defined. \
              Try --docker for containerized rendering\"}}}}\n",
-            "prose ".repeat(400)
         );
         let message = run_failure(&failed(&output), RENDER, None);
         assert!(

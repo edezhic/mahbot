@@ -1052,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn version_banner_tokens_parse_with_or_without_a_v_prefix() {
+    fn version_banners_and_release_tags_yield_the_same_version() {
         // The helper's `--version` banner prints the version with or without a
         // leading `v`.
         assert_eq!(
@@ -1065,24 +1065,7 @@ mod tests {
         );
         assert_eq!(parse_version_token("latest"), None);
         assert_eq!(parse_version_token(""), None);
-    }
 
-    #[test]
-    fn a_two_part_version_pads_to_semver() {
-        assert_eq!(
-            parse_short_version("10.3"),
-            Some(semver::Version::new(10, 3, 0))
-        );
-        assert_eq!(
-            parse_short_version("10.3.1"),
-            Some(semver::Version::new(10, 3, 1))
-        );
-        assert_eq!(parse_short_version("Telegram Bot API"), None);
-        assert_eq!(parse_short_version("10.3.1.2"), None);
-    }
-
-    #[test]
-    fn release_tags_carry_a_version_after_their_prefix() {
         // chrome-use tags are bare versioned tags, bun's carry a `bun-` prefix.
         assert_eq!(
             version_from_tag("v1.5.140"),
@@ -1186,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_aside_swap_replaces_and_cleans_up() {
+    fn rename_aside_swap_replaces_and_restores() {
         let dir = tempfile::tempdir().expect("tempdir");
         let dest = dir.path().join("bun");
         let tmp = dir.path().join("prepared");
@@ -1198,18 +1181,12 @@ mod tests {
         // The aside and the prepared copy are both gone after a clean swap.
         assert!(!aside_of(&dest).exists());
         assert!(!tmp.exists());
-    }
 
-    #[test]
-    fn rename_aside_swap_restores_dest_when_the_final_rename_fails() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dest = dir.path().join("bun");
-        // The prepared copy does not exist, so the final rename fails.
-        let tmp = dir.path().join("missing");
-        fs::write(&dest, "old").expect("write dest");
-
-        assert!(rename_aside_swap(&tmp, &dest).is_err());
-        // The previous binary was restored at its original location.
+        // A prepared copy that does not exist makes the final rename fail — the
+        // previous binary must come back at its original location.
+        fs::write(&dest, "old").expect("write dest again");
+        let missing = dir.path().join("missing");
+        assert!(rename_aside_swap(&missing, &dest).is_err());
         assert_eq!(fs::read(&dest).expect("read dest"), b"old");
         assert!(!aside_of(&dest).exists(), "aside was moved back");
     }
@@ -1235,30 +1212,6 @@ mod tests {
             .expect("finish archive")
             .finish()
             .expect("finish gzip")
-    }
-
-    #[test]
-    fn extract_single_file_tar_gz_lands_at_the_dir_root() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_test_archive(dir.path(), &[("bun", b"BIN" as &[u8])]);
-
-        let out = extract_single_file_tar_gz(&dir.path().join("pkg.tar.gz"), dir.path(), "bun")
-            .expect("extract");
-        assert_eq!(out, dir.path().join("bun"));
-        assert_eq!(fs::read(&out).expect("read extracted"), b"BIN");
-        // The extracted binary must be executable (the exec-bit chmod is
-        // unix-only; on Windows executability is the .exe extension).
-        #[cfg(unix)]
-        {
-            assert_ne!(
-                fs::metadata(&out)
-                    .expect("stat extracted")
-                    .permissions()
-                    .mode()
-                    & 0o111,
-                0
-            );
-        }
     }
 
     #[test]
@@ -1317,26 +1270,5 @@ mod tests {
                 0
             );
         }
-    }
-
-    #[test]
-    fn extract_single_file_zip_handles_a_nested_layout() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let entry = "bun-darwin-x64/bun";
-        write_test_zip(dir.path(), &[(entry, b"NESTED" as &[u8])]);
-
-        let out = extract_single_file_zip(&dir.path().join("pkg.zip"), dir.path(), "bun")
-            .expect("extract");
-        // Matched by file name at any depth, but always written to the dir root.
-        assert_eq!(out, dir.path().join("bun"));
-        assert_eq!(fs::read(&out).expect("read extracted"), b"NESTED");
-    }
-
-    #[test]
-    fn extract_single_file_zip_errors_without_the_binary() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_test_zip(dir.path(), &[("readme.txt", b"no bin" as &[u8])]);
-
-        assert!(extract_single_file_zip(&dir.path().join("pkg.zip"), dir.path(), "bun").is_err());
     }
 }

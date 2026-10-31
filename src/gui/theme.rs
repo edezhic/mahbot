@@ -100,7 +100,7 @@ const fn badge_bg(fg: Color) -> Color {
 /// [`iced::Color`] — this avoids duplicating color data in an exhaustive match.
 /// Adding a new [`crate::Role`] variant requires updating the `role_info()`
 /// match (`badge_fg` field); the compiler will not catch a missing field here
-/// (it defaults from `BASE_ROLE_INFO`), but the `badge_colors_set` test in
+/// (it defaults from `BASE_ROLE_INFO`), but the `role_info_sentinels_are_all_set` test in
 /// `role.rs` guards against silent black fallthrough.
 ///
 /// The background member is always the foreground at 0.1 alpha ([`badge_bg`]);

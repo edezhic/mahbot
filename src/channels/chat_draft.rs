@@ -208,11 +208,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_draft_clears_the_stored_one() {
-        let (_dir, store) = temp_store();
+    fn an_empty_draft_clears_the_stored_one_and_removes_the_file() {
+        let (dir, store) = temp_store();
+        let path = dir.path().join(DRAFT_FILE_NAME);
         store.set("hello".to_string(), None);
+        store.persist();
+        assert!(path.exists());
+        // Blank text is no draft at all: setting it clears what was stored.
         store.set("   ".to_string(), None);
         assert!(store.get().is_empty());
+        store.remove();
+        store.persist();
+        assert!(!path.exists());
     }
 
     #[test]
@@ -236,16 +243,5 @@ mod tests {
         store.persist();
         assert!(path.exists());
         assert!(!path.with_extension("json.tmp").exists());
-    }
-
-    #[test]
-    fn an_empty_draft_removes_the_file() {
-        let (dir, store) = temp_store();
-        let path = dir.path().join(DRAFT_FILE_NAME);
-        store.set("hello".to_string(), None);
-        store.persist();
-        store.remove();
-        store.persist();
-        assert!(!path.exists());
     }
 }

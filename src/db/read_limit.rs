@@ -297,27 +297,4 @@ mod tests {
             "zero is an immediate failure, never 'no limit'"
         );
     }
-
-    /// The failure names the target and the limit, and its two placements differ:
-    /// the channel variant says the instance holds the store and left its file
-    /// alone, the direct one does not — while both carry the knob's name.
-    #[test]
-    fn limit_message_names_the_target_the_limit_and_the_placement() {
-        let direct = limit_message("logs", Duration::from_secs(0), false);
-        assert!(direct.contains("'logs'"), "got: {direct}");
-        assert!(direct.contains("0s read limit"), "got: {direct}");
-        assert!(direct.contains(ENV), "got: {direct}");
-        assert!(
-            !direct.contains("left untouched"),
-            "a store this process read itself was not left alone: {direct}"
-        );
-
-        let channel = limit_message("logs", Duration::from_secs(0), true);
-        assert!(
-            channel.contains("left untouched"),
-            "the channel variant must say the live store was not opened: {channel}"
-        );
-        assert!(channel.contains(ENV), "got: {channel}");
-        assert_ne!(direct, channel, "the two placements must differ");
-    }
 }

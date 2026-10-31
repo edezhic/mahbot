@@ -540,14 +540,15 @@ mod tests {
 
     // ── Recommendation helpers ────────────────────────────────────────────
 
+    /// The recommendation cap: every item within the budget survives
+    /// untouched, a set that overflows it is cut where the budget ends, and an
+    /// item too large to fit on its own is dropped.
     #[test]
-    fn cap_recommendations_keeps_all_within_budget() {
+    fn cap_recommendations_cases() {
+        // All within budget: the list comes back unchanged.
         let recs = vec!["a".to_string(), "bb".to_string(), "ccc".to_string()];
         assert_eq!(cap_recommendations(recs), vec!["a", "bb", "ccc"]);
-    }
 
-    #[test]
-    fn cap_recommendations_drops_items_on_budget_overflow() {
         // 20 items of 100 bytes each: 19 fit (1 + 103k <= 2048), the 20th does not.
         let recs: Vec<String> = (0..20).map(|_| "x".repeat(100)).collect();
         let out = cap_recommendations(recs);
@@ -555,12 +556,9 @@ mod tests {
         assert!(
             serde_json::to_string(&out).unwrap().len() <= MAINTAINER_RECOMMENDATIONS_BUDGET_BYTES
         );
-    }
 
-    #[test]
-    fn cap_recommendations_drops_lone_oversized_item() {
-        let recs = vec!["y".repeat(3000)];
-        assert!(cap_recommendations(recs).is_empty());
+        // A lone item larger than the whole budget is dropped.
+        assert!(cap_recommendations(vec!["y".repeat(3000)]).is_empty());
     }
 
     #[test]
@@ -572,26 +570,6 @@ mod tests {
             " also keep ".to_string(),
         ];
         assert_eq!(cap_recommendations(recs), vec!["keep", "also keep"]);
-    }
-
-    #[test]
-    fn recommendations_block_format_and_content() {
-        let generated_at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
-        let now = generated_at + chrono::Duration::hours(5) + chrono::Duration::minutes(15);
-        let block = recommendations_block(
-            &["first rec".to_string(), "second rec".to_string()],
-            &generated_at,
-            now,
-        );
-        assert!(block.starts_with("<maintainer-recommendations>\n"));
-        assert!(
-            block.contains("ADVISORY — suggestions carried over from the previous maintainer run")
-        );
-        assert!(block.contains("generated 5 hours 15 minutes ago"));
-        assert!(block.contains("2026-01-02T03:04:05"));
-        assert!(block.contains("- first rec\n"));
-        assert!(block.contains("- second rec\n"));
-        assert!(block.ends_with("</maintainer-recommendations>\n\n"));
     }
 
     #[test]

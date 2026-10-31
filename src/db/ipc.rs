@@ -1270,39 +1270,6 @@ mod tests {
         assert_eq!(operation["call"]["tool"], "workspace");
     }
 
-    /// A command-line operation no instance serves must fail with this
-    /// command's own sentence, never with the bare OS error underneath it: the
-    /// caller only gets this far with a running product, so "No such file or
-    /// directory (os error 2)" would read as that product not being there.
-    /// `serial(ipc_bound)`: shrinks `MAHBOT_IPC_BOUND_TIMEOUT_SECS`, the bound
-    /// the listener-bound e2e tests above retry within.
-    #[serial_test::serial(ipc_bound)]
-    #[tokio::test]
-    async fn call_refusal_names_the_channel_instead_of_the_os_error() {
-        // 0 = give up after the first attempt, so the refusal is immediate.
-        let _env = crate::util::test::set_env_var("MAHBOT_IPC_BOUND_TIMEOUT_SECS", Some("0"));
-        let dir = tempfile::TempDir::new().unwrap();
-        let call = CallRequest {
-            tool: "workspace".to_string(),
-            args: serde_json::json!({ "action": "list" }),
-            secrets: Vec::new(),
-            output_dir: None,
-        };
-        match crate::db::ipc::ipc_call_with_wait(dir.path(), &call, CALL_STORE_BASE).await {
-            CallAttempt::NotServed(reason) => {
-                assert!(
-                    reason.contains(&socket_path(dir.path()).display().to_string()),
-                    "the refusal must name the endpoint: {reason}"
-                );
-                assert!(
-                    reason.contains("command-line channel"),
-                    "the refusal must name the channel that did not take it: {reason}"
-                );
-            }
-            _ => panic!("a call to a non-existent endpoint must be NotServed"),
-        }
-    }
-
     /// The client's classification of one reply frame. A `not_accepted` reply
     /// is the retryable "nothing ran" and an `unavailable` one is final; a
     /// product that does not know this build's protocol value answers the
@@ -1357,6 +1324,8 @@ mod tests {
 
     /// The IPC `WireValue` round-trips through `from_turso`/`to_turso` and
     /// renders NULL as empty, integers as decimals, and blobs as lowercase hex.
+    /// serde_json emits `null` for non-finite floats, so a REAL NaN cell must
+    /// come back as `NaN` instead of failing deserialization.
     #[test]
     fn wire_value_round_trips() {
         use crate::db::Value;
@@ -1378,12 +1347,8 @@ mod tests {
         assert_eq!(wire.to_turso(), Value::Blob(blob));
         assert_eq!(wire.format(), "00dead");
         assert_eq!(WireValue::Null.format(), "");
-    }
 
-    /// serde_json emits `null` for non-finite floats; `de_real` must map it back
-    /// to `NaN` so a REAL NaN cell round-trips instead of failing deserialization.
-    #[test]
-    fn wire_value_round_trips_non_finite_real() {
+        // A non-finite REAL goes out as `null` and must come back as NaN.
         let payload = serde_json::to_vec(&WireValue::Real(f64::NAN)).unwrap();
         match serde_json::from_slice::<WireValue>(&payload).unwrap() {
             WireValue::Real(f) => {

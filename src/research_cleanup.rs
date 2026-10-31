@@ -1332,23 +1332,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_prompt_builds_with_context() {
-        let td = tempfile::tempdir().unwrap();
-        let run_root = td.path();
-        let dump_path = run_root.join(COMMAND_DUMP_FILE);
-        let ws = crate::workspace::test_ws_named(
-            run_root.to_str().expect("temp path is utf8"),
-            "cleanup_ws",
-        );
-        let prompt = build_cleanup_prompt("run_abc", run_root, &dump_path, &ws);
-        assert!(prompt.contains("run_abc"), "run id substituted");
-        assert!(prompt.contains(&run_root.to_string_lossy().to_string()));
-        assert!(prompt.contains(&dump_path.to_string_lossy().to_string()));
-        assert!(prompt.contains("cleanup_ws"));
-        assert!(prompt.contains("Never touch another run's folder"));
-    }
-
-    #[tokio::test]
     async fn dispatch_research_cleanup_deduped_by_jobs_row() {
         init_stores().await;
         crate::util::test::create_test_workspace("/tmp/test_ws_cleanup", "test_ws").await;

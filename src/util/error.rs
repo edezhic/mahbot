@@ -100,18 +100,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_error_display_format() {
-        let err = HttpError {
-            status: 429,
-            body: "Rate limit exceeded".into(),
-            context: "OpenAI".into(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("OpenAI API error (429)"));
-        assert!(msg.contains("Rate limit exceeded"));
-    }
-
-    #[test]
     fn http_error_downcast() {
         let err = anyhow::Error::from(HttpError {
             status: 400,

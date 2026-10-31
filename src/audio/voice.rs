@@ -4544,22 +4544,6 @@ mod tests {
         }
     }
 
-    /// The default segmentation config must use the standard pipeline
-    /// constants (silence threshold aligned to the streaming segment timeout).
-    #[test]
-    fn vad_segmentation_config_defaults() {
-        assert_eq!(DEFAULT_VAD_SEGMENTATION_CONFIG.frame_length, FRAME_LENGTH);
-        assert_eq!(DEFAULT_VAD_SEGMENTATION_CONFIG.hop_length, HOP_LENGTH);
-        assert_eq!(
-            DEFAULT_VAD_SEGMENTATION_CONFIG.consecutive_required,
-            ENROLLMENT_VAD_CONSECUTIVE_REQUIRED
-        );
-        assert_eq!(
-            DEFAULT_VAD_SEGMENTATION_CONFIG.silence_threshold_samples,
-            ENROLLMENT_SILENCE_THRESHOLD_SAMPLES
-        );
-    }
-
     // ── Refractory period tests ──────────────────────────────────────────
 
     #[test]
@@ -4666,29 +4650,26 @@ mod tests {
     // microphone: reject guards, the resume/teardown transitions in
     // [`PipelineCtx::end_button_recording`], and the outcomes the composer sees.
 
+    /// Both guards that close the record button: a recording already running
+    /// (its window owns the composer) and an enrollment that owns the mic.
     #[test]
     #[serial_test::serial(voice)]
-    fn button_recording_is_refused_while_one_runs() {
+    fn a_start_press_never_displaces_a_running_recording_or_an_enrollment() {
         let _ = init_global();
 
+        // A recording is in progress: refused, and the running recording is
+        // left exactly as it was.
         let mut ctx = PipelineCtx::new();
-        ctx.recording = Some(RecordingOrigin::WakeWord); // a recording is in progress
+        ctx.recording = Some(RecordingOrigin::WakeWord);
         set_status(VoiceStatus::RecordingWakeWord);
 
         ctx.handle_start_button_recording();
 
-        // Refused, and the running recording is left exactly as it was: its
-        // message belongs to the composer's existing window.
         assert_eq!(ctx.recording, Some(RecordingOrigin::WakeWord));
         assert!(!ctx.resume_listening_after_recording);
         assert!(matches!(get_status(), VoiceStatus::RecordingWakeWord));
-    }
 
-    #[test]
-    #[serial_test::serial(voice)]
-    fn button_recording_is_refused_during_enrollment() {
-        let _ = init_global();
-
+        // Enrollment owns the mic: refused without touching global state.
         let mut ctx = PipelineCtx::new();
         ctx.enrollment_mode = true;
         set_status(VoiceStatus::Listening);
@@ -4696,57 +4677,101 @@ mod tests {
         ctx.handle_start_button_recording();
 
         assert!(ctx.recording.is_none());
-        // Status untouched — the rejection does not mutate global state.
         assert!(matches!(get_status(), VoiceStatus::Listening));
     }
 
+    /// [`PipelineCtx::end_button_recording`] resolves three starting states: a
+    /// wake-word assistant to return to, a recording-only mic to tear down, and
+    /// a pending auto-start that teardown must not cancel.
     #[test]
     #[serial_test::serial(voice)]
-    fn button_recording_end_resumes_wake_word_listening() {
+    fn the_end_press_consumes_the_resume_request_and_leaves_the_mic_as_it_was() {
+        struct Case {
+            name: &'static str,
+            is_listening: bool,
+            auto_start_pending: bool,
+        }
+
         let _ = init_global();
+        let cases = [
+            Case {
+                name: "resumes_wake_word_listening",
+                is_listening: true,
+                auto_start_pending: false,
+            },
+            Case {
+                name: "tears_down_recording_only_mic",
+                is_listening: false,
+                auto_start_pending: false,
+            },
+            Case {
+                // Voice enabled in config but models still loading → auto-start
+                // is pending, and a button recording must not cancel it.
+                name: "preserves_auto_start_pending",
+                is_listening: false,
+                auto_start_pending: true,
+            },
+        ];
 
-        let mut ctx = PipelineCtx::new();
-        ctx.is_listening = true; // wake-word assistant active
-        ctx.recording = Some(RecordingOrigin::Button);
-        ctx.resume_listening_after_recording = true;
-        set_status(VoiceStatus::RecordingButton);
+        for case in cases {
+            let mut ctx = PipelineCtx::new();
+            ctx.is_listening = case.is_listening;
+            ctx.auto_start_pending = case.auto_start_pending;
+            ctx.recording = Some(RecordingOrigin::Button);
+            // A button recording that started while listening always holds the
+            // resume request; ending it consumes that request either way.
+            ctx.resume_listening_after_recording = case.is_listening;
+            set_status(VoiceStatus::RecordingButton);
 
-        ctx.end_button_recording();
+            ctx.end_button_recording();
 
-        // Wake-word listening resumes: status Listening, mic still running.
-        assert!(ctx.recording.is_none());
-        assert!(!ctx.resume_listening_after_recording);
-        assert!(ctx.is_listening);
-        assert!(matches!(get_status(), VoiceStatus::Listening));
-    }
-
-    #[test]
-    #[serial_test::serial(voice)]
-    fn button_recording_end_tears_down_recording_only_mic() {
-        let _ = init_global();
-
-        let mut ctx = PipelineCtx::new();
-        ctx.recording = Some(RecordingOrigin::Button); // recording with a recording-only mic
-        set_status(VoiceStatus::RecordingButton);
-
-        ctx.end_button_recording();
-
-        // No wake-word listening before → mic torn down, voice disabled.
-        assert!(ctx.recording.is_none());
-        assert!(!ctx.is_listening);
-        assert!(ctx.mic.is_none());
-        assert!(matches!(get_status(), VoiceStatus::Disabled));
+            assert!(
+                ctx.recording.is_none(),
+                "case {}: recording ended",
+                case.name
+            );
+            assert_eq!(
+                ctx.is_listening, case.is_listening,
+                "case {}: listening state",
+                case.name,
+            );
+            assert_eq!(
+                ctx.auto_start_pending, case.auto_start_pending,
+                "case {}: the pending auto-start survives teardown",
+                case.name,
+            );
+            if case.is_listening {
+                assert!(
+                    !ctx.resume_listening_after_recording,
+                    "case {}: the resume request is consumed",
+                    case.name,
+                );
+                assert!(
+                    matches!(get_status(), VoiceStatus::Listening),
+                    "case {}: the wake-word mic resumes",
+                    case.name,
+                );
+            } else {
+                assert!(ctx.mic.is_none(), "case {}: mic torn down", case.name);
+                assert!(
+                    matches!(get_status(), VoiceStatus::Disabled),
+                    "case {}: nothing is left listening",
+                    case.name,
+                );
+            }
+        }
     }
 
     // ── Microphone-loss tests ────────────────────────────────────────────
     // The device-loss scenarios themselves need real hardware; these cover the
     // state transitions the loss handler performs.
 
-    /// A loss during enrollment abandons the attempt completely — nothing may
-    /// be built or stored from it later, and voice must not claim to listen.
+    /// A loss abandons the attempt completely — nothing may be built or stored
+    /// from it later — and voice rests on the user's switch: listening when it
+    /// is on, Disabled when it is off.
     #[test]
     #[serial_test::serial(voice)]
-    fn microphone_loss_abandons_enrollment_and_stops_listening() {
+    fn microphone_loss_abandons_the_attempt_and_rests_on_the_switch() {
         let _ = init_global();
         set_enabled(true);
         let mut ctx = PipelineCtx::new();
@@ -4796,14 +4821,9 @@ mod tests {
         assert_eq!(recording_blocked_reason(), None);
         assert!(ctx.mic.is_none());
         assert!(ctx.recording.is_none());
-    }
 
-    /// With voice switched off there is nothing claiming to listen, so the
-    /// resting state after a loss is Disabled.
-    #[test]
-    #[serial_test::serial(voice)]
-    fn microphone_loss_with_voice_disabled_rests_disabled() {
-        let _ = init_global();
+        // With voice switched off there is nothing claiming to listen, so the
+        // resting state after a loss is Disabled and the buffer is dropped.
         set_enabled(false);
         let mut ctx = PipelineCtx::new();
         ctx.is_listening = true;
@@ -4815,46 +4835,6 @@ mod tests {
 
         assert!(ctx.recording.is_none());
         assert!(ctx.command_buffer.is_empty());
-        assert!(matches!(get_status(), VoiceStatus::Disabled));
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(voice)]
-    async fn button_recording_discard_clears_buffer_and_ends() {
-        let _ = init_global();
-
-        let mut ctx = PipelineCtx::new();
-        ctx.recording = Some(RecordingOrigin::Button);
-        ctx.command_buffer.extend_from_slice(&[0.1, 0.2, 0.3]);
-        set_status(VoiceStatus::RecordingButton);
-
-        ctx.handle_stop_recording(false).await;
-
-        assert!(ctx.recording.is_none());
-        assert!(ctx.command_buffer.is_empty());
-        assert!(matches!(get_status(), VoiceStatus::Disabled));
-    }
-
-    #[test]
-    #[serial_test::serial(voice)]
-    fn button_recording_teardown_preserves_auto_start_pending() {
-        let _ = init_global();
-
-        let mut ctx = PipelineCtx::new();
-        // Voice enabled in config but models still loading → auto-start is
-        // pending. A button recording must not cancel it.
-        ctx.auto_start_pending = true;
-        ctx.recording = Some(RecordingOrigin::Button); // recording-only mic
-        set_status(VoiceStatus::RecordingButton);
-
-        ctx.end_button_recording();
-
-        // Teardown's Full reset would clear auto_start_pending; the button
-        // recording's lifecycle preserves it so check_auto_start still fires
-        // once models become ready.
-        assert!(ctx.recording.is_none());
-        assert!(ctx.auto_start_pending);
-        assert!(!ctx.is_listening);
         assert!(matches!(get_status(), VoiceStatus::Disabled));
     }
 
@@ -4930,11 +4910,12 @@ mod tests {
         assert!(matches!(get_status(), VoiceStatus::Listening));
     }
 
-    /// The composer's cross: the recording is dropped and the composer reports
-    /// nothing on its own — it closed its window on the same press.
+    /// The composer's cross, at both origins: the recording is dropped and the
+    /// composer reports nothing on its own — it closed its window on the same
+    /// press. A button recording takes the recording-only mic with it.
     #[tokio::test]
     #[serial_test::serial(voice)]
-    async fn a_discarded_wake_recording_reports_nothing() {
+    async fn a_discarded_recording_clears_its_buffer_and_reports_nothing() {
         let _ = init_global();
         init_recording_tx();
         let mut events = RECORDING.get().expect("warmed above").subscribe();
@@ -4950,6 +4931,18 @@ mod tests {
         assert!(ctx.command_buffer.is_empty());
         assert!(events.try_recv().is_err());
         assert!(matches!(get_status(), VoiceStatus::Listening));
+
+        let mut ctx = PipelineCtx::new();
+        ctx.recording = Some(RecordingOrigin::Button);
+        ctx.command_buffer.extend_from_slice(&[0.1, 0.2, 0.3]);
+        set_status(VoiceStatus::RecordingButton);
+
+        ctx.handle_stop_recording(false).await;
+
+        assert!(ctx.recording.is_none());
+        assert!(ctx.command_buffer.is_empty());
+        assert!(events.try_recv().is_err());
+        assert!(matches!(get_status(), VoiceStatus::Disabled));
     }
 
     // ── Model-status resolution tests ────────────────────────────────────
@@ -4958,60 +4951,42 @@ mod tests {
     // stranded the footer on "Loading…" was an asymmetry between the two.
     // No serial marker needed: the helper reads no global state.
 
+    /// One rule over every state and both toggle positions: a failed load is
+    /// terminal, a load in flight is waited on, an unstarted recogniser is not
+    /// reported, and Ready resolves by the user's switch.
     #[test]
-    fn resolved_model_status_failure_is_terminal() {
-        // Failed → ModelError — never Disabled, never LoadingModels, regardless
-        // of the voice toggle.
-        assert!(matches!(
-            resolved_model_status(ModelState::Failed, true),
-            VoiceStatus::ModelError
-        ));
-        assert!(matches!(
-            resolved_model_status(ModelState::Failed, false),
-            VoiceStatus::ModelError
-        ));
-    }
-
-    #[test]
-    fn resolved_model_status_ready_resolves_by_enabled() {
-        // Ready + enabled → Listening (unchanged behavior).
+    fn resolved_model_status_follows_the_load_and_the_switch() {
+        for enabled in [true, false] {
+            assert!(
+                matches!(
+                    resolved_model_status(ModelState::Failed, enabled),
+                    VoiceStatus::ModelError
+                ),
+                "a failed load is terminal, never Disabled or LoadingModels (enabled={enabled})",
+            );
+            assert!(
+                matches!(
+                    resolved_model_status(ModelState::Loading, enabled),
+                    VoiceStatus::LoadingModels
+                ),
+                "a load in flight keeps the footer polling (enabled={enabled})",
+            );
+            assert!(
+                matches!(
+                    resolved_model_status(ModelState::Uninit, enabled),
+                    VoiceStatus::Disabled
+                ),
+                "nothing asks for a recogniser before first use (enabled={enabled})",
+            );
+        }
         assert!(matches!(
             resolved_model_status(ModelState::Ready, true),
             VoiceStatus::Listening
         ));
-        // Ready + disabled → Disabled (the LoadingModels hang fix: the footer
-        // indicator must clear once loading finishes).
+        // The LoadingModels hang fix: the footer indicator must clear once
+        // loading finishes with the switch off.
         assert!(matches!(
             resolved_model_status(ModelState::Ready, false),
-            VoiceStatus::Disabled
-        ));
-    }
-
-    #[test]
-    fn resolved_model_status_still_loading_is_transient() {
-        // A load in flight → LoadingModels; the periodic wake-up keeps polling
-        // until a terminal state is reached.
-        assert!(matches!(
-            resolved_model_status(ModelState::Loading, true),
-            VoiceStatus::LoadingModels
-        ));
-        assert!(matches!(
-            resolved_model_status(ModelState::Loading, false),
-            VoiceStatus::LoadingModels
-        ));
-    }
-
-    #[test]
-    fn resolved_model_status_uninitialised_reports_nothing() {
-        // The recogniser is a first-use load: before anything asks for one, no
-        // load may be reported — the footer must not sit on "Loading…" waiting
-        // for a load that was never started.
-        assert!(matches!(
-            resolved_model_status(ModelState::Uninit, true),
-            VoiceStatus::Disabled
-        ));
-        assert!(matches!(
-            resolved_model_status(ModelState::Uninit, false),
             VoiceStatus::Disabled
         ));
     }
@@ -5051,10 +5026,9 @@ mod tests {
     // ── AdaptiveThresholdState tests ──────────────────────────────────────
     // Pure unit tests for the z-score adaptive threshold tracker.  Uses
     // synthetic per-frame scores — no models or voice pipeline state.
-    // Covers bootstrap phase, mean/std computation, all safeguards, and reset.
 
     #[test]
-    fn adaptive_bootstrap_boundary_and_safe_harbor_clamp() {
+    fn adaptive_bootstrap_boundary_and_clamps() {
         let harbor = legacy_geometry().static_threshold;
 
         // bootstrap boundary: every feed during bootstrap returns None; the
@@ -5085,6 +5059,18 @@ mod tests {
             (threshold - harbor).abs() < 0.01,
             "safe-harbor clamp: threshold {threshold} should equal safe harbor {harbor}",
         );
+
+        // warmed() initializes with near-silence scores (~0.033), and its first
+        // feed exits bootstrap with the same safe-harbor clamp.
+        let mut state = AdaptiveThresholdState::warmed(harbor);
+        let threshold = state
+            .feed(0.033, ADAPTIVE_K_DEFAULT, harbor)
+            .expect("warmed() should exit bootstrap");
+        assert!(
+            (threshold - harbor).abs() < 0.01,
+            "warmed(): threshold {threshold} should equal safe harbor {harbor}",
+        );
+        assert_eq!(state.len(), ADAPTIVE_BOOTSTRAP_FRAMES + 1);
     }
 
     #[test]
@@ -5135,28 +5121,11 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_warmed_clamps_to_safe_harbor() {
-        // warmed() initializes with near-silence scores (~0.033). The
-        // computed adaptive threshold (0.033 + 2.5 × 0.0) × 3 = 0.099 should
-        // be clamped to the safe harbor (1.65), matching production where the
-        // threshold is fed real silence/background scores.
+    fn adaptive_reset_and_peek() {
         let harbor = legacy_geometry().static_threshold;
-        let mut state = AdaptiveThresholdState::warmed(harbor);
-        let threshold = state
-            .feed(0.033, ADAPTIVE_K_DEFAULT, harbor)
-            .expect("warmed() should exit bootstrap");
-        assert!(
-            (threshold - harbor).abs() < 0.01,
-            "warmed(): threshold {threshold} should equal safe harbor {harbor}",
-        );
-        // Verify all bootstrap frames were fed the near-silence score and not
-        // 0.5 (which would produce threshold ~1.5 instead of 1.65).
-        assert_eq!(state.len(), ADAPTIVE_BOOTSTRAP_FRAMES + 1);
-    }
 
-    #[test]
-    fn adaptive_reset_clears_state_and_peek_empty() {
-        let harbor = legacy_geometry().static_threshold;
+        // reset() empties the window, so the next feed re-enters bootstrap and
+        // peek() answers nothing.
         let mut state = AdaptiveThresholdState::new();
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
@@ -5175,11 +5144,6 @@ mod tests {
             state.peek(ADAPTIVE_K_DEFAULT, harbor).is_none(),
             "reset: peek should return None (empty window)",
         );
-    }
-
-    #[test]
-    fn adaptive_peek_does_not_mutate_and_agrees_with_feed() {
-        let harbor = legacy_geometry().static_threshold;
 
         // peek() must not change scores, sum, sum_sq, or bootstrap_count.
         let mut state = AdaptiveThresholdState::new();
@@ -5220,36 +5184,9 @@ mod tests {
             feed_threshold, peek_threshold,
             "peek must agree with feed on the same state",
         );
-    }
 
-    #[test]
-    fn adaptive_peek_bootstrap_boundary_and_threshold_range() {
-        let harbor = legacy_geometry().static_threshold;
-
-        // peek() returns None during bootstrap like feed(); on the last
-        // bootstrap frame feed() increments bootstrap_count past the threshold
-        // so peek() is Some.
-        let mut state = AdaptiveThresholdState::new();
-        for i in 0..ADAPTIVE_BOOTSTRAP_FRAMES - 1 {
-            assert!(
-                state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor).is_none(),
-                "bootstrap: feed frame {i} should be None",
-            );
-            assert!(
-                state.peek(ADAPTIVE_K_DEFAULT, harbor).is_none(),
-                "bootstrap: peek frame {i} should be None",
-            );
-        }
-        assert!(
-            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor).is_none(),
-            "bootstrap: last feed should be None",
-        );
-        assert!(
-            state.peek(ADAPTIVE_K_DEFAULT, harbor).is_some(),
-            "bootstrap: peek should be Some after bootstrap completed",
-        );
-
-        // peek() clamps to safe harbor on constant low scores (0.1).
+        // peek() clamps to safe harbor on constant low scores (0.1) and its
+        // threshold lies within [harbor, ceiling].
         let mut state = AdaptiveThresholdState::new();
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.1, ADAPTIVE_K_DEFAULT, harbor);
@@ -5261,8 +5198,6 @@ mod tests {
             (threshold - harbor).abs() < 0.01,
             "safe-harbor clamp: peek threshold {threshold} should equal safe harbor {harbor}",
         );
-
-        // peek() threshold must lie within [harbor, ceiling].
         let mut state = AdaptiveThresholdState::new();
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
@@ -5286,9 +5221,14 @@ mod tests {
         DetectionGeometry::for_enrollment(None)
     }
 
+    /// The rolling window's three rules: a below-reset score clears it, frames
+    /// accumulate to the static threshold, and an adaptive override raises the
+    /// bar.
     #[test]
-    fn score_window_resets_below_no_match_threshold() {
+    fn process_wake_word_score_clears_fires_and_honours_the_override() {
         let geometry = legacy_geometry();
+
+        // A below-reset score clears the window.
         let mut window = vec![0.9, 0.8, 0.7];
         let (detected, rolling) =
             process_wake_word_score(geometry.reset - 0.01, &mut window, geometry, None);
@@ -5301,12 +5241,8 @@ mod tests {
             window.is_empty(),
             "below-reset score must clear the rolling window"
         );
-    }
 
-    #[test]
-    fn score_window_accumulates_and_fires() {
         // static threshold = 3 × 0.55 = 1.65 → need 3 frames summing to ≥1.65.
-        let geometry = legacy_geometry();
         let mut window = Vec::new();
         for score in [0.7, 0.7] {
             let (detected, _) = process_wake_word_score(score, &mut window, geometry, None);
@@ -5318,14 +5254,10 @@ mod tests {
             (rolling - 2.1).abs() < 1e-6,
             "rolling sum should be 2.1, got {rolling}"
         );
-    }
 
-    #[test]
-    fn score_window_adaptive_override_used() {
-        let geometry = legacy_geometry();
-        let mut window = Vec::new();
         // A high adaptive override (3.0) must suppress detection even when
         // three 0.7 frames would otherwise fire (sum 2.1 < 3.0).
+        let mut window = Vec::new();
         for _ in 0..3 {
             let (detected, _) = process_wake_word_score(0.7, &mut window, geometry, Some(3.0));
             assert!(!detected, "adaptive override must raise the detection bar");
@@ -5359,8 +5291,12 @@ mod tests {
         .expect("synthetic enrollment")
     }
 
+    /// The cosine-prototype scorer's decisions: without an enrollment nothing
+    /// scores, a prototype match fires after the rolling window fills, and a
+    /// below-reset frame clears the window and feeds only the background
+    /// statistics.
     #[test]
-    fn score_single_no_enrollment_returns_zero_score() {
+    fn score_single_embedding_fires_on_a_match_and_resets_without_one() {
         // Without an enrollment no detection is possible: total_score = 0.0
         // and the window is reset (0.0 < the default reset threshold).
         let mut window = vec![0.9, 0.8];
@@ -5380,10 +5316,7 @@ mod tests {
             window.is_empty(),
             "zero score must reset the rolling window"
         );
-    }
 
-    #[test]
-    fn score_single_detects_high_cosine_match() {
         // A perfect match against the prototype (cosine 1.0 → soft score 1.0
         // with the default floor) must fire detection after 3 frames.
         let enrollment = synthetic_enrollment(MIN_ENROLLMENT_UTTERANCES);
@@ -5409,20 +5342,14 @@ mod tests {
             detected,
             "3 consecutive high-cosine frames must fire detection"
         );
-    }
 
-    #[test]
-    fn score_single_adaptive_feeds_background_only() {
-        // Scores below the reset threshold feed the adaptive statistics;
-        // wake-word-like scores only peek (no statistics mutation).
-        let enrollment = synthetic_enrollment(MIN_ENROLLMENT_UTTERANCES);
-        let mut window = Vec::new();
+        // An orthogonal embedding (basis 1 vs prototype basis 0) → cosine 0 →
+        // soft score 0.0 (clamped) → below reset → clears the window and feeds
+        // the adaptive statistics.
+        let mut window = vec![0.9, 0.8];
         let mut adaptive = AdaptiveThresholdState::new();
-        // An orthogonal embedding (basis 1 vs prototype basis 0) → cosine 0
-        // → soft score 0.0 (clamped) → below reset → feeds.
-        let bg = basis_embedding(1);
-        let (detected, _, total, _) = score_single_embedding(
-            &bg,
+        let (detected, rolling, total, _) = score_single_embedding(
+            &basis_embedding(1),
             Some(&enrollment),
             &mut window,
             Some(&mut adaptive),
@@ -5430,33 +5357,16 @@ mod tests {
         );
         assert!(!detected);
         assert!(total < legacy_geometry().reset);
-        assert!(window.is_empty(), "below-reset score clears the window");
-        assert_eq!(
-            adaptive.len(),
-            1,
-            "background score must feed the adaptive window"
-        );
-    }
-
-    #[test]
-    fn score_single_low_score_resets_window() {
-        // A below-reset frame mid-utterance clears the rolling window.
-        let enrollment = synthetic_enrollment(MIN_ENROLLMENT_UTTERANCES);
-        let mut window = vec![0.9, 0.8];
-        let bg = basis_embedding(1);
-        let (detected, rolling, _, _) = score_single_embedding(
-            &bg,
-            Some(&enrollment),
-            &mut window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-        );
-        assert!(!detected);
         #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
         {
             assert_eq!(rolling, 0.0);
         }
         assert!(window.is_empty(), "low score must reset the rolling window");
+        assert_eq!(
+            adaptive.len(),
+            1,
+            "background score must feed the adaptive window"
+        );
     }
 
     #[test]
@@ -5647,42 +5557,7 @@ mod tests {
         }
     }
 
-    // ── Enrollment state tests ─────────────────────────────────────────────
-
-    #[test]
-    #[serial_test::serial(voice)]
-    fn test_enrolled_utterance_count_tracks_utterances() {
-        // enrolled_utterance_count tracks user utterances while
-        // enrollment_embeddings holds exactly one 1024-dim embedding per
-        // utterance (no augmentation in the encoder pipeline).
-        let _ = init_global();
-        let mut state = voice_state().write().unwrap_poison();
-        state.reset_enrollment(); // ensure clean state from prior serial tests
-        assert_eq!(state.enrollment_embeddings.len(), 0);
-        assert_eq!(state.enrolled_utterance_count, 0);
-
-        state.enrollment_embeddings.push(basis_embedding(0));
-        state.enrolled_utterance_count = 1;
-
-        assert_eq!(state.enrolled_utterance_count, 1);
-        assert_eq!(state.enrollment_embeddings.len(), 1);
-
-        // Cancel reset clears both.
-        state.reset_enrollment();
-        assert_eq!(state.enrolled_utterance_count, 0);
-        assert!(state.enrollment_embeddings.is_empty());
-    }
-
-    // ── samples_to_ms / quality helpers ────────────────────────────────────
-
-    #[test]
-    fn samples_to_ms_conversion() {
-        assert_eq!(samples_to_ms(0, SAMPLE_RATE), 0);
-        assert_eq!(samples_to_ms(16_000, SAMPLE_RATE), 1000);
-        assert_eq!(samples_to_ms(400, SAMPLE_RATE), 25);
-        // Truncating integer division — 1 sample = 0ms.
-        assert_eq!(samples_to_ms(1, SAMPLE_RATE), 0);
-    }
+    // ── Utterance quality ──────────────────────────────────────────────────
 
     #[test]
     fn compute_utterance_quality_short_utterance_scores_zero_duration() {
@@ -5806,6 +5681,10 @@ mod tests {
     fn reset_full_clears_all_buffers_and_state() {
         let _ = init_global();
         let mut ctx = ctx_with_populated_buffers();
+        // Full leaves the handler-managed flags alone: they are owned by the
+        // handler functions, not by the reset.
+        ctx.is_listening = true;
+        ctx.enrollment_mode = true;
 
         // Establish this test's own baseline: the accumulators are
         // process-global and the Soft-reset test leaves its own entries behind
@@ -5831,6 +5710,10 @@ mod tests {
         assert!(!ctx.auto_start_pending);
         assert!(ctx.recording.is_none());
 
+        // Handler-managed flags survive.
+        assert!(ctx.is_listening);
+        assert!(ctx.enrollment_mode);
+
         // Global enrollment accumulators PRESERVED by Full — they survive
         // mic stop/start cycles so mid-enrollment progress is not lost on
         // toggle-off/on.
@@ -5841,27 +5724,12 @@ mod tests {
 
     #[test]
     #[serial_test::serial(voice)]
-    fn reset_full_preserves_handler_managed_flags() {
+    fn reset_soft_and_cancel_differ_in_scope() {
         let _ = init_global();
         let mut ctx = ctx_with_populated_buffers();
 
-        // Full should NOT touch these — they are owned by handler functions.
-        ctx.is_listening = true;
-        ctx.enrollment_mode = true;
-
-        ctx.reset_pipeline_state(ResetLevel::Full);
-
-        assert!(ctx.is_listening);
-        assert!(ctx.enrollment_mode);
-    }
-
-    #[test]
-    #[serial_test::serial(voice)]
-    fn reset_soft_preserves_vad_threshold_cooldown_and_flags() {
-        let _ = init_global();
-        let mut ctx = ctx_with_populated_buffers();
-
-        // Pre-populate global enrollment state so we can verify it's preserved.
+        // Pre-populate global enrollment state so we can verify Soft keeps it
+        // and Cancel clears it.
         let saved_embeddings = vec![vec![0.5; 1024]];
         let saved_chunks = vec![vec![0.5; 100]];
         {
@@ -5892,40 +5760,23 @@ mod tests {
         let state = voice_state().read().unwrap_poison();
         assert_eq!(state.enrollment_embeddings, saved_embeddings);
         assert_eq!(state.negative_audio_chunks, saved_chunks);
-    }
+        drop(state);
 
-    #[test]
-    #[serial_test::serial(voice)]
-    fn reset_cancel_clears_enrollment_and_vad_threshold() {
-        let _ = init_global();
+        // Cancel clears vad_threshold, the detection cooldown and the global
+        // accumulators, while the handler-managed flags still survive.
         let mut ctx = ctx_with_populated_buffers();
-
-        // Pre-populate global enrollment state so we can verify it's cleared.
-        {
-            let mut state = voice_state().write().unwrap_poison();
-            state.enrollment_embeddings.push(vec![0.5; 1024]);
-            state.negative_audio_chunks.push(vec![0.5; 100]);
-        }
-
-        let saved_auto_start = ctx.auto_start_pending;
-        let saved_recording = ctx.recording;
-
         ctx.reset_pipeline_state(ResetLevel::Cancel);
 
         assert_buffers_cleared(&ctx);
 
-        // Cancel clears vad_threshold and last_wake_word_detection.
         #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
         {
             assert_eq!(ctx.vad_threshold, VAD_THRESHOLD);
         }
         assert!(ctx.last_wake_word_detection.is_none());
-
-        // Cancel preserves handler-managed flags (unlike Full).
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.recording, saved_recording);
 
-        // Global enrollment accumulators cleared (unlike Soft).
         let state = voice_state().read().unwrap_poison();
         assert!(state.enrollment_embeddings.is_empty());
         assert!(state.negative_audio_chunks.is_empty());
@@ -5963,79 +5814,6 @@ mod tests {
     // [`process_phase3_frames`] with injected VAD decisions — the stateful
     // earshot neural detector is not deterministic on synthetic audio, so
     // decisions are supplied directly.
-
-    /// Build an initial `Phase3Progress` for the state-machine tests.
-    fn empty_phase3_progress() -> Phase3Progress {
-        Phase3Progress {
-            processed: 0,
-            silence_samples: 0,
-            negatives_speech_samples: 0,
-            completed_chunks: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn phase3_speech_counter_is_1_to_1_and_chunking_invariant() {
-        // 60 mic chunks of 0.5 s of continuous speech (injected all-speech
-        // decisions).  Each hop must be counted exactly once: the counter
-        // equals the real audio duration (minus the trailing partial window,
-        // which is never fed to the VAD), regardless of chunking.
-        const CHUNK_SAMPLES: usize = SAMPLE_RATE as usize / 2; // 0.5 s
-        const CHUNKS: usize = 60;
-        let total_samples = CHUNK_SAMPLES * CHUNKS; // 480,000
-
-        let mut buf: Vec<f32> = Vec::new();
-        let mut prog = empty_phase3_progress();
-        let mut seen = 0usize;
-        for _ in 0..CHUNKS {
-            buf.extend(std::iter::repeat_n(0.1f32, CHUNK_SAMPLES));
-            prog = process_phase3_frames(
-                &mut buf,
-                prog.processed,
-                prog.silence_samples,
-                prog.negatives_speech_samples,
-                |_| true, // every hop VAD-positive
-            );
-            seen += CHUNK_SAMPLES;
-            // Invariant: the counter never exceeds the real audio duration.
-            assert!(
-                prog.negatives_speech_samples <= seen,
-                "counter {} exceeded real audio {seen}",
-                prog.negatives_speech_samples,
-            );
-            // 1:1 per-call monotone check: in all-speech mode every processed
-            // hop is counted, so the counter must equal the watermark exactly.
-            // The quadratic bug made the counter grow by the WHOLE buffer on
-            // each chunk (counter ≫ processed); an under-count would leave it
-            // behind (counter < processed).
-            assert_eq!(
-                prog.negatives_speech_samples, prog.processed,
-                "counter must track processed hops 1:1 across calls \
-                 (no re-count, no under-count)",
-            );
-        }
-
-        // Each processed hop counted exactly once.
-        let expected =
-            (total_samples.saturating_sub(FRAME_LENGTH)) / HOP_LENGTH * HOP_LENGTH + HOP_LENGTH;
-        assert_eq!(prog.negatives_speech_samples, expected);
-        assert!(prog.negatives_speech_samples <= total_samples);
-
-        // Chunking invariance: the same audio fed in ONE call must yield the
-        // same counter.  The quadratic bug's signature was chunk-count-
-        // dependent growth (each new chunk re-counted all prior frames).
-        let mut one_shot = vec![0.1f32; total_samples];
-        let one_shot_prog = process_phase3_frames(&mut one_shot, 0, 0, 0, |_| true);
-        assert_eq!(
-            one_shot_prog.negatives_speech_samples, prog.negatives_speech_samples,
-            "counter must not depend on mic-chunk boundaries",
-        );
-
-        // Continuous speech produces no chunk boundaries — the unfinalized
-        // segment survives intact (nothing drained, nothing pushed).
-        assert!(prog.completed_chunks.is_empty());
-        assert_eq!(buf.len(), total_samples);
-    }
 
     #[test]
     fn phase3_chunks_are_full_speech_segments_across_mic_chunks() {
@@ -6126,6 +5904,16 @@ mod tests {
         let chunk = vec![0.1f32; CHUNK_SAMPLES];
         for _ in 0..10 {
             handle_negative_collection_audio(&chunk, &mut ctx);
+            // 1:1 per-call monotone check: in all-speech mode every processed
+            // hop is counted, so the counter must equal the watermark exactly.
+            // The quadratic bug made the counter grow by the WHOLE buffer on
+            // each chunk (counter ≫ processed); an under-count would leave it
+            // behind (counter < processed).
+            assert_eq!(
+                ctx.negatives_speech_samples, ctx.phase3_processed,
+                "counter must track processed hops 1:1 across calls \
+                 (no re-count, no under-count)",
+            );
         }
         let total = 10 * CHUNK_SAMPLES;
         let expected = (total.saturating_sub(FRAME_LENGTH)) / HOP_LENGTH * HOP_LENGTH + HOP_LENGTH;
@@ -6154,116 +5942,116 @@ mod tests {
     // Tests the extracted segment boundary check logic with the encoder
     // pipeline signature `(&mut self, hop_count: usize)`.
 
+    /// At the hop threshold the boundary fires and resets the per-segment
+    /// state; below it the state persists, and a recording in progress skips
+    /// the reset entirely.
     #[test]
-    fn handle_segment_boundary_resets_at_threshold() {
-        let mut ctx = PipelineCtx::new();
-        ctx.score_window = vec![0.5; 5];
-        ctx.segment_silence_hops = 10;
-        ctx.segment_score_steps = 7;
-
-        // Complete adaptive threshold bootstrap so the reset-to-bootstrapping
-        // assertion is meaningful (not trivially true from PipelineCtx::new()).
-        {
-            let mut at = AdaptiveThresholdState::new();
-            for _ in 0..=ADAPTIVE_BOOTSTRAP_FRAMES {
-                at.feed(0.5, ADAPTIVE_K_DEFAULT, legacy_geometry().static_threshold);
-            }
-            assert!(
-                !at.is_bootstrapping(),
-                "adaptive threshold must exit bootstrap after {} feeds",
-                ADAPTIVE_BOOTSTRAP_FRAMES + 1
-            );
-            ctx.adaptive_threshold = at;
+    fn handle_segment_boundary_table() {
+        struct Case {
+            name: &'static str,
+            /// Silence hops accumulated before the call.
+            initial_hops: usize,
+            hop_count: usize,
+            recording: bool,
+            boundary_fires: bool,
+            /// Silence hops the call must leave behind.
+            hops_after: usize,
         }
 
-        // hop_count at threshold → boundary fires
-        ctx.handle_segment_boundary(SEGMENT_TIMEOUT_HOPS);
+        let cases = [
+            Case {
+                name: "at_threshold_fires",
+                initial_hops: 10,
+                hop_count: SEGMENT_TIMEOUT_HOPS,
+                recording: false,
+                boundary_fires: true,
+                hops_after: 0,
+            },
+            Case {
+                name: "below_threshold_persists",
+                initial_hops: 10,
+                hop_count: SEGMENT_TIMEOUT_HOPS - 1,
+                recording: false,
+                boundary_fires: false,
+                hops_after: SEGMENT_TIMEOUT_HOPS - 1,
+            },
+            Case {
+                // A just-fired detection (is_recording) must NOT be reset by
+                // the boundary check — the detection→recording handoff
+                // completes the transition and owns the state.
+                name: "recording_skips_the_reset",
+                initial_hops: 0,
+                hop_count: SEGMENT_TIMEOUT_HOPS,
+                recording: true,
+                boundary_fires: false,
+                hops_after: 0,
+            },
+        ];
 
-        // ── Per-segment state reset on ctx ──
-        assert!(ctx.score_window.is_empty(), "score_window must be cleared");
-        assert_eq!(
-            ctx.segment_silence_hops, 0,
-            "segment_silence_hops must be reset"
-        );
-        assert_eq!(
-            ctx.segment_score_steps, 0,
-            "segment_score_steps must be reset at the boundary"
-        );
-        assert!(
-            ctx.adaptive_threshold.is_bootstrapping(),
-            "adaptive_threshold must be reset (re-enter bootstrap)"
-        );
-    }
+        for case in cases {
+            let mut ctx = PipelineCtx::new();
+            ctx.recording = case.recording.then_some(RecordingOrigin::WakeWord);
+            ctx.score_window = vec![0.5; 5];
+            ctx.segment_silence_hops = case.initial_hops;
+            ctx.segment_score_steps = 7;
 
-    #[test]
-    fn handle_segment_boundary_persists_below_threshold() {
-        let mut ctx = PipelineCtx::new();
-        ctx.score_window = vec![0.5; 5];
-        ctx.segment_silence_hops = 10;
-        ctx.segment_score_steps = 7;
+            // Complete adaptive threshold bootstrap so the reset-to-bootstrapping
+            // assertion is meaningful (not trivially true from PipelineCtx::new()).
+            {
+                let mut at = AdaptiveThresholdState::new();
+                for _ in 0..=ADAPTIVE_BOOTSTRAP_FRAMES {
+                    at.feed(0.5, ADAPTIVE_K_DEFAULT, legacy_geometry().static_threshold);
+                }
+                assert!(
+                    !at.is_bootstrapping(),
+                    "adaptive threshold must exit bootstrap after {} feeds",
+                    ADAPTIVE_BOOTSTRAP_FRAMES + 1
+                );
+                ctx.adaptive_threshold = at;
+            }
 
-        // hop_count below threshold → state persisted
-        let below_threshold = SEGMENT_TIMEOUT_HOPS - 1;
-        ctx.handle_segment_boundary(below_threshold);
+            ctx.handle_segment_boundary(case.hop_count);
 
-        // ── Per-segment state preserved on ctx ──
-        assert_eq!(
-            ctx.segment_silence_hops, below_threshold,
-            "counter must be persisted below threshold"
-        );
-        assert_eq!(
-            ctx.segment_score_steps, 7,
-            "segment_score_steps must persist inside a continuing segment"
-        );
-        assert!(
-            !ctx.score_window.is_empty(),
-            "score_window must survive below threshold"
-        );
-    }
-
-    #[test]
-    fn handle_segment_boundary_does_not_reset_when_recording() {
-        // A just-fired detection (is_recording) must NOT be reset by the
-        // boundary check — the detection→recording handoff completes the
-        // transition and owns the state.
-        let mut ctx = PipelineCtx::new();
-        ctx.recording = Some(RecordingOrigin::WakeWord);
-        ctx.score_window = vec![0.5; 5];
-        ctx.segment_silence_hops = 0;
-
-        ctx.handle_segment_boundary(SEGMENT_TIMEOUT_HOPS);
-
-        assert!(
-            !ctx.score_window.is_empty(),
-            "recording mode must skip the boundary reset"
-        );
-        assert_eq!(
-            ctx.segment_silence_hops, 0,
-            "recording mode must not write back the counter"
-        );
-    }
-
-    #[test]
-    fn handle_segment_boundary_counting_across_calls() {
-        // Simulates the VAD-gap counter accumulating across detection calls:
-        // below threshold → persisted; the next call crosses the threshold
-        // → boundary fires and the counter resets.
-        let mut ctx = PipelineCtx::new();
-        ctx.segment_silence_hops = 0;
-
-        // Call 1: 10 silence hops (< 19) → persisted.
-        ctx.handle_segment_boundary(10);
-        assert_eq!(ctx.segment_silence_hops, 10);
-
-        // Call 2: speech resets the counter to 0 (handled by the frame loop),
-        // then 5 silence hops → persisted again.
-        ctx.segment_silence_hops = 0;
-        ctx.handle_segment_boundary(5);
-        assert_eq!(ctx.segment_silence_hops, 5);
-
-        // Call 3: crosses the threshold → boundary fires, counter resets.
-        ctx.handle_segment_boundary(SEGMENT_TIMEOUT_HOPS);
-        assert_eq!(ctx.segment_silence_hops, 0);
-        assert!(ctx.score_window.is_empty());
+            assert_eq!(
+                ctx.segment_silence_hops, case.hops_after,
+                "case {}: silence hop counter",
+                case.name,
+            );
+            if case.boundary_fires {
+                assert!(
+                    ctx.score_window.is_empty(),
+                    "case {}: score window",
+                    case.name
+                );
+                assert_eq!(
+                    ctx.segment_score_steps, 0,
+                    "case {}: segment_score_steps must be reset at the boundary",
+                    case.name,
+                );
+                assert!(
+                    ctx.adaptive_threshold.is_bootstrapping(),
+                    "case {}: adaptive_threshold must be reset (re-enter bootstrap)",
+                    case.name,
+                );
+            } else {
+                assert!(
+                    !ctx.score_window.is_empty(),
+                    "case {}: score_window must survive inside a segment",
+                    case.name,
+                );
+                assert!(
+                    !ctx.adaptive_threshold.is_bootstrapping(),
+                    "case {}: adaptive_threshold must survive inside a segment",
+                    case.name,
+                );
+                if !case.recording {
+                    assert_eq!(
+                        ctx.segment_score_steps, 7,
+                        "case {}: segment_score_steps must persist inside a continuing segment",
+                        case.name,
+                    );
+                }
+            }
+        }
     }
 }

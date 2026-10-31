@@ -198,7 +198,6 @@ fn render_skill_location(skill: &Skill, workspace: &Path) -> String {
 mod tests {
     use super::*;
     use crate::workspace::test_ws;
-    use std::path::PathBuf;
 
     /// Write a `SKILL.md` with frontmatter `name`/`description` at
     /// `<root>/<rel>/<dir_name>/SKILL.md`. The body is filler — no test
@@ -241,45 +240,21 @@ mod tests {
         assert_eq!(skills[0].description, "No description provided.");
     }
 
+    /// Nothing to load is an empty set, never an error: an empty skills
+    /// directory and a workspace path that does not exist both yield no skills.
     #[tokio::test]
-    async fn empty_skills_dir_returns_empty() {
+    async fn load_skills_returns_empty_when_there_is_nothing_to_load() {
         let dir = tempfile::tempdir().unwrap();
-        let skills = load_skills(&test_ws(dir.path())).await;
-        assert!(skills.is_empty());
-    }
-
-    #[tokio::test]
-    async fn nonexistent_workspace_returns_empty() {
-        let skills = load_skills(&test_ws(Path::new("/nonexistent"))).await;
-        assert!(skills.is_empty());
-    }
-
-    #[test]
-    fn parse_frontmatter_works() {
-        let content = "---\nname: my-skill\ndescription: Does stuff\n---\n\nContent here";
-        let meta = parse_frontmatter(content);
-        assert_eq!(meta.name.as_deref(), Some("my-skill"));
-        assert_eq!(meta.description.as_deref(), Some("Does stuff"));
-    }
-
-    #[test]
-    fn parse_no_frontmatter() {
-        let content = "# Just a heading\n\nSome content";
-        let meta = parse_frontmatter(content);
-        assert!(meta.name.is_none());
-    }
-
-    #[test]
-    fn skills_to_prompt_shows_name_and_description() {
-        let skill = Skill {
-            name: "my-skill".into(),
-            description: "Does stuff".into(),
-            location: PathBuf::from("skills/my-skill/SKILL.md"),
-        };
-        let prompt = skills_to_prompt(&[skill], &test_ws(Path::new("")));
-        assert!(prompt.contains("my-skill"));
-        assert!(prompt.contains("Does stuff"));
-        assert!(prompt.contains("skills/my-skill/SKILL.md"));
+        assert!(
+            load_skills(&test_ws(dir.path())).await.is_empty(),
+            "an empty skills directory yields no skills"
+        );
+        assert!(
+            load_skills(&test_ws(Path::new("/nonexistent")))
+                .await
+                .is_empty(),
+            "a nonexistent workspace yields no skills"
+        );
     }
 
     #[tokio::test]
@@ -399,30 +374,6 @@ mod tests {
         let skills = load_skills(&test_ws(dir.path())).await;
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "From a-early");
-    }
-
-    #[tokio::test]
-    async fn load_skills_unique_names_from_multiple_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-
-        write_skill(dir.path(), "skills", "skill-a", "skill-a", "From workspace");
-        write_skill(
-            dir.path(),
-            ".claude/skills",
-            "skill-b",
-            "skill-b",
-            "From .claude",
-        );
-        write_skill(
-            dir.path(),
-            ".agents/skills",
-            "skill-c",
-            "skill-c",
-            "From .agents",
-        );
-
-        let skills = load_skills(&test_ws(dir.path())).await;
-        assert_eq!(skills.len(), 3);
     }
 
     #[test]

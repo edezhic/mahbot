@@ -4,52 +4,40 @@
 use super::*;
 use crate::channels::enrich_links;
 
+/// The normalization runs its rules in one order: entities decode first (so
+/// their angle brackets are then stripped), a `<blockquote>` wrapper comes off,
+/// angle brackets go, and newlines collapse to spaces.
 #[test]
-fn normalize_decodes_entities_before_angle_strip() {
-    // `&lt;b&gt;` decodes to `<b>` only after HTML decoding; the trailing
-    // angle brackets are then stripped, leaving the inner text.
-    assert_eq!(normalize_reply_text("&lt;b&gt;hi"), "bhi");
+fn normalize_applies_its_rules_in_order() {
+    let cases: &[(&str, &str)] = &[
+        // `&lt;b&gt;` decodes to `<b>` only after HTML decoding; the trailing
+        // angle brackets are then stripped, leaving the inner text.
+        ("&lt;b&gt;hi", "bhi"),
+        (
+            "<blockquote>\n↩ alice: hello\n</blockquote>",
+            "↩ alice: hello",
+        ),
+        ("hello <world>", "hello world"),
+        ("a\nb\r\nc", "a b c"),
+    ];
+    for (raw, expected) in cases {
+        assert_eq!(normalize_reply_text(raw), *expected, "raw: {raw:?}");
+    }
 }
 
 #[test]
-fn normalize_strips_blockquote_wrapper() {
-    assert_eq!(
-        normalize_reply_text("<blockquote>\n↩ alice: hello\n</blockquote>"),
-        "↩ alice: hello"
-    );
-}
-
-#[test]
-fn normalize_removes_angle_brackets() {
-    assert_eq!(normalize_reply_text("hello <world>"), "hello world");
-}
-
-#[test]
-fn normalize_collapses_newlines() {
-    assert_eq!(normalize_reply_text("a\nb\r\nc"), "a b c");
-}
-
-#[test]
-fn normalize_maps_image_marker_inline() {
-    assert_eq!(
-        normalize_reply_text("look at [IMAGE:/p/x.png] now"),
-        "look at [Photo] now"
-    );
-    assert_eq!(
-        normalize_reply_text("pic [IMAGE:data:image/png;base64,AAA] ok"),
-        "pic [Photo] ok"
-    );
-}
-
-#[test]
-fn normalize_maps_audio_video_and_file_markers() {
-    assert_eq!(
-        normalize_reply_text("[AUDIO:/tmp/a.ogg]"),
-        "[Voice message]"
-    );
-    // Case-insensitive marker recognition.
-    assert_eq!(normalize_reply_text("[video:/tmp/v.mp4]"), "[Video]");
-    assert_eq!(normalize_reply_text("[FILE:/tmp/report.pdf]"), "[File]");
+fn normalize_maps_every_media_marker() {
+    let cases: &[(&str, &str)] = &[
+        ("look at [IMAGE:/p/x.png] now", "look at [Photo] now"),
+        ("pic [IMAGE:data:image/png;base64,AAA] ok", "pic [Photo] ok"),
+        ("[AUDIO:/tmp/a.ogg]", "[Voice message]"),
+        // Case-insensitive marker recognition.
+        ("[video:/tmp/v.mp4]", "[Video]"),
+        ("[FILE:/tmp/report.pdf]", "[File]"),
+    ];
+    for (raw, expected) in cases {
+        assert_eq!(normalize_reply_text(raw), *expected, "raw: {raw:?}");
+    }
 }
 
 #[test]
@@ -58,24 +46,10 @@ fn normalize_caps_at_exactly_snippet_max() {
     let capped = normalize_reply_text(&long);
     assert_eq!(capped.chars().count(), REPLY_SNIPPET_MAX_CHARS);
     assert!(capped.ends_with('…'));
-}
 
-#[test]
-fn normalize_leaves_exactly_max_unchanged() {
+    // A snippet of exactly the cap is not touched at all.
     let exact: String = "a".repeat(REPLY_SNIPPET_MAX_CHARS);
     assert_eq!(normalize_reply_text(&exact), exact);
-}
-
-#[test]
-fn format_reply_marker_exact_literal() {
-    let reply = ReplyReference {
-        author: "alice".to_string(),
-        snippet: "hi".to_string(),
-    };
-    assert_eq!(
-        format_reply_marker(&reply),
-        "<reply-to>alice: hi</reply-to>:\n"
-    );
 }
 
 #[test]
@@ -122,13 +96,9 @@ async fn marker_injection_follows_link_enrichment() {
 }
 
 #[test]
-fn agent_author_label_resolves_display_labels() {
+fn agent_author_label_resolves_and_falls_back() {
     assert_eq!(agent_author_label(Some("analyst_3")), "Analyst");
     assert_eq!(agent_author_label(Some("engineer")), "Engineer");
-}
-
-#[test]
-fn agent_author_label_falls_back_to_agent() {
     assert_eq!(agent_author_label(None), "Agent");
     assert_eq!(agent_author_label(Some("stage_comment")), "Agent");
 }

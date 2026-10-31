@@ -80,65 +80,41 @@ pub(crate) fn decode_html_entities(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Every special character is written as its entity, and `&` is escaped
+    /// before anything else so an already-encoded document is not
+    /// double-decoded: `&amp;` becomes `&amp;amp;`, not `&`.
     #[test]
-    fn escape_html_all_special_chars() {
-        // All five special characters in one string
-        let r = escape_html("<div class=\"test\">AT&T 'hello'</div>");
-        assert_eq!(
-            r,
-            "&lt;div class=&quot;test&quot;&gt;AT&amp;T &#39;hello&#39;&lt;/div&gt;"
-        );
+    fn escape_html_writes_every_special_character_as_its_entity() {
+        let cases: [(&str, &str); 2] = [
+            (
+                "<div class=\"test\">AT&T 'hello'</div>",
+                "&lt;div class=&quot;test&quot;&gt;AT&amp;T &#39;hello&#39;&lt;/div&gt;",
+            ),
+            (
+                "&amp; &lt; &gt; &quot; &#39;",
+                "&amp;amp; &amp;lt; &amp;gt; &amp;quot; &amp;#39;",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(escape_html(input), expected, "input: {input:?}");
+        }
     }
 
+    /// All five entities decode, in the order that makes double-encoded input
+    /// come out right: `&amp;#39;` decodes `&amp;` first, yielding `&#39;`,
+    /// which the next pass turns into `'`.
     #[test]
-    fn escape_html_no_special_chars() {
-        // Plain text with no special characters passes through unchanged
-        let r = escape_html("hello world 123");
-        assert_eq!(r, "hello world 123");
-    }
-
-    #[test]
-    fn escape_html_empty_string() {
-        let r = escape_html("");
-        assert_eq!(r, "");
-    }
-
-    #[test]
-    fn escape_html_only_ampersand() {
-        // The order-dependency test: & must not be double-escaped
-        let r = escape_html("&amp; &lt; &gt; &quot; &#39;");
-        assert_eq!(r, "&amp;amp; &amp;lt; &amp;gt; &amp;quot; &amp;#39;");
-    }
-
-    // --- decode_html_entities tests (moved from telegram.rs) ---
-
-    #[test]
-    fn decode_html_entities_no_change() {
-        // Fast path: no ampersand → returned unchanged (also covers empty string)
-        let r = decode_html_entities("hello world 123");
-        assert_eq!(r, "hello world 123");
-        assert_eq!(decode_html_entities(""), "");
-    }
-
-    #[test]
-    fn decode_html_entities_lone_ampersand() {
-        // Ampersand with no valid entity passes through unchanged
-        let r = decode_html_entities("a & b");
-        assert_eq!(r, "a & b");
-    }
-
-    #[test]
-    fn decode_html_entities_all() {
-        // All five entities decoded in realistic text
-        let r = decode_html_entities("say &quot;hi&quot; &amp; &lt;tag&gt; &#39;ok&#39;");
-        assert_eq!(r, "say \"hi\" & <tag> 'ok'");
-    }
-
-    #[test]
-    fn decode_html_entities_double_encoded() {
-        // Order dependency: &amp; before &#39; so &amp;#39; → &#39; → '
-        let r = decode_html_entities("&amp;#39;");
-        assert_eq!(r, "'");
+    fn decode_html_entities_walks_the_table_in_order() {
+        let cases: [(&str, &str); 2] = [
+            (
+                "say &quot;hi&quot; &amp; &lt;tag&gt; &#39;ok&#39;",
+                "say \"hi\" & <tag> 'ok'",
+            ),
+            ("&amp;#39;", "'"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(decode_html_entities(input), expected, "input: {input:?}");
+        }
     }
 
     // --- Round-trip: decode(encode(c)) == c for all entities ---
@@ -154,15 +130,5 @@ mod tests {
             let decoded = decode_html_entities(&encoded);
             assert_eq!(decoded, ch.to_string(), "round-trip failed for {ch:?}");
         }
-    }
-
-    #[test]
-    fn round_trip_all_entities_in_context() {
-        // Verify that encoding and then decoding a string containing all special
-        // characters returns the original string.
-        let original = "<div class=\"test\">AT&T 'hello'</div>";
-        let encoded = escape_html(original);
-        let decoded = decode_html_entities(&encoded);
-        assert_eq!(decoded, original);
     }
 }

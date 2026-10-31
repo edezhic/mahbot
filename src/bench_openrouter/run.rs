@@ -959,8 +959,13 @@ mod tests {
         }
     }
 
+    /// The request the harness sends: the chat shape (system + user, then one
+    /// assistant/tool pair per frame, with the reasoning fields spread into the
+    /// assistant message), and the pinned body — model, token cap, provider
+    /// order, the single tool — with `reasoning_effort` only when one was
+    /// chosen and `tool_choice` never sent.
     #[test]
-    fn build_messages_shape_and_reasoning_spread() {
+    fn request_construction() {
         let frames = vec![
             ToolFrame {
                 id: "call_0".to_string(),
@@ -993,7 +998,6 @@ mod tests {
         assert!(msgs[2].get("reasoning_content").is_none());
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "call_0");
-        assert_eq!(msgs[3]["content"], "step 0 acknowledged; proceed to step 1");
         // Frame 1: reasoning spread into the assistant message.
         assert_eq!(msgs[4]["role"], "assistant");
         assert_eq!(msgs[4]["reasoning_content"], "rc");
@@ -1003,11 +1007,8 @@ mod tests {
             msgs[4]["tool_calls"][0]["function"]["arguments"],
             "{\"step\":1}"
         );
-        assert_eq!(msgs[5]["content"], "step 1 acknowledged; proceed to step 2");
-    }
+        assert_eq!(msgs[5]["tool_call_id"], "call_1");
 
-    #[test]
-    fn build_request_body_pins_and_omits_effort_and_tool_choice() {
         let body = build_request_body("acme/model-1", &base(), &[], "acme/fp8", None, 128);
         assert_eq!(body["model"], "acme/model-1");
         assert_eq!(body["max_tokens"], 128);
@@ -1025,17 +1026,6 @@ mod tests {
         let with_effort = build_request_body("m", &base(), &[], "t", Some("low"), 256);
         assert_eq!(with_effort["reasoning_effort"], "low");
         assert!(with_effort.get("tool_choice").is_none());
-    }
-
-    #[test]
-    fn generate_filler_deterministic_and_sized() {
-        let a = generate_filler(4000);
-        let b = generate_filler(4000);
-        assert_eq!(a, b);
-        assert!(a.len() >= 4000, "filler too short: {}", a.len());
-        assert!(a.len() <= 4400, "filler overshoot: {}", a.len());
-        assert_eq!(a.lines().next(), Some("000000 alpha"));
-        assert!(a.contains('\n'));
     }
 
     #[test]

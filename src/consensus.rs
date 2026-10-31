@@ -1024,6 +1024,79 @@ pub(crate) fn grouping_request(
 mod tests {
     use super::*;
 
+    /// Collapse semantics: a representative with `collapsed_ids` freezes and
+    /// places every collapsed id (so the remainder excludes them), the
+    /// distinct-agent count includes the collapsed agents, and a round is
+    /// complete when the only coverage of an id is via `collapsed_ids`. A
+    /// collapsed id that ALSO appears as an ungrouped entry is accepted —
+    /// placement wins and the duplicate is dropped silently.
+    #[test]
+    fn collapsed_ids_freeze_place_and_count() {
+        // Three items across three agents: id → agent idx.
+        let items = vec![
+            vec!["a".to_string()],
+            vec!["b".to_string()],
+            vec!["c".to_string()],
+        ];
+        let mut state = RepairState::new(&items);
+
+        // Ids 1 and 2 are covered ONLY via collapsed_ids on representative 0 —
+        // the raw-proposal completeness check must accept the round.
+        let outcome = process_round(
+            RoundInput {
+                summary: Some("s".to_string()),
+                groups: vec![GroupingGroup {
+                    heading: "G".to_string(),
+                    contradiction: false,
+                    members: vec![GroupingMember {
+                        id: 0,
+                        collapsed_ids: vec![1, 2],
+                    }],
+                }],
+                ungrouped: Vec::new(),
+                references: Vec::new(),
+            },
+            &mut state,
+        );
+        assert!(outcome.round_rejection.is_none());
+        assert!(outcome.rejections.is_empty());
+        assert_eq!(outcome.froze, 1);
+        // Collapse placement leaves nothing in the remainder.
+        assert!(state.remainder().is_empty());
+        assert_eq!(
+            distinct_agents(&state.frozen_groups[0], &state.table),
+            vec![0, 1, 2]
+        );
+
+        // A collapsed id that ALSO appears as an ungrouped entry: placement
+        // wins — the duplicate is dropped silently, never a rejection.
+        let items2 = vec![vec!["a".to_string()], vec!["b".to_string()]];
+        let mut state2 = RepairState::new(&items2);
+        let outcome = process_round(
+            RoundInput {
+                summary: Some("s".to_string()),
+                groups: vec![GroupingGroup {
+                    heading: "G".to_string(),
+                    contradiction: false,
+                    members: vec![GroupingMember {
+                        id: 0,
+                        collapsed_ids: vec![1],
+                    }],
+                }],
+                ungrouped: vec![GroupingMember {
+                    id: 1,
+                    ..Default::default()
+                }],
+                references: Vec::new(),
+            },
+            &mut state2,
+        );
+        assert!(outcome.round_rejection.is_none());
+        assert!(outcome.rejections.is_empty());
+        assert_eq!(outcome.froze, 1);
+        assert!(state2.remainder().is_empty());
+    }
+
     /// Byte-exact pin of the repair-instruction assembly for every PrevRound
     /// framing: framing sentence, frozen/remainder headers, list lines, and
     /// blank-line structure. Guards the framing-asset section order (a
@@ -1320,78 +1393,5 @@ mod tests {
                 "framings must be pairwise distinct for {prev:?}"
             );
         }
-    }
-
-    /// Collapse semantics: a representative with `collapsed_ids` freezes and
-    /// places every collapsed id (so the remainder excludes them), the
-    /// distinct-agent count includes the collapsed agents, and a round is
-    /// complete when the only coverage of an id is via `collapsed_ids`. A
-    /// collapsed id that ALSO appears as an ungrouped entry is accepted —
-    /// placement wins and the duplicate is dropped silently.
-    #[test]
-    fn collapsed_ids_freeze_place_and_count() {
-        // Three items across three agents: id → agent idx.
-        let items = vec![
-            vec!["a".to_string()],
-            vec!["b".to_string()],
-            vec!["c".to_string()],
-        ];
-        let mut state = RepairState::new(&items);
-
-        // Ids 1 and 2 are covered ONLY via collapsed_ids on representative 0 —
-        // the raw-proposal completeness check must accept the round.
-        let outcome = process_round(
-            RoundInput {
-                summary: Some("s".to_string()),
-                groups: vec![GroupingGroup {
-                    heading: "G".to_string(),
-                    contradiction: false,
-                    members: vec![GroupingMember {
-                        id: 0,
-                        collapsed_ids: vec![1, 2],
-                    }],
-                }],
-                ungrouped: Vec::new(),
-                references: Vec::new(),
-            },
-            &mut state,
-        );
-        assert!(outcome.round_rejection.is_none());
-        assert!(outcome.rejections.is_empty());
-        assert_eq!(outcome.froze, 1);
-        // Collapse placement leaves nothing in the remainder.
-        assert!(state.remainder().is_empty());
-        assert_eq!(
-            distinct_agents(&state.frozen_groups[0], &state.table),
-            vec![0, 1, 2]
-        );
-
-        // A collapsed id that ALSO appears as an ungrouped entry: placement
-        // wins — the duplicate is dropped silently, never a rejection.
-        let items2 = vec![vec!["a".to_string()], vec!["b".to_string()]];
-        let mut state2 = RepairState::new(&items2);
-        let outcome = process_round(
-            RoundInput {
-                summary: Some("s".to_string()),
-                groups: vec![GroupingGroup {
-                    heading: "G".to_string(),
-                    contradiction: false,
-                    members: vec![GroupingMember {
-                        id: 0,
-                        collapsed_ids: vec![1],
-                    }],
-                }],
-                ungrouped: vec![GroupingMember {
-                    id: 1,
-                    ..Default::default()
-                }],
-                references: Vec::new(),
-            },
-            &mut state2,
-        );
-        assert!(outcome.round_rejection.is_none());
-        assert!(outcome.rejections.is_empty());
-        assert_eq!(outcome.froze, 1);
-        assert!(state2.remainder().is_empty());
     }
 }

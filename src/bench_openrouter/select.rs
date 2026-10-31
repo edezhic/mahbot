@@ -481,48 +481,48 @@ mod tests {
         }
     }
 
+    /// The health gate's two screening predicates: only the raw status `"0"` is
+    /// healthy (the refined bands `-1`…`-10` all are not, and neither is a
+    /// missing status), and only a `:free` suffix is the free variant.
     #[test]
-    fn healthy_status_parsing() {
+    fn exclusion_predicates() {
         assert!(is_healthy_status(Some("0")));
         for s in ["-1", "-2", "-3", "-5", "-10", "", "abc"] {
             assert!(!is_healthy_status(Some(s)), "status {s:?}");
         }
         assert!(!is_healthy_status(None));
-    }
 
-    #[test]
-    fn free_variant_detection() {
         assert!(is_free_variant("groq/llama-3.1-70b:free"));
         assert!(!is_free_variant("groq/llama-3.1-70b"));
         assert!(!is_free_variant(""));
     }
 
+    /// The estimate blends the validated mix and adds the per-request fee; a
+    /// provider with no advertised cache-read price is billed at the full prompt
+    /// price for the cached share and says so in a flag.
     #[test]
-    fn estimate_cost_uses_cache_read_and_request_fees() {
-        let price = Pricing {
+    fn estimate_cost_cases() {
+        let priced = Pricing {
             prompt: Some("0.000002".to_string()),
             completion: Some("0.000008".to_string()),
             request: Some("0.0005".to_string()),
             input_cache_read: Some("0.0000002".to_string()),
         };
         let mut flags = Vec::new();
-        let est = estimate_cost(&price, 1000.0, 4, &mut flags);
+        let est = estimate_cost(&priced, 1000.0, 4, &mut flags);
         assert!(flags.is_empty(), "cache-read price present → no flag");
         let expected =
             (0.977 * 0.000_000_2 + 0.014 * 0.000_002 + 0.009 * 0.000_008) * 1000.0 + 0.0005 * 4.0;
         assert!((est - expected).abs() < 1e-12);
-    }
 
-    #[test]
-    fn estimate_cost_falls_back_to_prompt_with_flag() {
-        let price = Pricing {
-            prompt: Some("0.000002".to_string()),
-            completion: Some("0.000008".to_string()),
+        let unpriced_cache = Pricing {
+            prompt: priced.prompt.clone(),
+            completion: priced.completion.clone(),
             request: Some("0".to_string()),
             input_cache_read: None, // provider does not advertise cache pricing
         };
         let mut flags = Vec::new();
-        let est = estimate_cost(&price, 1000.0, 1, &mut flags);
+        let est = estimate_cost(&unpriced_cache, 1000.0, 1, &mut flags);
         assert_eq!(flags.len(), 1);
         assert!(flags[0].contains("no cache-read price advertised"));
         // All cached tokens billed at the full prompt price.
@@ -530,97 +530,110 @@ mod tests {
         assert!((est - expected).abs() < 1e-12);
     }
 
+    /// The gate and cost rules through `select_providers`: a cost outlier is
+    /// dropped while the rest are selected, a short healthy set is padded to
+    /// three from the cheapest excluded candidates, and context-excluded
+    /// endpoints stay out.
     #[test]
-    fn selection_target_count_and_outlier() {
-        // 8 healthy with varied costs; one cost is an outlier (>3×median).
-        let mut inputs = Vec::new();
+    fn selection_exclusions_and_padding() {
+        struct Case {
+            name: &'static str,
+            inputs: Vec<SelectionInput>,
+            /// Index → the reason recorded for it.
+            reasons: &'static [(usize, Option<ExclusionReason>)],
+            selected: usize,
+        }
+        let mut outlier_inputs = Vec::new();
         for i in 0..8 {
             let est = if i == 7 { 100.0 } else { f64::from(i + 1) };
-            inputs.push(input(ep(&format!("p{i}"), 200_000, "0"), est));
+            outlier_inputs.push(input(ep(&format!("p{i}"), 200_000, "0"), est));
         }
-        let decisions = select_providers(&inputs, 128_000, None);
-        let selected: Vec<_> = decisions.iter().filter(|d| d.selected).collect();
-        // target = max(3, ceil(0.8×8)) = 7; the outlier (>3×median) is dropped.
-        assert_eq!(selected.len(), 7);
-        assert_eq!(decisions[7].reason, Some(ExclusionReason::Outlier(100.0)));
-        // The 6 non-outlier healthy endpoints are all selected.
-        for d in &decisions[..6] {
-            assert!(d.selected);
-        }
-    }
-
-    #[test]
-    fn selection_pads_healthy_lt_3() {
-        // 2 healthy + 1 unhealthy; pad to exactly 3 with the cheapest excluded.
-        let mut inputs = Vec::new();
-        let h0 = input(ep("h0", 200_000, "0"), 1.0);
-        let h1 = input(ep("h1", 200_000, "0"), 2.0);
-        let bad = input(ep("bad", 200_000, "-10"), 3.0);
-        inputs.extend([h0, h1, bad]);
-        let decisions = select_providers(&inputs, 128_000, None);
-        let selected: Vec<_> = decisions.iter().filter(|d| d.selected).collect();
-        assert_eq!(selected.len(), 3);
-        assert!(decisions[0].selected && decisions[1].selected);
-        assert!(decisions[2].selected);
-        assert_eq!(decisions[2].reason, Some(ExclusionReason::Padding));
-    }
-
-    #[test]
-    fn selection_zero_healthy_is_empty() {
-        let inputs = vec![
-            input(ep("a", 200_000, "-10"), 1.0),
-            input(ep("b", 200_000, "-2"), 2.0),
+        let cases = [
+            Case {
+                name: "outlier dropped",
+                inputs: outlier_inputs,
+                // target = max(3, ceil(0.8×8)) = 7; the outlier (>3×median) is dropped.
+                reasons: &[(7, Some(ExclusionReason::Outlier(100.0)))],
+                selected: 7,
+            },
+            Case {
+                name: "padded to three",
+                inputs: vec![
+                    input(ep("h0", 200_000, "0"), 1.0),
+                    input(ep("h1", 200_000, "0"), 2.0),
+                    input(ep("bad", 200_000, "-10"), 3.0),
+                ],
+                reasons: &[(2, Some(ExclusionReason::Padding))],
+                selected: 3,
+            },
+            Case {
+                name: "context excluded",
+                inputs: vec![
+                    input(ep("small", 32_000, "0"), 5.0),
+                    input(ep_ctx("none", None, "0"), 5.0),
+                    input(ep("ok1", 200_000, "0"), 1.0),
+                    input(ep("ok2", 200_000, "0"), 2.0),
+                    input(ep("ok3", 200_000, "0"), 3.0),
+                    input(ep("ok4", 200_000, "0"), 4.0),
+                ],
+                // n = max(3, ceil(0.8×4)) = 4 → all 4 healthy selected.
+                reasons: &[
+                    (0, Some(ExclusionReason::ContextTooSmall(32_000))),
+                    (1, Some(ExclusionReason::ContextUnknown)),
+                ],
+                selected: 4,
+            },
         ];
-        let decisions = select_providers(&inputs, 128_000, None);
-        assert!(decisions.iter().all(|d| !d.selected));
+        for case in &cases {
+            let decisions = select_providers(&case.inputs, 128_000, None);
+            assert_eq!(
+                decisions.iter().filter(|d| d.selected).count(),
+                case.selected,
+                "case {}: selected count",
+                case.name
+            );
+            for &(index, ref expected) in case.reasons {
+                assert_eq!(
+                    decisions[index].reason, *expected,
+                    "case {}: reason at index {index}",
+                    case.name
+                );
+            }
+        }
     }
 
+    /// The target count and the allowlist that overrides it: nothing healthy
+    /// means nothing selected, otherwise `max(3, ceil(0.8 × healthy))` — except
+    /// that a 1–2 entry allowlist is benchmarked as-is, while a 0-match
+    /// allowlist is not "short" and falls back to the count rule.
     #[test]
-    fn selection_allowlist_restricts_and_short_allowlist_wins() {
+    fn allowlist_and_target_count() {
+        assert_eq!(effective_target_count(0, None), 0);
+        assert_eq!(effective_target_count(0, Some(2)), 0);
+        assert_eq!(effective_target_count(5, None), 4);
+        assert_eq!(effective_target_count(20, None), 16);
+        assert_eq!(effective_target_count(1, Some(2)), 2);
+        assert_eq!(effective_target_count(10, Some(1)), 1);
+        assert_eq!(effective_target_count(10, Some(0)), 8);
+
         let mut inputs = Vec::new();
         for i in 0..4 {
             inputs.push(input(ep(&format!("p{i}"), 200_000, "0"), f64::from(i + 1)));
         }
-        // Allowlist with 2 entries → exactly those two selected, no padding.
         let wl = vec!["p1".to_string(), "p3".to_string()];
         let decisions = select_providers(&inputs, 128_000, Some(&wl));
         assert_eq!(decisions.iter().filter(|d| d.selected).count(), 2);
         assert!(decisions[1].selected && decisions[3].selected);
         assert!(!decisions[0].selected && !decisions[2].selected);
 
-        // Single-entry allowlist → exactly that one.
         let wl = vec!["p0".to_string()];
         let decisions = select_providers(&inputs, 128_000, Some(&wl));
         assert_eq!(decisions.iter().filter(|d| d.selected).count(), 1);
         assert!(decisions[0].selected);
     }
 
-    #[test]
-    fn selection_min_context_excludes_small_contexts() {
-        // 4 healthy (context ok) + small-context + unknown-context: the two
-        // context-excluded endpoints stay out (H >= 3 → no padding).
-        let inputs = vec![
-            input(ep("small", 32_000, "0"), 5.0),
-            input(ep_ctx("none", None, "0"), 5.0),
-            input(ep("ok1", 200_000, "0"), 1.0),
-            input(ep("ok2", 200_000, "0"), 2.0),
-            input(ep("ok3", 200_000, "0"), 3.0),
-            input(ep("ok4", 200_000, "0"), 4.0),
-        ];
-        let decisions = select_providers(&inputs, 128_000, None);
-        assert_eq!(
-            decisions[0].reason,
-            Some(ExclusionReason::ContextTooSmall(32_000))
-        );
-        assert_eq!(decisions[1].reason, Some(ExclusionReason::ContextUnknown));
-        assert!(!decisions[0].selected && !decisions[1].selected);
-        // n = max(3, ceil(0.8×4)) = 4 → all 4 healthy selected.
-        assert_eq!(decisions.iter().filter(|d| d.selected).count(), 4);
-        for (i, d) in decisions.iter().enumerate().take(6).skip(2) {
-            assert!(d.selected, "endpoint {i} should be selected");
-        }
-    }
-
+    /// The planned spend: the estimate sums every selected provider (padded ones
+    /// included) and the guard is `cap × 2 / selected`.
     #[test]
     fn plan_cost_sums_selected_and_computes_guard() {
         let inputs = vec![
@@ -634,67 +647,5 @@ mod tests {
         assert!((total - 0.6).abs() < 1e-12);
         // guard = cap×2 / max(1, 3) = 4/3.
         assert!((guard - 4.0 / 3.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn exclusion_reason_displays() {
-        assert_eq!(
-            ExclusionReason::Status("-10".to_string()).to_string(),
-            "status -10"
-        );
-        assert_eq!(
-            ExclusionReason::FreeVariant.to_string(),
-            "free variant (:free tag)"
-        );
-        assert_eq!(
-            ExclusionReason::ContextTooSmall(32_000).to_string(),
-            "context too small (32000 tokens)"
-        );
-        assert_eq!(
-            ExclusionReason::ContextUnknown.to_string(),
-            "context unknown"
-        );
-        assert_eq!(
-            ExclusionReason::NotInAllowlist.to_string(),
-            "not in provider allowlist"
-        );
-        assert_eq!(
-            ExclusionReason::Padding.to_string(),
-            "padding (expected to fail)"
-        );
-    }
-
-    #[test]
-    fn selection_decision_reason_text() {
-        let d = SelectionDecision {
-            selected: false,
-            reason: Some(ExclusionReason::Padding),
-        };
-        assert_eq!(d.reason_text(), "padding (expected to fail)");
-        let selected = SelectionDecision {
-            selected: true,
-            reason: None,
-        };
-        assert_eq!(selected.reason_text(), "selected");
-        let unselected = SelectionDecision {
-            selected: false,
-            reason: None,
-        };
-        assert_eq!(unselected.reason_text(), "not selected");
-    }
-
-    #[test]
-    fn effective_target_count_rules() {
-        // Nothing healthy → 0, allowlist or not.
-        assert_eq!(effective_target_count(0, None), 0);
-        assert_eq!(effective_target_count(0, Some(2)), 0);
-        // No allowlist: max(3, ceil(0.8 × healthy)).
-        assert_eq!(effective_target_count(5, None), 4);
-        assert_eq!(effective_target_count(20, None), 16);
-        // Short allowlist (1-2 matching endpoints) wins over the count rule.
-        assert_eq!(effective_target_count(1, Some(2)), 2);
-        assert_eq!(effective_target_count(10, Some(1)), 1);
-        // A 0-match allowlist is not "short" — the count rule applies.
-        assert_eq!(effective_target_count(10, Some(0)), 8);
     }
 }

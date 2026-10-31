@@ -448,7 +448,8 @@ mod tests {
     /// The first refusal of a store file in the process files one durable block
     /// with every measured field, in the shape the other per-store blocks use;
     /// later refusals only count. The block must not read as a checkpoint failure
-    /// — a refusal is not one.
+    /// — a refusal is not one — and a probe that could not answer for an external
+    /// condition carries the environment note instead of the finding's shape.
     #[test]
     fn refusal_is_recorded_once_and_is_not_a_checkpoint_failure() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
@@ -490,15 +491,11 @@ mod tests {
                 "a refusal must not read as {forbidden:?}: {body}"
             );
         }
-    }
 
-    /// A probe that could not answer because of an external condition (here:
-    /// lock contention) is marked in the record as environment-caused, so an
-    /// environmental refusal is not read as evidence about the store.
-    #[test]
-    fn an_environmental_refusal_is_marked_as_such() {
-        let tmp = tempfile::TempDir::new().expect("temp dir");
-        let refusal = verdict(
+        // A probe that could not answer because of an external condition (here:
+        // lock contention) is marked as environment-caused, so an environmental
+        // refusal is not read as evidence about the store.
+        let environmental = verdict(
             Ok(3),
             Ok(20_480),
             Err("wal stat failed: database is locked".to_string()),
@@ -506,8 +503,8 @@ mod tests {
         .expect("the case must be refused");
         record_refusal(
             "shrink_gate_environment_probe",
-            &tmp.path().join("probe.db"),
-            &refusal,
+            &tmp.path().join("environment.db"),
+            &environmental,
             Some(tmp.path()),
         );
         let body = std::fs::read_to_string(tmp.path().join("error.log")).expect("error.log");

@@ -255,29 +255,49 @@ mod tests {
         );
     }
 
-    /// Under the production filter only the checkpoint-failure sentence on the
-    /// engine's own target is kept, whole — prefix and interpolated diagnostics —
-    /// and it reaches the error chain through the production seam: the same
-    /// sentence on another target never reaches the layer, and a different
-    /// message on the engine target is dropped by the message check.
+    /// The production layer stack — the real one, built by
+    /// [`crate::logs::log_layers`], not a copy of it: the `EnvFilter` must stay a
+    /// LAYER filter on the JSON log layer, because installed globally it would
+    /// drop the engine's DEBUG event and the record would silently fall back to
+    /// the product's constant text with every other test still green.
+    ///
+    /// It is also the layer's whole filter: the checkpoint-failure sentence on
+    /// the engine's own target is kept whole — prefix and interpolated
+    /// diagnostics — while a different message on that target is dropped, the
+    /// same sentence on another target never reaches the layer, and the
+    /// product's own text stays a separate chain link.
     #[tokio::test]
-    async fn only_the_engines_checkpoint_sentence_is_kept() {
-        let _guard = tracing::subscriber::set_default(filtered_subscriber());
+    async fn the_production_filter_stack_keeps_only_the_engine_sentence() {
+        use tracing_subscriber::EnvFilter;
+
+        let _guard = tracing::subscriber::set_default(crate::logs::log_layers(
+            std::io::sink,
+            EnvFilter::new(crate::logs::DEFAULT_LOG_FILTER),
+        ));
         let sink = CauseSink::new();
         sink.scoped(async {
+            tracing::debug!(
+                target: ENGINE_TARGET,
+                "PRAGMA wal_checkpoint failed: the production stack"
+            );
             tracing::debug!(target: ENGINE_TARGET, "a different message");
             tracing::debug!(
                 target: "turso_core::storage::pager",
                 "PRAGMA wal_checkpoint failed: another target"
             );
-            tracing::debug!(target: ENGINE_TARGET, "PRAGMA wal_checkpoint failed: literal");
         })
         .await;
 
-        let rendered = format!("{:#}", sink.attach(anyhow::anyhow!("no reason captured")));
+        let rendered = format!(
+            "{:#}",
+            sink.attach(anyhow::anyhow!(
+                "Unexpected result from PRAGMA wal_checkpoint"
+            ))
+        );
         assert!(
-            rendered.contains("engine cause: PRAGMA wal_checkpoint failed: literal"),
-            "the engine's own checkpoint sentence at DEBUG must be captured: {rendered:?}"
+            rendered.contains("engine cause: PRAGMA wal_checkpoint failed: the production stack"),
+            "the capture layer must keep the engine's reason under the production filter stack: \
+             {rendered:?}"
         );
         assert!(
             !rendered.contains("a different message"),
@@ -287,10 +307,13 @@ mod tests {
             !rendered.contains("another target"),
             "the engine's sentence on another target must be filtered out: {rendered:?}"
         );
+        assert!(
+            rendered.contains("Unexpected result from PRAGMA wal_checkpoint"),
+            "the product's own text must survive: {rendered:?}"
+        );
 
         // The engine's real event interpolates its diagnostics, so a formatted
-        // message must be kept whole as well as a literal one — and the product's
-        // own text stays a separate chain link.
+        // message must be kept whole as well as a literal one.
         let interpolated = CauseSink::new();
         interpolated
             .scoped(async {
@@ -314,40 +337,6 @@ mod tests {
         assert!(
             rendered.contains("boom"),
             "the captured cause must keep the interpolated diagnostics: {rendered:?}"
-        );
-        assert!(
-            rendered.contains("Unexpected result from PRAGMA wal_checkpoint"),
-            "the product's own text must survive: {rendered:?}"
-        );
-    }
-
-    /// The production layer stack — the real one, built by
-    /// [`crate::logs::log_layers`], not a copy of it: the `EnvFilter` must stay a
-    /// LAYER filter on the JSON log layer, because installed globally it would
-    /// drop the engine's DEBUG event and the record would silently fall back to
-    /// the product's constant text with every other test still green.
-    #[tokio::test]
-    async fn the_production_filter_stack_still_keeps_the_engine_reason() {
-        use tracing_subscriber::EnvFilter;
-
-        let _guard = tracing::subscriber::set_default(crate::logs::log_layers(
-            std::io::sink,
-            EnvFilter::new(crate::logs::DEFAULT_LOG_FILTER),
-        ));
-        let sink = CauseSink::new();
-        sink.scoped(async {
-            tracing::debug!(
-                target: ENGINE_TARGET,
-                "PRAGMA wal_checkpoint failed: the production stack"
-            );
-        })
-        .await;
-
-        let rendered = format!("{:#}", sink.attach(anyhow::anyhow!("no reason captured")));
-        assert!(
-            rendered.contains("the production stack"),
-            "the capture layer must keep the engine's reason under the production filter stack: \
-             {rendered:?}"
         );
     }
 }

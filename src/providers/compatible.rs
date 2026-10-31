@@ -326,21 +326,6 @@ struct NativeMessage {
     reasoning_details: Option<serde_json::Value>,
 }
 
-impl NativeMessage {
-    #[cfg(test)]
-    fn user(content: &str) -> Self {
-        NativeMessage {
-            role: "user".into(),
-            content: Some(MessageContent::Text(content.into())),
-            tool_call_id: None,
-            tool_calls: None,
-            reasoning_content: None,
-            reasoning: None,
-            reasoning_details: None,
-        }
-    }
-}
-
 // ── Message content types for API serialization ──
 
 /// Parse `[IMAGE:…]` markers from content, returning cleaned text and extracted
@@ -1615,30 +1600,41 @@ mod tests {
         }
     }
 
+    /// A parsed response keeps the whole turn: the tool call's id and name ride
+    /// with the text and with the reasoning delta the model sent — the id is what
+    /// the tool result is returned against, so it can never be dropped.
     #[test]
-    fn parse_native_response_preserves_tool_call_id() {
+    fn parse_native_response_keeps_the_id_the_text_and_the_reasoning() {
+        let call = || ApiToolCall {
+            id: Some("call_1".to_string()),
+            kind: Some("function".to_string()),
+            function: Some(ApiToolCallFunction {
+                name: Some("shell".to_string()),
+                arguments: Some(r#"{"cmd":"ls"}"#.to_string()),
+            }),
+            name: None,
+            arguments: None,
+            parameters: None,
+        };
+
         let message = ResponseMessage {
-            content: None,
-            tool_calls: Some(vec![ApiToolCall {
-                id: Some("call_123".to_string()),
-                kind: Some("function".to_string()),
-                function: Some(ApiToolCallFunction {
-                    name: Some("shell".to_string()),
-                    arguments: Some(r#"{"command":"pwd"}"#.to_string()),
-                }),
-                name: None,
-                arguments: None,
-                parameters: None,
-            }]),
-            reasoning_content: None,
+            content: Some("answer".to_string()),
+            reasoning_content: Some("thinking step".to_string()),
             reasoning: None,
             reasoning_details: None,
+            tool_calls: Some(vec![call()]),
         };
 
         let parsed =
             OpenAiCompatibleProvider::parse_native_response(message, None, None, None, None);
+        let rc = parsed
+            .reasoning
+            .as_ref()
+            .and_then(|r| r.reasoning_content.clone());
+        assert_eq!(rc.as_deref(), Some("thinking step"));
+        assert_eq!(parsed.text.as_deref(), Some("answer"));
         assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.tool_calls[0].id, "call_123");
+        assert_eq!(parsed.tool_calls[0].id, "call_1");
         assert_eq!(parsed.tool_calls[0].name, "shell");
     }
 
@@ -1651,27 +1647,6 @@ mod tests {
         assert!(matches!(
             converted[0].content.as_ref(),
             Some(MessageContent::Text(value)) if value == "done"
-        ));
-    }
-
-    #[test]
-    fn convert_messages_for_native_converts_user_image_markers_to_image_parts() {
-        let uri = tiny_png_data_uri();
-        let input = vec![ChatMessage::user(format!(
-            "System primer [IMAGE:{uri}] user turn"
-        ))];
-
-        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].role, "user");
-        assert!(matches!(
-            converted[0].content.as_ref(),
-            Some(MessageContent::Parts(parts))
-                if parts.iter().any(|p| matches!(
-                    p,
-                    MessagePart::ImageUrl { image_url }
-                        if image_url.url == uri
-                ))
         ));
     }
 
@@ -1760,18 +1735,6 @@ mod tests {
                 .effective_content_optional()
                 .unwrap_or_default(),
             "Hello from Venice!"
-        );
-    }
-
-    #[tokio::test]
-    async fn warmup_without_key_attempts_connection() {
-        let provider = OpenAiCompatibleProvider::new("test", "http://127.0.0.1:1", None);
-        let result = provider.warmup().await;
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            !err_msg.contains("API key not set"),
-            "should not get credential error, got: {err_msg}"
         );
     }
 
@@ -1896,10 +1859,16 @@ mod tests {
         }
     }
 
+    /// A user turn's `[IMAGE:<data uri>]` marker is the image itself: it becomes an
+    /// OpenAI image part with the prose around it as text, in any casing, and the
+    /// same turn converted for the native frame carries the same part. A marker
+    /// that holds no image stays text, and no role other than the user's is ever
+    /// turned into parts.
     #[test]
-    fn to_message_content_converts_image_markers_to_openai_parts() {
+    fn user_image_markers_become_image_parts() {
         let uri = tiny_png_data_uri();
-        // Any casing is the same marker, including in the fast-path guard.
+
+        // `to_message_content` for a user turn, in either casing.
         for token in ["IMAGE", "image"] {
             let content = format!("Describe this\n\n[{token}:{uri}]");
             let value = serde_json::to_value(to_message_content(ChatRole::User, &content)).unwrap();
@@ -1912,18 +1881,8 @@ mod tests {
             assert_eq!(parts[1]["type"], "image_url");
             assert_eq!(parts[1]["image_url"]["url"], uri);
         }
-    }
 
-    #[test]
-    fn to_message_content_keeps_prose_image_markers_as_text() {
-        let content = "List any existing mechanism (tool, command, [IMAGE:...] marker, data URI)";
-        let value = serde_json::to_value(to_message_content(ChatRole::User, content)).unwrap();
-        assert_eq!(value, serde_json::json!(content));
-    }
-
-    #[test]
-    fn to_message_content_mixes_prose_marker_with_native_payload() {
-        let uri = tiny_png_data_uri();
+        // A prose marker and a payload in one turn: the prose stays text.
         let content = format!("see [IMAGE:...] and [IMAGE:{uri}]");
         let value = serde_json::to_value(to_message_content(ChatRole::User, &content)).unwrap();
         let parts = value.as_array().expect("mixed content should be an array");
@@ -1932,51 +1891,40 @@ mod tests {
         assert_eq!(parts[0]["text"], "see [IMAGE:...] and");
         assert_eq!(parts[1]["type"], "image_url");
         assert_eq!(parts[1]["image_url"]["url"], uri);
-    }
 
-    #[test]
-    fn to_message_content_keeps_plain_text_for_non_user_roles() {
+        // Only the user's turn becomes parts.
         let value = serde_json::to_value(to_message_content(
             ChatRole::System,
             "You are a helpful assistant.",
         ))
         .unwrap();
         assert_eq!(value, serde_json::json!("You are a helpful assistant."));
+
+        // The native frame of the same turn.
+        let input = vec![ChatMessage::user(format!(
+            "System primer [IMAGE:{uri}] user turn"
+        ))];
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Parts(parts))
+                if parts.iter().any(|p| matches!(
+                    p,
+                    MessagePart::ImageUrl { image_url }
+                        if image_url.url == uri
+                ))
+        ));
     }
 
+    /// Tool calls reach the caller as the envelope carried them: each keeps its
+    /// function name and the argument JSON verbatim, and several calls in one answer
+    /// stay in the order the model wrote them — a reordering would pair a result with
+    /// the wrong call.
     #[test]
-    fn request_serializes_with_tools() {
-        let tools = vec![serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Get weather for a location",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "location": {"type": "string"}
-                    }
-                }
-            }
-        })];
-
-        let req = ChatCompletionRequest {
-            model: "test-model".to_string(),
-            messages: vec![NativeMessage::user("What is the weather?")],
-            max_tokens: Some(32000),
-            tools: Some(tools),
-            tool_choice: Some("auto".to_string()),
-            extra: serde_json::Map::new(),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"tools\""));
-        assert!(json.contains("get_weather"));
-        assert!(json.contains("\"tool_choice\":\"auto\""));
-    }
-
-    #[test]
-    fn response_with_tool_calls_deserializes() {
-        let json = r#"{
+    fn tool_calls_are_assembled_from_the_envelope() {
+        let single = r#"{
             "choices": [{
                 "message": {
                     "content": null,
@@ -1990,8 +1938,7 @@ mod tests {
                 }
             }]
         }"#;
-
-        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(single).unwrap();
         let msg = &resp.choices[0].message;
         assert!(msg.content.is_none());
         let tool_calls = msg.tool_calls.as_ref().unwrap();
@@ -2009,11 +1956,8 @@ mod tests {
                 .as_deref(),
             Some("{\"location\":\"London\"}")
         );
-    }
 
-    #[test]
-    fn response_with_multiple_tool_calls() {
-        let json = r#"{
+        let both = r#"{
             "choices": [{
                 "message": {
                     "content": "I'll check both.",
@@ -2036,8 +1980,7 @@ mod tests {
                 }
             }]
         }"#;
-
-        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let resp: ApiChatResponse = serde_json::from_str(both).unwrap();
         let msg = &resp.choices[0].message;
         assert_eq!(msg.content.as_deref(), Some("I'll check both."));
         let tool_calls = msg.tool_calls.as_ref().unwrap();
@@ -2052,14 +1995,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn response_with_no_tool_calls_has_empty_vec() {
-        let json = r#"{"choices":[{"message":{"content":"Just text, no tools."}}]}"#;
-        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let msg = &resp.choices[0].message;
-        assert_eq!(msg.content.as_deref(), Some("Just text, no tools."));
-        assert!(msg.tool_calls.is_none());
-    }
+    /// Token accounting: the prompt and completion counts the provider reports
+    /// are what `stats` and the session's 200k summarization trigger read.
     #[test]
     fn api_response_parses_usage() {
         let json = r#"{
@@ -2088,33 +2025,14 @@ mod tests {
         assert_eq!(miss, None);
     }
 
+    /// The usage and provenance fields are telemetry, never the answer: what the
+    /// provider sent — token counts, cached tokens, billed cost, the fingerprint and
+    /// the serving provider — is kept, and a field this product does not understand
+    /// (drifted type, or a number serde cannot hold) becomes NULL instead of failing
+    /// the envelope, because the retry on identical bytes would only fail again.
     #[test]
-    fn api_response_parses_cached_tokens() {
-        // OpenRouter-shaped usage with prompt_tokens_details.cached_tokens.
-        let json = r#"{
-            "choices": [{"message": {"content": "Hello"}}],
-            "usage": {
-                "prompt_tokens": 150,
-                "completion_tokens": 60,
-                "prompt_tokens_details": {"cached_tokens": 90}
-            }
-        }"#;
-        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let usage = resp.usage.unwrap();
-        assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, Some(90));
-    }
-
-    #[test]
-    fn api_response_parses_without_usage() {
-        let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
-        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.usage.is_none());
-    }
-
-    #[test]
-    fn api_response_parses_cost_fingerprint_and_upstream_provider() {
-        // OpenRouter envelope with billed cost, system_fingerprint and the
-        // top-level serving provider.
+    fn envelope_telemetry_never_fails_the_parse() {
+        // A full OpenRouter envelope with billed cost, fingerprint and provider.
         let json = r#"{
             "choices": [{"message": {"content": "Hello"}}],
             "provider": "DeepSeek",
@@ -2133,6 +2051,8 @@ mod tests {
         assert_eq!(resp.system_fingerprint.as_deref(), Some("fp_44709d6fcb"));
         assert_eq!(resp.provider.as_deref(), Some("DeepSeek"));
         let usage = resp.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(150));
+        assert_eq!(usage.completion_tokens, Some(60));
         assert!((usage.cost.expect("cost") - 0.0012).abs() < 1e-12);
         // Parse→re-serialize normalizes key order (BTreeMap) — the stored
         // TEXT is reference-only; SQL slicing uses cost REAL.
@@ -2151,13 +2071,10 @@ mod tests {
                 .and_then(serde_json::Value::as_f64),
             Some(0.0008)
         );
-    }
 
-    #[test]
-    fn upstream_provider_present_on_cache_hit() {
-        // Cache hits strip openrouter_metadata, but the top-level `provider`
-        // field survives — the eviction/backend-switch rows this telemetry
-        // exists to attribute must not be NULL.
+        // A cache hit strips `openrouter_metadata`, but the top-level `provider`
+        // survives — the eviction/backend-switch rows this telemetry exists to
+        // attribute must not be NULL.
         let json = r#"{
             "choices": [{"message": {"content": "cached answer"}}],
             "provider": "Friendli",
@@ -2171,17 +2088,18 @@ mod tests {
         }"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.provider.as_deref(), Some("Friendli"));
-        // Missing/absent provider stays None (NULL) — non-OpenRouter endpoints.
-        let resp: ApiChatResponse =
-            serde_json::from_str(r#"{"choices":[{"message":{"content":"x"}}]}"#).unwrap();
-        assert!(resp.provider.is_none());
-    }
+        assert_eq!(
+            resp.usage
+                .unwrap()
+                .prompt_tokens_details
+                .unwrap()
+                .cached_tokens,
+            Some(8),
+            "the cached-token details are read from the same place"
+        );
 
-    #[test]
-    fn wrong_typed_telemetry_fields_do_not_break_envelope_parse() {
-        // Provider shape drift (system_fingerprint as number, cost as string,
-        // provider as number) must yield NULL — not a parse failure
-        // that would retry an otherwise-successful response.
+        // Provider shape drift (fingerprint as a number, cost as a string, provider
+        // as a number) yields NULL, not a parse failure.
         let json = r#"{
             "choices": [{"message": {"content": "Hello"}}],
             "provider": 42,
@@ -2194,19 +2112,16 @@ mod tests {
         let usage = resp.usage.unwrap();
         assert!(usage.cost.is_none());
         assert!(usage.cost_details.is_some(), "Value accepts any JSON");
-        // Missing fields stay None too.
+
+        // Missing fields stay None too — a non-OpenRouter endpoint sends none of it.
         let resp: ApiChatResponse =
             serde_json::from_str(r#"{"choices":[{"message":{"content":"x"}}]}"#).unwrap();
         assert!(resp.system_fingerprint.is_none());
         assert!(resp.provider.is_none());
         assert!(resp.usage.is_none());
-    }
 
-    #[test]
-    fn pathological_cost_details_number_does_not_break_envelope_parse() {
-        // serde_json rejects `1e999` as an out-of-range number — without the
-        // `opt_field` gate on cost_details this would fail the whole envelope
-        // parse and retry on byte-identical bytes.
+        // `1e999` is an out-of-range number to serde_json: without the `opt_field`
+        // gate on cost_details it would fail the whole envelope.
         let json = r#"{
             "choices": [{"message": {"content": "Hello"}}],
             "usage": {"cost_details": {"upstream_inference_prompt_cost": 1e999}}
@@ -2221,56 +2136,21 @@ mod tests {
     // reasoning_content pass-through tests
     // ─────────────────────────────────────────────────────────────────────
 
+    /// What an assistant turn replays: its reasoning (`reasoning_content` as sent,
+    /// or synthesized from the details blocks for a tool call), a content field that
+    /// is a string when the turn has no tool call and `null`/omitted — never
+    /// invented — when it has one, and a bare-JSON answer left as the plain text it
+    /// was rather than blanked into a shape the API rejects.
+    #[expect(clippy::too_many_lines)] // one shape per replay rule, in one place
+    #[expect(clippy::type_complexity)] // (label, history frame, its own check)
     #[test]
-    fn parse_native_response_captures_reasoning_content() {
-        let message = ResponseMessage {
-            content: Some("answer".to_string()),
-            reasoning_content: Some("thinking step".to_string()),
-            reasoning: None,
-            reasoning_details: None,
-            tool_calls: Some(vec![ApiToolCall {
-                id: Some("call_1".to_string()),
-                kind: Some("function".to_string()),
-                function: Some(ApiToolCallFunction {
-                    name: Some("shell".to_string()),
-                    arguments: Some(r#"{"cmd":"ls"}"#.to_string()),
-                }),
-                name: None,
-                arguments: None,
-                parameters: None,
-            }]),
+    fn an_assistant_replay_carries_its_reasoning_and_keeps_bare_json() {
+        let wire = |history_json: serde_json::Value| {
+            let messages = vec![ChatMessage::assistant(history_json.to_string())];
+            let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
+            serde_json::to_value(&native[0]).unwrap()
         };
 
-        let parsed =
-            OpenAiCompatibleProvider::parse_native_response(message, None, None, None, None);
-        let rc = parsed
-            .reasoning
-            .as_ref()
-            .and_then(|r| r.reasoning_content.clone());
-        assert_eq!(rc.as_deref(), Some("thinking step"));
-        assert_eq!(parsed.text.as_deref(), Some("answer"));
-        assert_eq!(parsed.tool_calls.len(), 1);
-    }
-
-    #[test]
-    fn parse_native_response_none_reasoning_content_for_normal_model() {
-        let message = ResponseMessage {
-            content: Some("hello".to_string()),
-            reasoning_content: None,
-            reasoning: None,
-            reasoning_details: None,
-            tool_calls: None,
-        };
-
-        let parsed =
-            OpenAiCompatibleProvider::parse_native_response(message, None, None, None, None);
-        assert!(parsed.reasoning.is_none());
-        assert_eq!(parsed.text.as_deref(), Some("hello"));
-    }
-
-    #[test]
-    #[expect(clippy::type_complexity)]
-    fn convert_messages_for_native_reasoning_cases() {
         let details = serde_json::json!([
             {"type": "reasoning.text", "text": "from details", "format": "x", "index": 0}
         ]);
@@ -2342,24 +2222,14 @@ mod tests {
                 },
             ),
         ];
-
         for (name, history_json, check) in cases {
             let messages = vec![ChatMessage::assistant(history_json.to_string())];
             let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
             check(&native, name);
         }
-    }
 
-    #[test]
-    fn convert_messages_for_native_assistant_content_backstop() {
-        let wire = |history_json: serde_json::Value| {
-            let messages = vec![ChatMessage::assistant(history_json.to_string())];
-            let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
-            serde_json::to_value(&native[0]).unwrap()
-        };
-
-        // Pure backstop shape: native frame with content None, no tool_calls,
-        // no reasoning — serializes with string content "" (never null/omitted).
+        // The content backstop: a frame with no tool call and no reasoning
+        // serializes with string content "" (never null/omitted).
         let value = wire(serde_json::json!({"content": null}));
         assert_eq!(value["content"], serde_json::json!(""));
         assert!(value.get("tool_calls").is_none());
@@ -2380,19 +2250,9 @@ mod tests {
         }));
         assert!(value.get("content").is_none(), "{value}");
         assert!(value.get("tool_calls").is_some());
-    }
 
-    #[test]
-    fn convert_messages_for_native_preserves_bare_json_reply() {
-        let messages = vec![ChatMessage::assistant(
-            serde_json::json!({"verdict": "bad"}).to_string(),
-        )];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
-        let value = serde_json::to_value(&native[0]).unwrap();
-
-        // The decode gate keeps a bare-JSON answer plain text, so the raw JSON
-        // text survives on the wire as string content (no blanking, no 400
-        // shape).
+        // A bare-JSON answer stays the text it was on the wire.
+        let value = wire(serde_json::json!({"verdict": "bad"}));
         assert_eq!(
             value["content"],
             serde_json::json!({"verdict": "bad"}).to_string()

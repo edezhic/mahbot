@@ -231,37 +231,40 @@ mod tests {
         .await
     }
 
+    /// A retryable failure is retried and the retry succeeds: the transport
+    /// class is retried byte-identically and the truncated-envelope class (the
+    /// EOF-while-parsing defect) likewise, and either recovers the parsed
+    /// verdict.
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    async fn recovers_after_consecutive_transport_errors() {
-        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
-        let fake = Arc::new(
-            FakeProvider::new()
-                .err(crate::retry::FailureClass::Transport, "transport error 1")
-                .err(crate::retry::FailureClass::Transport, "transport error 2")
-                .ok(r#"{"score": 8}"#),
-        );
-        let result = extract_with(fake).await;
-        let verdict = result.expect("should recover after 2 transport errors");
-        assert_eq!(verdict.score, 8);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    async fn recovers_after_truncated_envelope_parse_errors() {
-        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
-        // Truncated-envelope class (EOF-while-parsing defect class) retried
-        // byte-identical, then a full body parses.
-        let fake = Arc::new(
-            FakeProvider::new()
-                .err(
-                    crate::retry::FailureClass::TruncatedEnvelope,
-                    "EOF while parsing a value at line 317",
-                )
-                .ok(r#"{"score": 9}"#),
-        );
-        let result = extract_with(fake).await;
-        assert_eq!(result.expect("recovery").score, 9);
+    async fn recovers_after_retryable_failures() {
+        let cases = [
+            (
+                "transport errors",
+                FakeProvider::new()
+                    .err(crate::retry::FailureClass::Transport, "transport error 1")
+                    .err(crate::retry::FailureClass::Transport, "transport error 2")
+                    .ok(r#"{"score": 8}"#),
+                8,
+            ),
+            (
+                "truncated envelope",
+                FakeProvider::new()
+                    .err(
+                        crate::retry::FailureClass::TruncatedEnvelope,
+                        "EOF while parsing a value at line 317",
+                    )
+                    .ok(r#"{"score": 9}"#),
+                9,
+            ),
+        ];
+        for (reason, fake, score) in cases {
+            let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
+            let verdict = extract_with(Arc::new(fake))
+                .await
+                .expect("should recover after retryable failures");
+            assert_eq!(verdict.score, score, "case: {reason}");
+        }
     }
 
     #[tokio::test]
@@ -390,53 +393,57 @@ mod tests {
         );
     }
 
+    /// The parse-failure re-prompt turns the failed reply into the appended
+    /// assistant turn: a JSON-shaped reply is carried verbatim (the production
+    /// trigger), and a reply with NO text — a tool-call-style response — is
+    /// replaced by the non-empty no-output marker rather than replayed as an
+    /// empty frame.
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    async fn json_reply_reprompts_with_non_empty_assistant_turn() {
-        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
-        // JSON-shaped but unparseable for the score → parse failure → re-prompt.
-        let fake = Arc::new(
-            FakeProvider::new()
-                .ok(r#"{"verdict": "bad"}"#)
-                .ok(r#"{"score": 4}"#),
-        );
-        let result = extract_with(fake.clone()).await;
-        assert_eq!(result.expect("recovers").score, 4);
-
-        // The JSON-shaped reply is pushed verbatim as the re-prompt assistant
-        // turn (the production trigger). This seam verifies ChatMessages; the
-        // wire form is pinned by the decode-gate and serializer tests.
-        let messages = fake.request_messages.lock().unwrap().clone();
-        assert_eq!(messages.len(), 2);
-        assert!(messages[1].contains("Assistant"), "{}", messages[1]);
-        assert!(
-            messages[1].contains(r#"{\"verdict\": \"bad\"}"#),
-            "{}",
-            messages[1]
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    async fn empty_last_raw_reprompts_with_marker_not_empty_turn() {
-        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
-        // Tool-call-style response with no text → Some("") last_raw → parse failure.
-        let fake = Arc::new(FakeProvider::new().ok("").ok(r#"{"score": 7}"#));
-        let result = extract_with(fake.clone()).await;
-        assert_eq!(result.expect("recovers").score, 7);
-
-        // An empty assistant turn is replaced by the non-empty marker, so the
-        // second request re-prompts with real content, not an empty frame.
-        let messages = fake.request_messages.lock().unwrap().clone();
-        assert_eq!(messages.len(), 2);
+    async fn parse_failure_reprompts_with_a_non_empty_assistant_turn() {
         let marker = crate::prompt::load_prompt("extraction/retry_no_output.md");
-        assert!(messages[1].contains("Assistant"), "{}", messages[1]);
-        assert!(messages[1].contains(marker.as_str()), "{}", messages[1]);
-        assert!(
-            !messages[1].contains("content: \"\""),
-            "empty assistant turn must not be replayed: {}",
-            messages[1]
-        );
+        let cases = [
+            (
+                "a JSON reply is carried verbatim",
+                r#"{"verdict": "bad"}"#,
+                r#"{"score": 4}"#,
+                4u8,
+                r#"{\"verdict\": \"bad\"}"#.to_string(),
+                None,
+            ),
+            (
+                "a reply with no text becomes the marker",
+                "",
+                r#"{"score": 7}"#,
+                7u8,
+                marker.clone(),
+                Some("content: \"\"".to_string()),
+            ),
+        ];
+        for (reason, first, second, score, must_contain, must_not_contain) in cases {
+            let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
+            let fake = Arc::new(FakeProvider::new().ok(first).ok(second));
+            let result = extract_with(fake.clone()).await;
+            assert_eq!(result.expect("recovers").score, score, "case: {reason}");
+
+            // This seam verifies ChatMessages; the wire form is pinned by the
+            // decode-gate and serializer tests.
+            let messages = fake.request_messages.lock().unwrap().clone();
+            assert_eq!(messages.len(), 2, "case: {reason}");
+            assert!(messages[1].contains("Assistant"), "{}", messages[1]);
+            assert!(
+                messages[1].contains(&must_contain),
+                "case: {reason}: {}",
+                messages[1]
+            );
+            if let Some(never) = must_not_contain {
+                assert!(
+                    !messages[1].contains(&never),
+                    "case: {reason}: {}",
+                    messages[1]
+                );
+            }
+        }
     }
 
     #[tokio::test]

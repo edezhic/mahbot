@@ -119,6 +119,21 @@ mod tests {
         assert_eq!(info.duration, Duration::from_millis(2008));
         assert_eq!(info.dimensions, Some((1280, 720)));
         assert!(info.has_audio);
+
+        // An audio file with embedded artwork: the picture rides in a video stream
+        // of its own and must not read as the file's video.
+        let cover = r#"{
+            "streams": [
+                {"codec_type": "audio", "duration": "2.000000",
+                 "disposition": {"attached_pic": 0}},
+                {"codec_type": "video", "width": 200, "height": 200,
+                 "duration": "2.000000", "disposition": {"attached_pic": 1}}
+            ],
+            "format": {"duration": "2.000000"}
+        }"#;
+        let info = parse(cover.as_bytes()).expect("an audio file is readable");
+        assert_eq!(info.dimensions, None, "a cover is not the file's video");
+        assert!(info.has_audio);
     }
 
     #[test]
@@ -146,24 +161,6 @@ mod tests {
             parse(tagged).expect("readable").dimensions,
             Some((480, 640))
         );
-    }
-
-    #[test]
-    fn a_cover_is_not_a_video_track() {
-        // An audio file with embedded artwork: the picture rides in a video stream
-        // of its own and must not read as the file's video.
-        let document = r#"{
-            "streams": [
-                {"codec_type": "audio", "duration": "2.000000",
-                 "disposition": {"attached_pic": 0}},
-                {"codec_type": "video", "width": 200, "height": 200,
-                 "duration": "2.000000", "disposition": {"attached_pic": 1}}
-            ],
-            "format": {"duration": "2.000000"}
-        }"#;
-        let info = parse(document.as_bytes()).expect("an audio file is readable");
-        assert_eq!(info.dimensions, None);
-        assert!(info.has_audio);
     }
 
     #[test]

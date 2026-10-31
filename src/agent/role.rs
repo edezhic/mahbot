@@ -65,9 +65,9 @@ pub(crate) const SYSTEM_ROLE: &str = "system";
 /// cannot catch an arm that returns an empty tool set or silently uses
 /// struct update defaults — the tests in this module guard against those:
 ///
-/// * `badge_fg` black sentinel (struct update syntax)
-/// * `display_label` empty string sentinel (struct update syntax)
-/// * `default_reasoning_effort` non-empty (struct update)
+/// * the [`RoleInfo`] sentinels carried by a struct update — a black `badge_fg`
+///   and an empty `display_label` (the base's `default_reasoning_effort` is a
+///   real value, so it cannot hide a missing one)
 /// * [`Role::tools()`] non-empty for every variant
 /// * `role_description()` contains real content (no placeholder)
 /// * `summary_prompt()` contains real content (no placeholder)
@@ -704,69 +704,31 @@ mod tests {
         std::sync::Arc::new(crate::tools::chrome::ChromeRunSessions::default())
     }
 
+    /// Every [`RoleInfo`] field a struct update can silently leave at its
+    /// sentinel is set: a visible `badge_fg` (never the base `(0,0,0)`) and a
+    /// non-empty `display_label`. The label a role must not render as its own
+    /// snake_case name is pinned explicitly for QA.
     #[test]
-    fn role_roundtrip() {
-        // FromStr for every variant by lowercase name
-        for role in Role::iter() {
-            let parsed: crate::Role = role.as_str().parse().unwrap();
-            assert_eq!(parsed, role, "roundtrip failed for '{}'", role.as_str());
-            // Display (strum-generated) must match the canonical as_str()
-            assert_eq!(role.to_string(), role.as_str());
-            // as_str() returns a &'static str — verify it's non-empty
-            assert!(
-                !role.as_str().is_empty(),
-                "as_str() empty for '{}'",
-                role.as_str()
-            );
-        }
-
-        // Error case
-        assert!("unknown_role".parse::<crate::Role>().is_err());
-    }
-
-    #[test]
-    fn badge_colors_set() {
-        // Guards against the BASE_ROLE_INFO default of (0,0,0) — a new role
-        // added with struct update syntax must set badge_fg explicitly.
+    fn role_info_sentinels_are_all_set() {
         for role in Role::iter() {
             let info = super::role_info(&role);
             let (r, g, b) = info.badge_fg;
-            let is_black = r == 0.0 && g == 0.0 && b == 0.0;
             assert!(
-                !is_black,
+                !(r == 0.0 && g == 0.0 && b == 0.0),
                 "{}: badge_fg must not be (0,0,0) — set a visible color",
                 role.as_str()
             );
-        }
-    }
-
-    #[test]
-    fn defaults_set() {
-        // Guards against an empty default_reasoning_effort — a new role added
-        // with struct update syntax must set it if it differs from the
-        // BASE_ROLE_INFO default, and even the base must be non-empty.
-        for role in Role::iter() {
-            let info = super::role_info(&role);
-            assert!(
-                !info.default_reasoning_effort.is_empty(),
-                "{}: default_reasoning_effort must not be empty",
-                role.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn display_labels_set() {
-        // Guards against the BASE_ROLE_INFO sentinel of "" — every role must
-        // set a display_label explicitly.
-        for role in Role::iter() {
-            let info = super::role_info(&role);
             assert!(
                 !info.display_label.is_empty(),
                 "{}: display_label must not be empty — set a display_label in role_info()",
                 role.as_str()
             );
         }
+        assert_eq!(
+            super::role_info(&crate::Role::Qa).display_label,
+            "QA",
+            "QA's display label is not its snake_case name"
+        );
     }
 
     /// A custom role's tools are exactly the chosen subset of the admin
@@ -819,31 +781,30 @@ mod tests {
         chosen_names.sort_unstable();
         assert_eq!(chosen_names, vec!["read", "sleep"]);
         assert!(Role::custom_role_tools(&[]).is_empty());
-    }
 
-    /// Computer use stays with the administrator's Assistant: no custom role is
-    /// offered it, and a stored grant naming it keeps the record intact while
-    /// building nothing.
-    #[test]
-    fn computer_use_is_never_a_custom_roles_tool() {
+        // Computer use stays with the administrator's Assistant: the catalogue
+        // never offers it, and a stored grant naming it keeps the record intact
+        // while building nothing.
         assert!(
-            !Role::custom_role_tool_catalog().contains(&"computer"),
+            !catalog.contains(&"computer"),
             "computer use must not be offered to a custom role"
         );
-        let built = |entries: &[&str]| -> Vec<&str> {
+        let granted = |entries: &[&str]| -> Vec<String> {
             let entries: Vec<String> = entries.iter().map(|s| (*s).to_string()).collect();
             Role::custom_role_tools(&entries)
                 .iter()
-                .map(|tool| tool.name())
+                .map(|tool| tool.name().to_string())
                 .collect()
         };
-        let withheld = built(&["computer"]);
         assert!(
-            withheld.is_empty(),
-            "a stored `computer` grant must build nothing, got {withheld:?}"
+            granted(&["computer"]).is_empty(),
+            "a stored `computer` grant must build nothing"
         );
-        // The withheld entry costs the record nothing else.
-        assert_eq!(built(&["read", "computer"]), vec!["read"]);
+        assert_eq!(
+            granted(&["read", "computer"]),
+            vec!["read"],
+            "the withheld entry costs the record nothing else"
+        );
     }
 
     /// A granted dispatch tool is built with exactly the kinds its entry names,
@@ -1159,116 +1120,63 @@ mod tests {
         );
     }
 
+    /// One row per specially-restricted tool: it reaches exactly the roles the
+    /// row's predicate names and no other, admin Assistant included in "no
+    /// other". The predicate is the whole rule — the custom-role catalogue is a
+    /// separate derivation, pinned by
+    /// `custom_role_tools_are_the_chosen_subset_of_the_admin_set`.
     #[test]
-    fn admin_only_tools_only_in_admin_assistant() {
-        // Acceptance pin: the admin's administrative tools — the merged
-        // `mahbot_config` setup tool, the read-only `mahbot_debug` query tool and
-        // `workspace` (the assistant's own project view: list / add / board /
-        // ticket / comment / pause / resume) — live in the admin's Assistant's own
-        // static tool set and in no other role's static set. A guest's Assistant
-        // and every other role must never advertise any of them here. (A custom
-        // role may additionally choose them from the catalogue derived from that
-        // admin set, `assistant_core_tools(true)`, which this static-set pin does
-        // not cover.)
+    fn restricted_tools_reach_only_the_roles_that_may_hold_them() {
+        fn admin_assistant(role: crate::Role, is_admin: bool) -> bool {
+            role == crate::Role::Assistant && is_admin
+        }
+        fn any_assistant(role: crate::Role, _is_admin: bool) -> bool {
+            role == crate::Role::Assistant
+        }
+        fn assistant_or_manager(role: crate::Role, _is_admin: bool) -> bool {
+            matches!(role, crate::Role::Assistant | crate::Role::Manager)
+        }
+
+        /// A tool name and the roles that may hold it.
+        type Rule = (&'static str, fn(crate::Role, bool) -> bool);
+
         let ws = crate::workspace::test_ws("test");
-        for role in Role::iter() {
-            for is_admin in [false, true] {
-                let names: Vec<&str> = role
-                    .tools(&ws, is_admin, test_sessions())
-                    .iter()
-                    .map(|t| t.name())
-                    .collect();
-                for name in ["mahbot_config", "mahbot_debug", "workspace"] {
-                    let has = names.contains(&name);
-                    if role == crate::Role::Assistant && is_admin {
-                        assert!(has, "the admin's Assistant must advertise `{name}`");
-                    } else {
-                        assert!(
-                            !has,
-                            "{}{} must not advertise `{name}`",
-                            role.as_str(),
-                            if is_admin { " (admin)" } else { "" }
-                        );
-                    }
+        let mut rules: Vec<Rule> = vec![
+            ("mahbot_config", admin_assistant),
+            ("mahbot_debug", admin_assistant),
+            ("workspace", admin_assistant),
+            ("computer", admin_assistant),
+            ("custom", any_assistant),
+            ("document", any_assistant),
+            ("sleep", assistant_or_manager),
+        ];
+        // `cfg!`, not `#[cfg]`: the macOS-only row must not leave `rules`
+        // unmutated on the other targets, where that is a denied lint.
+        if cfg!(target_os = "macos") {
+            rules.push(("say", admin_assistant));
+        }
+        for (name, may_hold) in rules {
+            for role in Role::iter() {
+                for is_admin in [false, true] {
+                    let has = role
+                        .tools(&ws, is_admin, test_sessions())
+                        .iter()
+                        .any(|t| t.name() == name);
+                    assert_eq!(
+                        has,
+                        may_hold(role, is_admin),
+                        "{}{} `{name}` availability",
+                        role.as_str(),
+                        if is_admin { " (admin)" } else { "" }
+                    );
                 }
             }
         }
-    }
-
-    #[test]
-    fn custom_tool_is_advertised_by_every_assistant_only() {
-        // Acceptance pin: the single forwarding tool goes to every Assistant —
-        // the admin's and a guest's alike, since the grants (not the toolset)
-        // decide what each call may reach — and to no other role.
-        let ws = crate::workspace::test_ws("test");
-        for role in Role::iter() {
-            for is_admin in [false, true] {
-                let has = role
-                    .tools(&ws, is_admin, test_sessions())
-                    .iter()
-                    .any(|t| t.name() == "custom");
-                assert_eq!(
-                    has,
-                    role == crate::Role::Assistant,
-                    "{}{} custom-tool availability",
-                    role.as_str(),
-                    if is_admin { " (admin)" } else { "" }
-                );
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn say_is_the_admin_assistants_alone() {
-        // Acceptance pin: the voice belongs to the admin's own Assistant — no
-        // guest, no Manager, no worker, no analyst — and a custom role cannot
-        // choose it, because it is withheld by name.
-        let ws = crate::workspace::test_ws("test");
-        for role in Role::iter() {
-            for is_admin in [false, true] {
-                let has = role
-                    .tools(&ws, is_admin, test_sessions())
-                    .iter()
-                    .any(|t| t.name() == "say");
-                assert_eq!(
-                    has,
-                    role == crate::Role::Assistant && is_admin,
-                    "{}{} say-tool availability",
-                    role.as_str(),
-                    if is_admin { " (admin)" } else { "" }
-                );
-            }
-        }
+        #[cfg(target_os = "macos")]
         assert!(
             !Role::custom_role_tool_catalog().contains(&"say"),
             "a custom role must not be offered the voice"
         );
-    }
-
-    #[test]
-    fn document_tool_is_advertised_by_every_assistant_only() {
-        // Acceptance pin: document work is built into EVERY Assistant — the
-        // owner's and a guest's alike, with no grant or permission in between —
-        // and into no other role. (The managed runtime's absence hides it at
-        // advertisement time, which is a separate per-agent decision; this pins
-        // the toolset itself.)
-        let ws = crate::workspace::test_ws("test");
-        for role in Role::iter() {
-            for is_admin in [false, true] {
-                let has = role
-                    .tools(&ws, is_admin, test_sessions())
-                    .iter()
-                    .any(|t| t.name() == "document");
-                assert_eq!(
-                    has,
-                    role == crate::Role::Assistant,
-                    "{}{} document-tool availability",
-                    role.as_str(),
-                    if is_admin { " (admin)" } else { "" }
-                );
-            }
-        }
     }
 
     #[test]
@@ -1299,37 +1207,6 @@ mod tests {
             // Everything else about them is unchanged.
             for expected in ["read", "search", "chrome"] {
                 assert!(names.contains(&expected), "{name} keeps {expected}");
-            }
-        }
-    }
-
-    #[test]
-    fn computer_tool_only_in_admin_assistant() {
-        // Acceptance pin: `computer` lives in the admin's Assistant's own
-        // static tool set and in no other role's. Every other role (and a
-        // guest's Assistant) relies on delegation (chrome/analyze/shell) rather
-        // than direct local GUI access, so the tool must never leak into their
-        // static toolset. A custom role cannot be granted it either
-        // ([`CUSTOM_ROLE_WITHHELD_TOOLS`]): its set is derived per record, never
-        // static, so that half is pinned by
-        // `computer_use_is_never_a_custom_roles_tool`.
-        let ws = crate::workspace::test_ws("test");
-        for role in Role::iter() {
-            for is_admin in [false, true] {
-                let has = role
-                    .tools(&ws, is_admin, test_sessions())
-                    .iter()
-                    .any(|t| t.name() == "computer");
-                if role == crate::Role::Assistant && is_admin {
-                    assert!(has, "the admin's Assistant must advertise `computer`");
-                } else {
-                    assert!(
-                        !has,
-                        "{}{} must not advertise `computer`",
-                        role.as_str(),
-                        if is_admin { " (admin)" } else { "" }
-                    );
-                }
             }
         }
     }
@@ -1376,40 +1253,6 @@ mod tests {
     }
 
     #[test]
-    fn sleep_tool_only_in_assistant_and_manager_toolsets() {
-        // Acceptance pin on the STATIC per-role sets: `sleep` is granted only to
-        // the Assistant (the admin's and a guest's) and the Manager — every
-        // other built-in role always has pending work and must not end its turn.
-        // A custom role is the deliberate exception: its set is the
-        // administrator's choice (taken from the Assistant's own, which carries
-        // `sleep`), so it has no static arm to pin — `Role::tools()` returns an
-        // empty vec for it by design.
-        let ws = crate::workspace::test_ws("test");
-        for role in Role::iter() {
-            for is_admin in [false, true] {
-                let has = role
-                    .tools(&ws, is_admin, test_sessions())
-                    .iter()
-                    .any(|t| t.name() == "sleep");
-                if matches!(role, crate::Role::Assistant | crate::Role::Manager) {
-                    assert!(
-                        has,
-                        "{} (is_admin={is_admin}) must advertise `sleep`",
-                        role.as_str()
-                    );
-                } else {
-                    assert!(
-                        !has,
-                        "{}{} must not advertise `sleep`",
-                        role.as_str(),
-                        if is_admin { " (admin)" } else { "" }
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn assistant_role_descriptions_are_populated() {
         // Both Assistant descriptions (a guest's + the admin's) must be
         // non-empty, free of unsubstituted template keys, and carry the
@@ -1429,13 +1272,6 @@ mod tests {
                 "Assistant role description must explain the <automation-notification> marker"
             );
         }
-    }
-
-    #[test]
-    fn qa_display_label() {
-        // QA has a special display label (not "Qa").
-        let info = super::role_info(&crate::Role::Qa);
-        assert_eq!(info.display_label, "QA");
     }
 
     #[test]

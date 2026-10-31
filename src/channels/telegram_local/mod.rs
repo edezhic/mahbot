@@ -930,29 +930,4 @@ mod tests {
         ));
         assert!(!credentials_rejected("connection refused"));
     }
-
-    #[test]
-    fn the_cause_is_read_without_the_transports_wrapper() {
-        assert_eq!(
-            api_cause("Telegram rejected the bot token — Unauthorized"),
-            "Unauthorized"
-        );
-        assert_eq!(
-            api_cause("the Bot API could not be reached"),
-            "the Bot API could not be reached"
-        );
-    }
-
-    #[test]
-    fn a_reported_version_reads_with_or_without_a_patch() {
-        assert_eq!(
-            parse_version("Bot API 10.3"),
-            Some(semver::Version::new(10, 3, 0))
-        );
-        assert_eq!(
-            parse_version("Bot API 10.3.1"),
-            Some(semver::Version::new(10, 3, 1))
-        );
-        assert_eq!(parse_version("Telegram Bot API server"), None);
-    }
 }

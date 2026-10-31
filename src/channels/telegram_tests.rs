@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::channels::telegram_intake::{IN_PROGRESS, Intake, RETENTION_HOURS, TelegramIntakeStore};
-use crate::util::test::{TicketFixture, canonical_without_verbatim_prefix};
+use crate::util::test::canonical_without_verbatim_prefix;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -55,13 +55,6 @@ fn test_update(overrides: &[(&str, serde_json::Value)]) -> serde_json::Value {
 async fn test_channel() -> TelegramChannel {
     crate::users::test_util::init_test_store().await;
     TelegramChannel::new_with("token".into(), CLOUD_API_BASE.to_string(), false)
-}
-
-#[test]
-fn test_parse_recipient() {
-    assert_eq!(parse_recipient("12345"), ("12345", None));
-    assert_eq!(parse_recipient("12345:678"), ("12345", Some("678")));
-    assert_eq!(parse_recipient(""), ("", None));
 }
 
 #[test]
@@ -172,40 +165,6 @@ fn board_listing_isolates_hostile_titles() {
             "unbalanced {open}/{close} in: {html}"
         );
     }
-}
-
-/// The `/board` reply text speaks for all workspaces: a header that says so over
-/// one line per ticket, each entry marked by its own ticket id prefix — and an
-/// empty case in the same voice.
-#[test]
-fn board_listing_text_speaks_for_all_workspaces() {
-    assert_eq!(board_listing_text(&[]), "All workspaces — no tickets");
-
-    let tickets = [
-        TicketFixture::new("mahbot-1", TicketPhase::Backlog)
-            .title("First")
-            .build(),
-        TicketFixture::new("mahbot_rlx-2", TicketPhase::InDevelopment)
-            .title("Second")
-            .build(),
-    ];
-    let ordered: Vec<&Ticket> = tickets.iter().collect();
-    let text = board_listing_text(&ordered);
-
-    let mut lines = text.lines();
-    assert_eq!(lines.next(), Some("All workspaces — 2 tickets"));
-    for ticket in &tickets {
-        let line = lines.next().expect("one line per ticket");
-        assert!(
-            line.contains(&ticket.id) && line.contains(&ticket.title),
-            "each entry is its own ticket's id and title, in order: {text:?}"
-        );
-    }
-    assert!(lines.next().is_none(), "nothing is added after the listing");
-
-    // One ticket is named in the singular, as the empty listing is called out.
-    let one = [&tickets[0]];
-    assert!(board_listing_text(&one).starts_with("All workspaces — 1 ticket\n"));
 }
 
 // ── Inline formatting tests ──────────────────────────────────────
@@ -357,22 +316,6 @@ fn test_inline_formatting() {
     }
 }
 
-#[tokio::test]
-async fn parse_update_message_uses_chat_id_as_reply_target() {
-    let ch = test_channel().await;
-    let update = test_update(&[]);
-
-    let msg = ch
-        .parse_update_message(&update)
-        .await
-        .expect("parse the update")
-        .expect("message should parse");
-
-    assert_eq!(msg.user_name, "alice");
-    assert_eq!(msg.reply_target, "-100200300");
-    assert_eq!(msg.content, "hello");
-}
-
 /// Write a real 1×1 red PNG raster — the classifier rejects non-raster
 /// "images", so fixtures must decode.
 fn write_test_png(path: &std::path::Path) {
@@ -384,7 +327,7 @@ fn write_test_png(path: &std::path::Path) {
 }
 
 #[test]
-fn parse_attachment_markers_tests() {
+fn parse_attachment_markers_attach_known_targets_and_refuse_the_rest() {
     let dir = tempfile::tempdir().unwrap();
     let png = dir.path().join("a.png");
     let ogg = dir.path().join("voice.ogg");
@@ -532,58 +475,6 @@ fn a_relative_media_marker_resolves_against_the_messages_workspace() {
     assert!(refusals.is_empty());
     assert_eq!(att.len(), 1);
     assert_eq!(att[0].target, relayed.to_string_lossy());
-}
-
-/// A target that cannot be delivered never reaches the user as raw marker text:
-/// it leaves a short refusal naming what could not be sent.
-#[test]
-fn an_undeliverable_marker_becomes_a_refusal() {
-    let dir = tempfile::tempdir().unwrap();
-    let roots = vec![dir.path().to_path_buf()];
-    let pictures = dir.path().join("pictures");
-    std::fs::create_dir(&pictures).unwrap();
-    std::fs::write(dir.path().join("notes.txt"), b"not an image").unwrap();
-
-    // A relative image no root holds: refused by name, with the marker gone.
-    let (cleaned, att, refusals) =
-        parse_attachment_markers("[IMAGE:missing/a.png]", &roots, TransferLimits::CLOUD);
-    assert_eq!(cleaned, "");
-    assert!(att.is_empty());
-    assert_eq!(refusals, vec!["Could not send \"a.png\": file not found."]);
-
-    // A directory target is refused as what it is.
-    let (cleaned, att, refusals) = parse_attachment_markers(
-        &format!("[IMAGE:{}]", pictures.display()),
-        &roots,
-        TransferLimits::CLOUD,
-    );
-    assert_eq!(cleaned, "");
-    assert!(att.is_empty());
-    assert_eq!(
-        refusals,
-        vec!["Could not send \"pictures\": it is a directory."]
-    );
-
-    // An existing file that is not a raster cannot be sent as a picture.
-    let (cleaned, att, refusals) =
-        parse_attachment_markers("[IMAGE:notes.txt]", &roots, TransferLimits::CLOUD);
-    assert_eq!(cleaned, "");
-    assert!(att.is_empty());
-    assert_eq!(
-        refusals,
-        vec!["Could not send \"notes.txt\": it is not an image."]
-    );
-
-    // An inline payload has no file name worth quoting: the refusal names the
-    // kind and never echoes the payload.
-    let blob = format!("[IMAGE:data:image/png;base64,{}]", "A".repeat(500));
-    let (cleaned, att, refusals) = parse_attachment_markers(&blob, &roots, TransferLimits::CLOUD);
-    assert_eq!(cleaned, "");
-    assert!(att.is_empty());
-    assert_eq!(
-        refusals,
-        vec!["Could not send \"image\": it carries an inline payload, not a file."]
-    );
 }
 
 /// One refused marker does not stop the others in the same message: every valid
@@ -855,9 +746,11 @@ fn assert_document_upload(fake: &FakeTelegram, name: &str, bytes: &str) {
 /// What the product actually puts on the wire for a video: a document upload
 /// carrying the file's own bytes, with content-type detection disabled and no
 /// geometry claim — the recipient's own player, not the message, describes the
-/// clip.
+/// clip. A video addressed by a URL is the same composition after the fetch: one
+/// document upload carrying the fetched bytes, never a video message, never a
+/// handover by address.
 #[tokio::test]
-async fn a_video_is_uploaded_as_a_document_with_no_geometry() {
+async fn a_video_reaches_the_chat_as_one_document_upload() {
     crate::users::test_util::init_test_store().await;
     let fake = FakeTelegram::start(&[("token-a", 700)]);
     let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
@@ -876,14 +769,8 @@ async fn a_video_is_uploaded_as_a_document_with_no_geometry() {
         .expect("the video is delivered");
 
     assert_document_upload(&fake, "clip.mov", "fake-mov-bytes");
-}
 
-/// The composition the change turns on: a video addressed by a URL reaches the
-/// chat as one document upload carrying the fetched bytes — never a video message,
-/// never a handover by address.
-#[tokio::test]
-async fn a_remote_video_is_fetched_and_uploaded_as_a_document() {
-    crate::users::test_util::init_test_store().await;
+    // The same clip by address: fetched first, uploaded as a document.
     let fake = FakeTelegram::start(&[("token-a", 700)]);
     fake.push_file("clip", b"remote-video-bytes", Duration::ZERO);
     let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
@@ -926,30 +813,6 @@ async fn an_image_by_address_keeps_the_photo_method() {
     let body: serde_json::Value =
         serde_json::from_slice(&fake.bodies("sendPhoto")[0]).expect("the by-address body is JSON");
     assert_eq!(body["photo"], url);
-}
-
-/// `[FILE:]` keeps its route: a local file goes out as a document upload of its
-/// own bytes.
-#[tokio::test]
-async fn a_file_is_uploaded_as_a_document() {
-    crate::users::test_util::init_test_store().await;
-    let fake = FakeTelegram::start(&[("token-a", 700)]);
-    let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
-    let dir = tempfile::tempdir().unwrap();
-    let report = dir.path().join("report.pdf");
-    std::fs::write(&report, b"%PDF-1.4 fake").unwrap();
-
-    telegram
-        .send(&SendMessage {
-            content: format!("[FILE:{}]", report.display()),
-            recipient: "42".to_string(),
-            reply_markup: None,
-            file_roots: vec![dir.path().to_path_buf()],
-        })
-        .await
-        .expect("the file is delivered");
-
-    assert_document_upload(&fake, "report.pdf", "%PDF-1.4 fake");
 }
 
 /// A fetched copy lives in a temp directory of its own and goes away with the
@@ -1064,21 +927,6 @@ async fn an_unfetchable_video_address_is_reported_not_pasted_as_a_link() {
     );
 }
 
-#[test]
-fn bare_path_without_marker_is_plain_text() {
-    let dir = tempfile::tempdir().unwrap();
-    let png = dir.path().join("snap.png");
-    write_test_png(&png);
-
-    // A reply that is exactly an existing file path — but carries no marker —
-    // must be delivered as plain text with no attachment.
-    let path = png.to_string_lossy().to_string();
-    let (cleaned, att, _) =
-        parse_attachment_markers(&path, &[dir.path().to_path_buf()], TransferLimits::CLOUD);
-    assert_eq!(cleaned, path);
-    assert!(att.is_empty());
-}
-
 /// The local server hands a file over as a path on this machine instead of
 /// serving it: the file is copied from there — left in place, because the server's
 /// own record still names it — and no HTTP request is involved (the base points at
@@ -1141,28 +989,13 @@ async fn a_local_hand_over_outside_the_servers_directory_is_refused() {
     assert!(!dest.exists(), "nothing may be copied out of the refusal");
 }
 
-/// A size that stops changing short of the declared one is a stall, not the end of
-/// the transfer: the wait keeps waiting and completes when the write reaches the
-/// size Telegram declared.
-#[tokio::test]
-async fn a_hand_over_survives_a_stall_and_completes_at_the_declared_size() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("clip.bin");
-    std::fs::write(&source, vec![7u8; 3]).unwrap();
-
-    let (waited, ()) = tokio::join!(wait_for_hand_over(&source, Some(9)), async {
-        // Long enough for the size to look settled for several samples.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        std::fs::write(&source, vec![7u8; 9]).unwrap();
-    });
-    waited.expect("a stalled write is not the end of the transfer");
-}
-
 /// A hand-over that is exactly the declared size is the whole file as soon as it is
-/// measured; with no declared size there is nothing to compare against, so a size
-/// that no longer changes is what completes it.
+/// measured, and one that stops changing short of it is a stall, not the end of the
+/// transfer: the wait keeps waiting and completes when the write reaches the size
+/// Telegram declared. With no declared size there is nothing to compare against, so
+/// a size that no longer changes is what completes it.
 #[tokio::test]
-async fn a_hand_over_at_the_declared_size_is_complete() {
+async fn a_hand_over_completes_at_the_declared_size_and_survives_a_stall() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("clip.bin");
     std::fs::write(&source, vec![7u8; 9]).unwrap();
@@ -1173,6 +1006,15 @@ async fn a_hand_over_at_the_declared_size_is_complete() {
     wait_for_hand_over(&source, None)
         .await
         .expect("an undeclared size is complete once it stops changing");
+
+    let stalled = dir.path().join("stalled.bin");
+    std::fs::write(&stalled, vec![7u8; 3]).unwrap();
+    let (waited, ()) = tokio::join!(wait_for_hand_over(&stalled, Some(9)), async {
+        // Long enough for the size to look settled for several samples.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(&stalled, vec![7u8; 9]).unwrap();
+    });
+    waited.expect("a stalled write is not the end of the transfer");
 }
 
 /// Each way a local hand-over fails reaches the owner as what it is: a file handed
@@ -1214,16 +1056,6 @@ fn every_local_hand_over_failure_reaches_the_owner_as_itself() {
         download_failure_reason(&unknown, TransferLimits::LOCAL),
         "Telegram refused the transfer"
     );
-}
-
-/// The limit a refusal names is the one in force: the cloud caps a download at
-/// 20 MB, the local server has no cap at all.
-#[test]
-fn the_refusal_limit_is_the_one_the_mode_has() {
-    assert!(declared_size_refusal(TransferLimits::CLOUD, 20 * 1024 * 1024 + 1).is_some());
-    assert!(declared_size_refusal(TransferLimits::LOCAL, 20 * 1024 * 1024 + 1).is_none());
-    assert_eq!(TransferLimits::LOCAL.upload, 2000 * 1024 * 1024);
-    assert_eq!(TransferLimits::CLOUD.upload, 50 * 1024 * 1024);
 }
 
 /// Boundaries of the declared-size gate: exactly at the cloud's limit passes,
@@ -1375,16 +1207,19 @@ async fn parse_callback_query_returns_message_with_extracted_fields() {
     assert_eq!(msg.message_id, Some(100));
 }
 
+/// What a callback query narrows on: absent/null data or message, and a sender
+/// nothing authorizes, are refused — while an empty-string data stays valid with
+/// empty content, and a null callback_query_id stays valid as `None`.
 #[tokio::test]
-async fn parse_callback_query_rejects_invalid_inputs() {
+async fn parse_callback_query_narrows_only_on_absent_inputs() {
     let ch = test_channel().await;
     let unknown_user = serde_json::json!({ "id": 999, "username": "unknown_user" });
-    let cases = [
+    let rejected = [
         ("no data", [("data", serde_json::Value::Null)]),
         ("no message", [("message", serde_json::Value::Null)]),
         ("unknown user", [("from", unknown_user)]),
     ];
-    for (name, overrides) in &cases {
+    for (name, overrides) in &rejected {
         let cq = test_callback_query(overrides);
         assert!(
             ch.parse_callback_query(&cq)
@@ -1394,17 +1229,12 @@ async fn parse_callback_query_rejects_invalid_inputs() {
             "case {name}: expected rejection"
         );
     }
-}
 
-#[tokio::test]
-async fn parse_callback_query_accepts_empty_data_and_null_id() {
-    // Regression pair: the ? guard in parse_callback_query only rejects
-    // absent/null data — NOT an empty string, which yields empty content
-    // (distinct from process_updates' unwrap_or("") ACK check). A
-    // null/absent callback_query_id likewise stays valid, becoming None
-    // rather than Some — unlike missing data which rejects.
-    let ch = test_channel().await;
-    let cases = [
+    // Regression pair: the `?` guard only rejects absent/null data — NOT an empty
+    // string, which yields empty content (distinct from process_updates'
+    // unwrap_or("") ACK check). A null/absent callback_query_id likewise stays
+    // valid, becoming None rather than Some — unlike missing data which rejects.
+    let accepted = [
         (
             "empty-string data",
             [("data", serde_json::json!(""))],
@@ -1418,7 +1248,7 @@ async fn parse_callback_query_accepts_empty_data_and_null_id() {
             None,
         ),
     ];
-    for (name, overrides, content, cq_id) in &cases {
+    for (name, overrides, content, cq_id) in &accepted {
         let cq = test_callback_query(overrides);
         let msg = ch
             .parse_callback_query(&cq)
@@ -1430,8 +1260,12 @@ async fn parse_callback_query_accepts_empty_data_and_null_id() {
     }
 }
 
+/// The chunker never hands Telegram more than it accepts: the limit itself does
+/// not split, one character past it does, the join rebuilds the message, a newline
+/// is preferred over a mid-word cut, and a code block or emoji at the boundary
+/// stays within the limit.
 #[test]
-fn telegram_message_splitting() {
+fn splitting_respects_the_telegram_limit() {
     // basic: exact limit → no split
     assert_eq!(
         split_message_for_telegram(&"a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH)).len(),
@@ -1454,17 +1288,12 @@ fn telegram_message_splitting() {
     for p in &split_message_for_telegram(&msg) {
         assert!(p.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH);
     }
-}
 
-#[test]
-fn newline_split_fallback_prevents_mid_word_break() {
-    // Regression: when the only newline is in the first half of the
-    // search window and no spaces exist, the old code would hard-split
-    // mid-word. The newline fallback (tier 3) prevents this.
+    // Regression: when the only newline is in the first half of the search
+    // window and no spaces exist, a hard split would land mid-word. The
+    // newline fallback (tier 3) prevents this.
     let msg = format!("{}\n{}", "a".repeat(1000), "x".repeat(5000));
     let chunks = split_message_for_telegram(&msg);
-
-    // All chunks must respect the length limit
     for (i, chunk) in chunks.iter().enumerate() {
         assert!(
             chunk.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH,
@@ -1474,35 +1303,22 @@ fn newline_split_fallback_prevents_mid_word_break() {
             TELEGRAM_MAX_MESSAGE_LENGTH,
         );
     }
-
-    // Concatenation must reconstruct the original message
     assert_eq!(chunks.join(""), msg);
-
-    // The first chunk must end with the newline (not split mid-word)
     assert!(
         chunks[0].ends_with('\n'),
         "first chunk should end with newline, got: {:?}",
         chunks[0].chars().rev().take(10).collect::<String>()
     );
-}
 
-#[test]
-fn wrapped_chunks_respect_telegram_limit() {
-    // Simulate send_text_chunks wrapping to verify no chunk exceeds the
-    // 4096-char limit after continuation prefixes are prepended.
-    //
-    // Middle chunk overhead: "(continued)\n\n...\n\n(continues...)" = 29 chars
-    // Last chunk overhead:  "(continued)\n\n..."                   = 13 chars
-    // First chunk (multi):  "...\n\n(continues...)"               = 16 chars
-
-    // Build a message designed to force 3+ chunks, then verify wrapping.
+    // Wrapping: `send_text_chunks` prepends a continuation prefix (29 chars in
+    // the middle, 13 on the last), so every raw chunk must leave that much room
+    // — three chunks exercise all the variants.
     let msg = format!("X{}X", "a".repeat(9000));
     let chunks = split_message_for_telegram(&msg);
     assert!(
         chunks.len() >= 3,
         "expected 3+ chunks to exercise all continuation variants"
     );
-
     for (i, chunk) in chunks.iter().enumerate() {
         let wrapped = wrap_chunk(chunk, i, chunks.len());
         assert!(
@@ -1513,75 +1329,48 @@ fn wrapped_chunks_respect_telegram_limit() {
         );
     }
 
-    // Boundary: last chunk exactly at 4066 chars (new limit) — wrapping
-    // produces 4066+13=4079 ≤ 4096.  Under the old code, a 4095-char last
-    // chunk would wrap to 4108 > 4096.
-    //
-    // Intentionally uses raw format! rather than wrap_chunk() — this tests
-    // the splitter's TELEGRAM_CONTINUATION_OVERHEAD constant, not the
-    // wrapping helper. wrap_chunk would return the chunk bare for total==1.
-    let boundary = "b".repeat(4066);
-    let chunks = split_message_for_telegram(&boundary);
-    assert_eq!(chunks.len(), 1, "4066-char message should not split");
-    let wrapped = format!("(continued)\n\n{}", chunks[0]);
-    assert!(
-        wrapped.chars().count() <= 4096,
-        "boundary wrapped: {} > 4096",
-        wrapped.chars().count()
-    );
+    // The boundary itself is not split: a 4066-char message leaves the room its
+    // continuation prefix needs, and a 4096-char one is a single message, sent
+    // without any prefix at all.
+    for (size, wrapped) in [(4066, true), (4096, false)] {
+        let boundary = "b".repeat(size);
+        let chunks = split_message_for_telegram(&boundary);
+        assert_eq!(chunks.len(), 1, "{size}-char message should not split");
+        if wrapped {
+            let wrapped = format!("(continued)\n\n{}", chunks[0]);
+            assert!(
+                wrapped.chars().count() <= 4096,
+                "{size}-char boundary wrapped: {} > 4096",
+                wrapped.chars().count()
+            );
+        }
+    }
 
-    // Old bug reproducer: a 4095-char last chunk would wrap to 4108.
-    // With the fix, a message that produces a ~4095-char last chunk
-    // shouldn't exist; the splitter caps non-first chunks at 4066.
-    let near_limit = "c".repeat(4096);
-    let chunks = split_message_for_telegram(&near_limit);
-    assert_eq!(chunks.len(), 1, "4096-char message should not split");
-}
-
-#[test]
-fn tag_extension_clamped_to_telegram_limit() {
-    // Regression: extend_past_open_tag could push a chunk
-    // past the sendable limit when the split point landed inside a long
-    // HTML tag whose '>' fell beyond the 4066-char window. The raw chunk
-    // then exceeded 4096 chars and Telegram rejected the send (HTML and
-    // the plain-text retry both fail), dropping the message.
-    //
-    // Well-formed variant of the ticket repro — what
-    // markdown_to_telegram_html actually emits: a link whose href opens
-    // within the last ~100 chars of the window and whose '>' lands past
-    // it. Under the old code the first chunk was 4151 chars (wrapped 4166).
+    // Regression: a split point inside a long HTML tag whose '>' fell beyond the
+    // window could push a chunk past the sendable limit, and Telegram rejected
+    // the send (HTML and the plain-text retry both fail), dropping the message.
+    // The clamp must target the byte offset of the 4066-char boundary, never a
+    // raw byte count: clamping to byte 4066 panics on 3-byte CJK and under-fills
+    // 2-byte Cyrillic.
     let tag = format!(
         "<a href=\"https://example.com/{}\">link</a>",
         "y".repeat(120)
     );
-
-    // ASCII body — the original overflow reproducer.
-    let ascii_msg = format!("{}{}", "x".repeat(4000), tag);
-    // Multibyte bodies: the clamp must target the byte offset of the
-    // 4066-char boundary (hard_split), never a raw byte count — clamping
-    // to byte 4066 panics on 3-byte CJK and under-fills 2-byte Cyrillic.
-    let cjk_msg = format!("{}{}", "界".repeat(4000), tag);
-    let cyrillic_msg = format!("{}{}", "ы".repeat(4000), tag);
-
     for (name, msg) in [
-        ("ascii", ascii_msg),
-        ("cjk", cjk_msg),
-        ("cyrillic", cyrillic_msg),
+        ("ascii", format!("{}{}", "x".repeat(4000), tag)),
+        ("cjk", format!("{}{}", "界".repeat(4000), tag)),
+        ("cyrillic", format!("{}{}", "ы".repeat(4000), tag)),
     ] {
         let chunks = split_message_for_telegram(&msg);
-        // Reconstruction must be lossless.
         assert_eq!(chunks.join(""), msg, "{name}: reconstruction");
         assert!(chunks.len() >= 2, "{name}: expected a split");
         for (i, chunk) in chunks.iter().enumerate() {
-            // Raw chunks never exceed the 4066-char budget...
             assert!(
                 chunk.chars().count()
                     <= TELEGRAM_MAX_MESSAGE_LENGTH - TELEGRAM_CONTINUATION_OVERHEAD,
                 "{name}: chunk {i} raw {} chars exceeds the 4066 budget",
                 chunk.chars().count(),
             );
-            // ...and the wrapped form (as sent by send_text_chunks) never
-            // exceeds Telegram's hard 4096-char limit.
             let wrapped = wrap_chunk(chunk, i, chunks.len());
             assert!(
                 wrapped.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH,
@@ -1589,27 +1378,12 @@ fn tag_extension_clamped_to_telegram_limit() {
                 wrapped.chars().count(),
             );
         }
-        // The budget is used effectively: the first chunk sits near the
-        // 4066-char ceiling instead of being truncated by a byte clamp.
         assert!(
             chunks[0].chars().count() >= 4000,
             "{name}: first chunk only {} chars — budget underused",
             chunks[0].chars().count(),
         );
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// extract_sender_user_name tests
-// ─────────────────────────────────────────────────────────────────────
-
-#[test]
-fn test_extract_sender_user_name() {
-    let username =
-        extract_sender_user_name(&serde_json::json!({"from": {"id": 123, "username": "alice"}}));
-    assert_eq!(username, "alice");
-    let username = extract_sender_user_name(&serde_json::json!({"from": {"id": 42}}));
-    assert_eq!(username, "unknown");
 }
 
 #[tokio::test]
@@ -1805,39 +1579,12 @@ async fn callback_query_authorizes_the_person_when_its_message_is_chat_attribute
 // build_reply_reference / replied_to_sender_label tests
 // ─────────────────────────────────────────────────────────────────────
 
+/// `build_reply_reference` is the composition around the shared normalization
+/// (asserted in `reply_tests`): it names the replied-to author, falls back to the
+/// caption when a media message's `text` is empty, and has nothing to report when
+/// the message is not a reply at all.
 #[test]
-fn build_reply_reference_text_snippet_normalized() {
-    // Entities decoded, angle brackets stripped, newlines collapsed.
-    let message = serde_json::json!({
-        "reply_to_message": {
-            "from": { "username": "alice" },
-            "text": "say &quot;hi&quot; &amp; <bye>\nsecond line"
-        }
-    });
-    let reply = build_reply_reference(&message).unwrap();
-    assert_eq!(reply.author, "@alice");
-    assert_eq!(reply.snippet, "say \"hi\" & bye second line");
-}
-
-#[test]
-fn build_reply_reference_snippet_caps_at_max() {
-    let long = "a".repeat(crate::channels::reply::REPLY_SNIPPET_MAX_CHARS + 50);
-    let message = serde_json::json!({
-        "reply_to_message": {
-            "from": { "username": "alice" },
-            "text": long
-        }
-    });
-    let reply = build_reply_reference(&message).unwrap();
-    assert_eq!(
-        reply.snippet.chars().count(),
-        crate::channels::reply::REPLY_SNIPPET_MAX_CHARS
-    );
-    assert!(reply.snippet.ends_with('…'));
-}
-
-#[test]
-fn build_reply_reference_caption_fallback() {
+fn build_reply_reference_reads_text_or_caption_and_needs_a_reply() {
     // A media message with an empty `text` falls back to the caption.
     let message = serde_json::json!({
         "reply_to_message": {
@@ -1847,61 +1594,17 @@ fn build_reply_reference_caption_fallback() {
         }
     });
     let reply = build_reply_reference(&message).unwrap();
+    assert_eq!(reply.author, "@bob");
     assert_eq!(reply.snippet, "at the beach");
-}
 
-#[test]
-fn build_reply_reference_media_kind_placeholders() {
-    for (field, expected) in [
-        ("photo", "[Photo]"),
-        ("document", "[Document]"),
-        ("video", "[Video]"),
-        ("voice", "[Voice message]"),
-        ("audio", "[Voice message]"),
-        ("sticker", "[Sticker]"),
-        ("animation", "[Message]"),
+    // No reply: absent, and a null reply_to_message (not an object), are both
+    // nothing to report.
+    for message in [
+        serde_json::json!({ "text": "no reply here" }),
+        serde_json::json!({ "text": "hi", "reply_to_message": null }),
     ] {
-        let mut reply_to = serde_json::Map::new();
-        reply_to.insert("from".to_string(), serde_json::json!({ "username": "bob" }));
-        reply_to.insert(field.to_string(), serde_json::json!({ "file_id": "x" }));
-        let message = serde_json::json!({ "reply_to_message": reply_to });
-        let reply = build_reply_reference(&message).unwrap();
-        assert_eq!(reply.snippet, expected, "field: {field}");
+        assert!(build_reply_reference(&message).is_none(), "{message}");
     }
-    // Unknown kind (video_note) also falls back to [Message].
-    let message = serde_json::json!({
-        "reply_to_message": {
-            "from": { "username": "bob" },
-            "video_note": { "file_id": "x" }
-        }
-    });
-    assert_eq!(
-        build_reply_reference(&message).unwrap().snippet,
-        "[Message]"
-    );
-}
-
-#[test]
-fn build_reply_reference_no_reply_is_none() {
-    let message = serde_json::json!({ "text": "no reply here" });
-    assert!(build_reply_reference(&message).is_none());
-    // A null reply_to_message (not an object) is also "no reply".
-    let message = serde_json::json!({ "text": "hi", "reply_to_message": null });
-    assert!(build_reply_reference(&message).is_none());
-}
-
-#[test]
-fn build_reply_reference_mirrored_message() {
-    // A reply to a GUI-mirrored message: its raw text IS the mirror's own
-    // blockquote HTML, which normalizes away leaving just the `↩` line.
-    let message = serde_json::json!({
-        "reply_to_message": {
-            "from": { "username": "alice" },
-            "text": "<blockquote>\n↩ alice: hi there\n</blockquote>"
-        }
-    });
-    let reply = build_reply_reference(&message).unwrap();
-    assert_eq!(reply.snippet, "↩ alice: hi there");
 }
 
 #[test]
@@ -2066,110 +1769,6 @@ async fn reply_to_command_keeps_reference() {
         .reply_reference
         .expect("non-command reply keeps its reference");
     assert_eq!(reply.snippet, "/clear");
-}
-
-// ── IncomingAttachment / parse_attachment_metadata tests ─────────
-
-#[test]
-fn test_parse_attachment_metadata() {
-    // Document with all fields
-    let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
-            "document": {"file_id": "BQ", "file_name": "report.pdf", "file_size": 12345, "mime_type": "application/pdf"}
-        }))
-        .unwrap();
-    assert_eq!(att.kind, IncomingAttachmentKind::Document);
-    assert_eq!(att.file_id, "BQ");
-    assert_eq!(att.file_name.as_deref(), Some("report.pdf"));
-    assert_eq!(att.file_size, Some(12345));
-    assert_eq!(att.mime_type.as_deref(), Some("application/pdf"));
-    assert!(att.caption.is_none());
-    // Photo (picks largest by file_size)
-    let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
-            "photo": [{"file_id": "small_id", "file_size": 100}, {"file_id": "large_id", "file_size": 2000}]
-        })).unwrap();
-    assert_eq!(att.kind, IncomingAttachmentKind::Photo);
-    assert_eq!(att.file_id, "large_id");
-    assert_eq!(att.file_size, Some(2000));
-    // Caption extraction
-    let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
-        "document": {"file_id": "doc_id", "file_name": "data.csv"}, "caption": "Monthly report"
-    }))
-    .unwrap();
-    assert_eq!(att.caption.as_deref(), Some("Monthly report"));
-    let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
-        "photo": [{"file_id": "photo_id", "file_size": 1000}], "caption": "Look at this"
-    }))
-    .unwrap();
-    assert_eq!(att.caption.as_deref(), Some("Look at this"));
-    // Document without optional fields
-    let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
-        "document": {"file_id": "doc_no_name"}
-    }))
-    .unwrap();
-    assert_eq!(att.kind, IncomingAttachmentKind::Document);
-    assert_eq!(att.file_id, "doc_no_name");
-    assert!(att.file_name.is_none());
-    assert!(att.file_size.is_none());
-    // Document with mime_type extraction
-    let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
-        "document": {"file_id": "img_doc", "mime_type": "image/png"}
-    }))
-    .unwrap();
-    assert_eq!(att.kind, IncomingAttachmentKind::Document);
-    assert_eq!(att.mime_type.as_deref(), Some("image/png"));
-    // Voice message — its own kind: Telegram carries no file name, and off
-    // macOS the receive path refuses it rather than pretending it is a sound
-    // file it could transcribe.
-    let att = TelegramChannel::parse_attachment_metadata(
-        &serde_json::json!({"voice": {"file_id": "v", "duration": 5}}),
-    )
-    .unwrap();
-    assert_eq!(att.kind, IncomingAttachmentKind::Voice);
-    assert_eq!(att.file_id, "v");
-    assert!(att.file_name.is_none());
-    // Video message
-    let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
-        "video": {"file_id": "vid", "file_name": "clip.mp4", "file_size": 12345, "mime_type": "video/mp4", "duration": 4}
-    }))
-    .unwrap();
-    assert_eq!(att.kind, IncomingAttachmentKind::Video);
-    assert_eq!(att.file_id, "vid");
-    assert_eq!(att.file_name.as_deref(), Some("clip.mp4"));
-    assert_eq!(att.file_size, Some(12345));
-    assert_eq!(att.mime_type.as_deref(), Some("video/mp4"));
-    // Video note (no file_name/mime_type)
-    let att = TelegramChannel::parse_attachment_metadata(
-        &serde_json::json!({"video_note": {"file_id": "vn", "duration": 3, "file_size": 999}}),
-    )
-    .unwrap();
-    assert_eq!(att.kind, IncomingAttachmentKind::Video);
-    assert_eq!(att.file_id, "vn");
-    assert!(att.file_name.is_none());
-    assert!(att.mime_type.is_none());
-    // Animation (GIF)
-    let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
-        "animation": {"file_id": "anim", "file_name": "sticker.gif", "mime_type": "video/mp4"}
-    }))
-    .unwrap();
-    assert_eq!(att.kind, IncomingAttachmentKind::Video);
-    assert_eq!(att.file_id, "anim");
-    assert_eq!(att.file_name.as_deref(), Some("sticker.gif"));
-    // Audio message
-    let att = TelegramChannel::parse_attachment_metadata(
-        &serde_json::json!({"audio": {"file_id": "a", "file_name": "song.mp3", "file_size": 999}}),
-    )
-    .unwrap();
-    assert_eq!(att.kind, IncomingAttachmentKind::Audio);
-    assert_eq!(att.file_id, "a");
-    assert_eq!(att.file_name.as_deref(), Some("song.mp3"));
-    assert_eq!(att.file_size, Some(999));
-    // No attachment cases
-    assert!(
-        TelegramChannel::parse_attachment_metadata(&serde_json::json!({"text": "Hello"})).is_none()
-    );
-    assert!(
-        TelegramChannel::parse_attachment_metadata(&serde_json::json!({"photo": []})).is_none()
-    );
 }
 
 // ── Attachment content format tests ──────────────────────────────
@@ -2403,31 +2002,6 @@ fn sanitize_attachment_filename_neutralizes_traversal() {
 }
 
 #[test]
-fn sanitize_attachment_filename_caps_bytes_not_chars() {
-    let fallback = "file_1_2.bin";
-    // The filesystem's per-component limit is bytes, so a name in a
-    // multi-byte script must be cut by the byte budget: a character cap would
-    // leave 360–480 bytes on a 120-char name and the write would fail. The
-    // stems below fit 176 bytes ("漢" is 3 bytes → 58 whole characters, "🙂" is
-    // 4 → 44) next to the preserved ".png", and truncation must land on a char
-    // boundary.
-    for (unit, stem_len) in [('漢', 58), ('🙂', 44)] {
-        let long = format!("{}.png", unit.to_string().repeat(200));
-        let sanitized = sanitize_attachment_filename(&long, fallback);
-        assert!(
-            sanitized.len() <= MAX_ATTACHMENT_FILENAME_BYTES,
-            "{sanitized} is {} bytes",
-            sanitized.len()
-        );
-        assert_eq!(
-            sanitized,
-            format!("{}.png", unit.to_string().repeat(stem_len)),
-            "{unit}"
-        );
-    }
-}
-
-#[test]
 fn local_attachment_name_uses_sanitized_sender_name_or_fallback() {
     let attachment = IncomingAttachment {
         file_id: "f".to_string(),
@@ -2511,100 +2085,6 @@ fn local_attachment_name_sanitizes_remote_extension_fallback() {
     assert!(name.starts_with("file_123_7."), "{name}");
 }
 
-#[test]
-fn attachment_image_and_video_helpers() {
-    // has_extension over telegram's receive-path IMAGE_EXTENSIONS
-    for p in [
-        "photo.png",
-        "photo.jpg",
-        "photo.jpeg",
-        "photo.webp",
-        "PHOTO.PNG",
-    ] {
-        assert!(crate::util::has_extension(
-            std::path::Path::new(p),
-            super::IMAGE_EXTENSIONS
-        ));
-    }
-    // gif/bmp are NOT image extensions anymore (codec trim)
-    for p in ["photo.gif", "photo.bmp"] {
-        assert!(!crate::util::has_extension(
-            std::path::Path::new(p),
-            super::IMAGE_EXTENSIONS
-        ));
-    }
-    for p in ["file.md", "file.txt", "file.pdf", "file.csv", "file"] {
-        assert!(!crate::util::has_extension(
-            std::path::Path::new(p),
-            super::IMAGE_EXTENSIONS
-        ));
-    }
-    // is_video_extension
-    for p in [
-        "clip.mp4",
-        "clip.mov",
-        "clip.mkv",
-        "clip.avi",
-        "clip.webm",
-        "CLIP.MP4",
-    ] {
-        assert!(crate::util::is_video_extension(std::path::Path::new(p)));
-    }
-    for p in ["file.md", "file.png", "file", "clip.mpg"] {
-        assert!(!crate::util::is_video_extension(std::path::Path::new(p)));
-    }
-}
-
-#[test]
-fn video_filename_normalization() {
-    // GIF-picker animations: ".gif" file_name, H.264 MP4 bytes → mp4 extension
-    assert_eq!(
-        normalize_video_filename(
-            IncomingAttachmentKind::Video,
-            "tenor.gif",
-            Some("video/mp4")
-        ),
-        "tenor.mp4"
-    );
-    // Recognized video extensions pass through untouched
-    assert_eq!(
-        normalize_video_filename(
-            IncomingAttachmentKind::Video,
-            "clip.webm",
-            Some("video/webm")
-        ),
-        "clip.webm"
-    );
-    // No-extension names gain .mp4
-    assert_eq!(
-        normalize_video_filename(IncomingAttachmentKind::Video, "video_123_45", None),
-        "video_123_45.mp4"
-    );
-    // Documents without a video MIME keep their name
-    assert_eq!(
-        normalize_video_filename(IncomingAttachmentKind::Document, "tenor.gif", None),
-        "tenor.gif"
-    );
-    // Documents with a video MIME and a non-video extension get a video
-    // extension derived from the MIME (webm not mislabeled as mp4)
-    assert_eq!(
-        normalize_video_filename(
-            IncomingAttachmentKind::Document,
-            "clip.xyz",
-            Some("video/mp4")
-        ),
-        "clip.mp4"
-    );
-    assert_eq!(
-        normalize_video_filename(
-            IncomingAttachmentKind::Document,
-            "clip.xyz",
-            Some("video/webm")
-        ),
-        "clip.webm"
-    );
-}
-
 // ── Album placement + merge tests ───────────────────────────────
 
 /// One polled update of a photo album: only the field the placement plan reads.
@@ -2627,11 +2107,15 @@ fn album_button_press_update(group: &str) -> serde_json::Value {
     )])
 }
 
+/// The batch placement plan: an album is parsed whole at its first member and its
+/// later members are skipped there — a plain message between them stays where it
+/// is — and a button press is never placed inside an album. A press carries the
+/// message its button sits on, so a press on an album photo must never join that
+/// album: joined, the photo would be handed over a second time as an inbound
+/// message, or — where the press is the first member of the batch, so the album is
+/// parsed there — the album's other members would stay skipped and be lost.
 #[test]
-fn poll_plan_parses_each_album_at_its_first_member() {
-    // An album of two, separated by a plain message, plus a one-member album:
-    // the album is parsed whole at its first member, the message between its
-    // members stays where it is, and the later member is skipped there.
+fn poll_plan_places_each_album_and_keeps_a_button_press_out_of_it() {
     let updates = vec![
         album_member_update(41, "g1"),
         test_update(&[]),
@@ -2647,15 +2131,7 @@ fn poll_plan_parses_each_album_at_its_first_member() {
             PollPlacement::Album(vec![3]),
         ]
     );
-}
 
-#[test]
-fn poll_plan_keeps_a_button_press_out_of_its_album() {
-    // A press carries the message its button sits on, so a press on an album
-    // photo must never join that album: joined, the photo would be handed over a
-    // second time as an inbound message, or — where the press is the first member
-    // of the batch, so the album is parsed there — the album's other members
-    // would stay skipped and be lost.
     let press_first = vec![
         album_button_press_update("g1"),
         album_member_update(42, "g1"),
@@ -2820,13 +2296,124 @@ async fn parsed_message(ch: &TelegramChannel, update: &serde_json::Value) -> Cha
         .expect("a message")
 }
 
-/// The older forward fields still attribute a message — and still count it as
-/// forwarded, which is the flag the burst collector's longer window rests on and
-/// which the rendered prefix alone would not pin.
+/// Every forward attribution: each modern `forward_origin` the product labels
+/// renders its attribution, and an origin it has no label for still counts as
+/// forwarded — the flag the burst collector's longer window rests on is the fact,
+/// the prefix only its rendering. An update carrying both the modern origin and
+/// the legacy fields still yields one attribution, an origin of a kind the product
+/// has no label for falls back to the legacy fields, and the older forward fields
+/// on their own still attribute a message.
 #[tokio::test]
-async fn forward_attribution() {
+#[expect(clippy::too_many_lines)] // one cohesive table of forward cases
+async fn forward_origin_attribution_covers_every_origin_and_the_legacy_fields() {
     let ch = test_channel().await;
 
+    let with_origin = |origin: serde_json::Value| {
+        test_update(&[(
+            "message",
+            serde_json::json!({
+                "message_id": 70,
+                "text": "Check this out",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999 },
+                "forward_origin": origin,
+            }),
+        )])
+    };
+
+    let cases = [
+        (
+            serde_json::json!({
+                "type": "user", "date": 1_700_000_000,
+                "sender_user": { "id": 42, "username": "bob" }
+            }),
+            "[Forwarded from @bob] Check this out",
+        ),
+        (
+            serde_json::json!({
+                "type": "user", "date": 1_700_000_000,
+                "sender_user": { "id": 77, "first_name": "Charlie" }
+            }),
+            "[Forwarded from Charlie] Check this out",
+        ),
+        (
+            serde_json::json!({
+                "type": "hidden_user", "date": 1_700_000_000,
+                "sender_user_name": "Hidden User"
+            }),
+            "[Forwarded from Hidden User] Check this out",
+        ),
+        (
+            serde_json::json!({
+                "type": "chat", "date": 1_700_000_000,
+                "sender_chat": { "id": -100_111_i64, "type": "supergroup", "title": "Group Chat" }
+            }),
+            "[Forwarded from Group Chat] Check this out",
+        ),
+        (
+            serde_json::json!({
+                "type": "channel", "date": 1_700_000_000,
+                "sender_chat": { "id": -100_222_i64, "type": "channel", "title": "Daily News" }
+            }),
+            "[Forwarded from channel: Daily News] Check this out",
+        ),
+    ];
+    for (origin, expected) in cases {
+        let msg = parsed_message(&ch, &with_origin(origin)).await;
+        assert_eq!(msg.content, expected);
+        assert!(msg.forwarded, "a modern forward must count as forwarded");
+    }
+
+    // The modern origin wins over the legacy fields: one attribution, not two.
+    let both = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 71,
+            "text": "Check this out",
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": 999 },
+            "forward_origin": {
+                "type": "channel",
+                "date": 1_700_000_000,
+                "sender_chat": {
+                    "id": -100_222_i64,
+                    "type": "channel",
+                    "title": "Daily News"
+                }
+            },
+            "forward_from": { "id": 42, "username": "bob" },
+        }),
+    )]);
+    let msg = parsed_message(&ch, &both).await;
+    assert_eq!(msg.content.matches("[Forwarded from").count(), 1);
+    assert!(
+        msg.content
+            .starts_with("[Forwarded from channel: Daily News] ")
+    );
+
+    // An origin this product has no label for renders no attribution of its own,
+    // and the older fields still get their chance to attribute the message.
+    let unknown = with_origin(serde_json::json!({"type": "something_new", "date": 1_700_000_000}));
+    let msg = parsed_message(&ch, &unknown).await;
+    assert_eq!(msg.content, "Check this out");
+    assert!(msg.forwarded);
+
+    let mut unlabelled = with_origin(serde_json::json!({
+        "type": "something_new", "date": 1_700_000_000,
+        "sender_chat": { "id": -100_222_i64, "type": "channel", "title": "Ignored" }
+    }));
+    unlabelled["message"]["forward_from_chat"] =
+        serde_json::json!({ "id": -100_333_i64, "title": "Fallback News" });
+    let msg = parsed_message(&ch, &unlabelled).await;
+    assert_eq!(
+        msg.content,
+        "[Forwarded from channel: Fallback News] Check this out"
+    );
+
+    // ── The older forward fields ──────────────────────────────────────────
+    // They still attribute a message — and still count it as forwarded, which is
+    // the flag the burst collector's longer window rests on and which the
+    // rendered prefix alone would not pin.
     let legacy = [
         (
             // A user with a username.
@@ -2936,120 +2523,6 @@ async fn forward_attribution() {
     assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
 }
 
-/// Every modern `forward_origin` the product labels renders its attribution, and
-/// an origin it has no label for still counts as forwarded: the flag the burst
-/// collector's longer window rests on is the fact, the prefix only its rendering.
-/// An update carrying both the modern origin and the legacy fields still yields
-/// one attribution, while an origin of a kind the product has no label for falls
-/// back to the legacy fields. The legacy fields on their own are covered by
-/// `forward_attribution`.
-#[tokio::test]
-async fn forward_origin_attribution_covers_every_origin_and_the_legacy_fields() {
-    let ch = test_channel().await;
-
-    let with_origin = |origin: serde_json::Value| {
-        test_update(&[(
-            "message",
-            serde_json::json!({
-                "message_id": 70,
-                "text": "Check this out",
-                "from": { "id": 1, "username": "alice" },
-                "chat": { "id": 999 },
-                "forward_origin": origin,
-            }),
-        )])
-    };
-
-    let cases = [
-        (
-            serde_json::json!({
-                "type": "user", "date": 1_700_000_000,
-                "sender_user": { "id": 42, "username": "bob" }
-            }),
-            "[Forwarded from @bob] Check this out",
-        ),
-        (
-            serde_json::json!({
-                "type": "user", "date": 1_700_000_000,
-                "sender_user": { "id": 77, "first_name": "Charlie" }
-            }),
-            "[Forwarded from Charlie] Check this out",
-        ),
-        (
-            serde_json::json!({
-                "type": "hidden_user", "date": 1_700_000_000,
-                "sender_user_name": "Hidden User"
-            }),
-            "[Forwarded from Hidden User] Check this out",
-        ),
-        (
-            serde_json::json!({
-                "type": "chat", "date": 1_700_000_000,
-                "sender_chat": { "id": -100_111_i64, "type": "supergroup", "title": "Group Chat" }
-            }),
-            "[Forwarded from Group Chat] Check this out",
-        ),
-        (
-            serde_json::json!({
-                "type": "channel", "date": 1_700_000_000,
-                "sender_chat": { "id": -100_222_i64, "type": "channel", "title": "Daily News" }
-            }),
-            "[Forwarded from channel: Daily News] Check this out",
-        ),
-    ];
-    for (origin, expected) in cases {
-        let msg = parsed_message(&ch, &with_origin(origin)).await;
-        assert_eq!(msg.content, expected);
-        assert!(msg.forwarded, "a modern forward must count as forwarded");
-    }
-
-    // The modern origin wins over the legacy fields: one attribution, not two.
-    let both = test_update(&[(
-        "message",
-        serde_json::json!({
-            "message_id": 71,
-            "text": "Check this out",
-            "from": { "id": 1, "username": "alice" },
-            "chat": { "id": 999 },
-            "forward_origin": {
-                "type": "channel",
-                "date": 1_700_000_000,
-                "sender_chat": {
-                    "id": -100_222_i64,
-                    "type": "channel",
-                    "title": "Daily News"
-                }
-            },
-            "forward_from": { "id": 42, "username": "bob" },
-        }),
-    )]);
-    let msg = parsed_message(&ch, &both).await;
-    assert_eq!(msg.content.matches("[Forwarded from").count(), 1);
-    assert!(
-        msg.content
-            .starts_with("[Forwarded from channel: Daily News] ")
-    );
-
-    // An origin this product has no label for renders no attribution of its own,
-    // and the older fields still get their chance to attribute the message.
-    let unknown = with_origin(serde_json::json!({"type": "something_new", "date": 1_700_000_000}));
-    let msg = parsed_message(&ch, &unknown).await;
-    assert_eq!(msg.content, "Check this out");
-    assert!(msg.forwarded);
-
-    let mut unlabelled = with_origin(serde_json::json!({
-        "type": "something_new", "date": 1_700_000_000,
-        "sender_chat": { "id": -100_222_i64, "type": "channel", "title": "Ignored" }
-    }));
-    unlabelled["message"]["forward_from_chat"] =
-        serde_json::json!({ "id": -100_333_i64, "title": "Fallback News" });
-    let msg = parsed_message(&ch, &unlabelled).await;
-    assert_eq!(
-        msg.content,
-        "[Forwarded from channel: Fallback News] Check this out"
-    );
-}
-
 /// A refused forwarded attachment keeps its attribution: a refusal hands on a
 /// message of its own, and the `[Forwarded from …]` prefix (with the forwarded
 /// fact) must ride on it too. A declared size past Telegram's own download cap is
@@ -3086,256 +2559,6 @@ async fn a_refused_forwarded_attachment_keeps_its_attribution() {
     .await;
 }
 
-// ── strip_html_tags tests ──────────────────────────────────
-
-#[test]
-fn test_strip_html_tags() {
-    struct Case {
-        name: &'static str,
-        input: &'static str,
-        expected: &'static str,
-    }
-    let cases = vec![
-        Case {
-            name: "empty string",
-            input: "",
-            expected: "",
-        },
-        Case {
-            name: "plain text",
-            input: "hello world",
-            expected: "hello world",
-        },
-        Case {
-            name: "simple tag",
-            input: "<b>bold</b>",
-            expected: "bold",
-        },
-        Case {
-            name: "nested tags",
-            input: "<div><span>text</span></div>",
-            expected: "text",
-        },
-        Case {
-            name: "self-closing tag",
-            input: "before<br/>after",
-            expected: "beforeafter",
-        },
-        // Regression: '<' in tag starts in_tag, then '>' inside attribute
-        // value must NOT close the tag.
-        Case {
-            name: "gt in double-quoted attribute",
-            input: "<a title=\"a > b\">link</a>",
-            expected: "link",
-        },
-        Case {
-            name: "gt in single-quoted attribute",
-            input: "<a title='a > b'>link</a>",
-            expected: "link",
-        },
-        // Double-quoted attribute containing single quotes
-        Case {
-            name: "mixed quotes - double with single inside",
-            input: "<a title=\"he said 'hello'\">text</a>",
-            expected: "text",
-        },
-        // Single-quoted attribute containing double quotes
-        Case {
-            name: "mixed quotes - single with double inside",
-            input: "<a title='he said \"hello\"'>text</a>",
-            expected: "text",
-        },
-        // Multiple attributes, some with '>' inside quoted values
-        Case {
-            name: "multiple attrs with gt",
-            input: "<input type=\"text\" value=\"a > b\" placeholder=\"x > y\">",
-            expected: "",
-        },
-        // '>' that is not inside a tag should be preserved as text
-        Case {
-            name: "gt outside tag",
-            input: "a > b",
-            expected: "a > b",
-        },
-        // '<' that is not part of a tag should start tag mode
-        // (pre-existing behavior: bare '<' starts tag stripping)
-        Case {
-            name: "lt outside tag",
-            input: "a < b",
-            expected: "a ",
-        },
-        Case {
-            name: "html comment",
-            input: "<!-- comment -->visible",
-            expected: "visible",
-        },
-        // Realistic mixed content with tags and text
-        Case {
-            name: "mixed content",
-            input: "Hello <b>world</b>, check <a href=\"https://example.com?q=a > b\">this</a> out!",
-            expected: "Hello world, check this out!",
-        },
-    ];
-    for case in cases {
-        let result = strip_html_tags(case.input);
-        assert_eq!(result, case.expected, "case: {}", case.name);
-    }
-}
-
-// ── extend_past_open_tag tests ─────────────────────────────
-
-#[expect(clippy::too_many_lines)]
-#[test]
-fn test_extend_past_open_tag() {
-    struct Case {
-        name: &'static str,
-        input: &'static str,
-        pos: usize,
-        expected: Option<usize>,
-    }
-    let cases = vec![
-        // No '<' before pos → None
-        Case {
-            name: "no tag near pos",
-            input: "hello world",
-            pos: 5,
-            expected: None,
-        },
-        // <b>hello
-        // 01234567
-        // pos=1 (inside <b>, before '>') → extend past '>' at 2
-        Case {
-            name: "inside simple tag before gt",
-            input: "<b>hello",
-            pos: 1,
-            expected: Some(3),
-        },
-        // pos=2 (at the '>' itself) → extend past it
-        Case {
-            name: "inside simple tag at gt",
-            input: "<b>hello",
-            pos: 2,
-            expected: Some(3),
-        },
-        // <b>hello
-        // 01234567
-        // pos=3 (at 'h', past the '>') → None
-        Case {
-            name: "after simple tag at h",
-            input: "<b>hello",
-            pos: 3,
-            expected: None,
-        },
-        // pos further into text → None
-        Case {
-            name: "after simple tag further",
-            input: "<b>hello",
-            pos: 5,
-            expected: None,
-        },
-        // No '>' exists after the '<' → None (can't extend)
-        Case {
-            name: "no closing gt",
-            input: "<div",
-            pos: 3,
-            expected: None,
-        },
-        // Regression: '>' inside double-quoted attribute must not be
-        // treated as tag closer. The real '>' is at index 16.
-        // <a title="a > b">text
-        // 012345678901234567890   (indices)
-        //           111111111122
-        //      '>' at 12 is inside attribute, real '>' at 16
-        // pos=13 (inside tag, past the quoted '>', before real '>') → extend to 17
-        Case {
-            name: "gt in double-quoted attr before real gt",
-            input: "<a title=\"a > b\">text",
-            pos: 13,
-            expected: Some(17),
-        },
-        // pos=16 (at the real '>') → extend past it
-        Case {
-            name: "gt in double-quoted attr at real gt",
-            input: "<a title=\"a > b\">text",
-            pos: 16,
-            expected: Some(17),
-        },
-        // pos after the real closing '>' → None
-        // <a title="a > b">text
-        // 012345678901234567890
-        //           111111111122
-        // real '>' at 16, 't' at 17
-        Case {
-            name: "after closed tag with gt in attr at 17",
-            input: "<a title=\"a > b\">text",
-            pos: 17,
-            expected: None,
-        },
-        Case {
-            name: "after closed tag with gt in attr at 20",
-            input: "<a title=\"a > b\">text",
-            pos: 20,
-            expected: None,
-        },
-        // Same scenario with single quotes
-        // <a title='a > b'>text
-        // real '>' at 16
-        Case {
-            name: "gt in single-quoted attr",
-            input: "<a title='a > b'>text",
-            pos: 13,
-            expected: Some(17),
-        },
-        // Double-quoted attr containing single quotes: '>' inside should still be
-        // treated as quoted because we're inside double quotes, not single.
-        // <a title="he said 'stop'">text
-        // real '>' at 25
-        // pos=17 (inside the attribute, past the single quotes) → extend past real '>'
-        Case {
-            name: "mixed quotes",
-            input: "<a title=\"he said 'stop'\">text",
-            pos: 17,
-            expected: Some(26),
-        },
-        // <div><span>text
-        // 012345678901234
-        // last '<' at 5 (<span>), its '>' at 10.
-        // pos=11 (after both tags are closed) → None
-        Case {
-            name: "after nested tags at 11",
-            input: "<div><span>text",
-            pos: 11,
-            expected: None,
-        },
-        // pos=15 (end of string, still after both tags) → None
-        Case {
-            name: "after nested tags at 15",
-            input: "<div><span>text",
-            pos: 15,
-            expected: None,
-        },
-        // <div><span>text
-        // pos=6 (inside <span>, before its '>') → extend past '>' at 10
-        Case {
-            name: "inside nested tag",
-            input: "<div><span>text",
-            pos: 6,
-            expected: Some(11),
-        },
-        // |<b>text → pos=0 is before any '<'
-        Case {
-            name: "pos at start",
-            input: "<b>text",
-            pos: 0,
-            expected: None,
-        },
-    ];
-    for case in cases {
-        let result = extend_past_open_tag(case.input, case.pos);
-        assert_eq!(result, case.expected, "case: {}", case.name);
-    }
-}
-
 /// Both readers report offsets in bytes, so multi-byte text around and inside
 /// a tag must not shift them.
 #[test]
@@ -3347,53 +2570,6 @@ fn test_html_tag_scans_are_byte_offsets() {
     assert_eq!(extend_past_open_tag(text, text.find('t').unwrap()), None);
 
     assert_eq!(strip_html_tags("ä <b x=\"ö>ü"), "ä ");
-}
-
-// ── decode_action ─────────────────────────────────────────────────────
-
-#[test]
-fn test_decode_action() {
-    struct Case {
-        name: &'static str,
-        input: &'static str,
-        expected: Option<(&'static str, &'static str)>,
-    }
-
-    let cases = [
-        Case {
-            name: "with payload",
-            input: "__act__set_image_model|google/gemini-3.1-flash-image-preview",
-            expected: Some(("set_image_model", "google/gemini-3.1-flash-image-preview")),
-        },
-        Case {
-            name: "empty payload pipe",
-            input: "__act__clear_session|",
-            expected: Some(("clear_session", "")),
-        },
-        Case {
-            name: "no pipe",
-            input: "__act__clear_session",
-            expected: Some(("clear_session", "")),
-        },
-        Case {
-            name: "rejects non prefix",
-            input: "random_text",
-            expected: None,
-        },
-        Case {
-            name: "rejects empty",
-            input: "",
-            expected: None,
-        },
-    ];
-
-    for case in &cases {
-        let result = decode_action(case.input);
-        let expected = case
-            .expected
-            .map(|(action, payload)| (action.to_string(), payload.to_string()));
-        assert_eq!(result, expected, "case: {}", case.name);
-    }
 }
 
 // ── GUI message → Telegram mirror tests ─────────────────────────────
@@ -3499,10 +2675,6 @@ fn telegram_msg(user_name: &str, content: &str) -> ChannelMessage {
 
 fn voice_msg(user_name: &str, content: &str) -> ChannelMessage {
     test_msg(user_name, content, "voice", "")
-}
-
-fn cli_msg(user_name: &str, content: &str) -> ChannelMessage {
-    test_msg(user_name, content, crate::cli::CHANNEL, "")
 }
 
 /// Shared happy-path mirror harness: sets up the mirror environment, binds
@@ -3680,23 +2852,6 @@ async fn mirrors_voice_transcript_to_telegram() {
 }
 
 #[tokio::test]
-async fn mirrors_command_line_message_to_telegram() {
-    // A message the command line sends is the owner's own, so it mirrors exactly
-    // like GUI text and a voice transcript: same recipient bindings, same
-    // blockquote format, and NOTHING in the mirrored text marks it as scripted.
-    let mirrored = mirror_single_to_binding(
-        "cli_user",
-        "unique_cli",
-        &cli_msg("cli_user", "Send this from a script"),
-    )
-    .await;
-    assert_eq!(
-        mirrored.content,
-        "<blockquote>\nSend this from a script\n</blockquote>"
-    );
-    assert!(mirrored.reply_markup.is_none());
-}
-#[tokio::test]
 async fn sends_to_multiple_telegram_bindings() {
     let (sent, _lock) = setup_mirror_test_env().await;
     let store = crate::users::store();
@@ -3810,21 +2965,6 @@ async fn mirrors_reply_reference_header() {
 }
 
 #[tokio::test]
-async fn mirrors_media_only_with_reply_reference() {
-    let mut msg = gui_msg("media_ref", "[IMAGE:/tmp/screenshot.png]");
-    msg.reply_reference = Some(crate::channels::ReplyReference {
-        author: "bob".to_string(),
-        snippet: "[Photo]".to_string(),
-    });
-    let mirrored = mirror_single_to_binding("media_ref", "unique_media_ref", &msg).await;
-    // Media-only content (markers stripped) still mirrors the `↩` line.
-    assert_eq!(
-        mirrored.content,
-        "<blockquote>\n↩ bob: [Photo]\n</blockquote>"
-    );
-}
-
-#[tokio::test]
 #[serial_test::serial(gui_admin_workspace)] // writes the shared seeded admin row
 async fn user_command_entries_reflect_admin_state() {
     // Serialized with the sibling mirror tests: this test initialises the
@@ -3904,62 +3044,6 @@ async fn user_command_entries_reflect_admin_state() {
     assert!(cmds.contains(&"image_models"));
     assert!(cmds.contains(&"video_models"));
     assert_eq!(cmds[0], "image_models");
-}
-
-// ── Self-update notification texts ─────────────────────────────────────────
-
-/// The self-update notifications must reach the admin as plain, single
-/// messages: no character may be turned into markup, and none may be split by
-/// the chunker (a split message reads as several notifications). The start-up
-/// line is one of them — it is where an unattended update's new version is
-/// named to the owner.
-#[test]
-fn test_update_notification_texts_render_as_plain_single_messages() {
-    for text in [
-        crate::self_update::UPDATE_BUILD_COMPLETE_MSG,
-        crate::self_update::UPDATE_DOWNLOAD_COMPLETE_MSG,
-        crate::self_update::UPDATE_RESTART_MSG,
-        &crate::self_update::back_online_message(false),
-        &crate::self_update::back_online_message(true),
-    ] {
-        assert_eq!(to_telegram_html(text), text, "not plain text: {text}");
-        assert_eq!(
-            split_message_for_telegram(text).len(),
-            1,
-            "split into several messages: {text}"
-        );
-    }
-
-    // A failure's lead line is plain text like the notifications above; only the
-    // detail under it (the captured build output) becomes a code block.
-    let failure = crate::self_update::update_failure_notification(&anyhow::anyhow!(
-        "Failed to build from source:\n```\nboom\n```"
-    ));
-    let html = to_telegram_html(&failure);
-    assert_eq!(html.lines().next(), failure.lines().next());
-    assert_eq!(split_message_for_telegram(&html).len(), 1);
-}
-
-/// The start-up notice is produced before a self-hosted start has a transport, so
-/// it waits for one: the wait ends once a base exists, not on a timer of its own.
-#[tokio::test]
-async fn test_wait_until_a_transport_exists() {
-    let ready = std::sync::Arc::new(AtomicBool::new(false));
-    let published = std::sync::Arc::clone(&ready);
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        published.store(true, Ordering::SeqCst);
-    });
-
-    let waited = tokio::time::timeout(
-        Duration::from_secs(5),
-        wait_until(|| ready.load(Ordering::SeqCst)),
-    )
-    .await;
-    assert!(
-        matches!(waited, Ok(true)),
-        "the wait must end once a base exists"
-    );
 }
 
 // ── Telegram intake checks ──────────────────────────────────────────

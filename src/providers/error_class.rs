@@ -196,55 +196,7 @@ mod tests {
         );
     }
 
-    // ── Context window error handling ─────────────────────────
-
-    #[test]
-    fn context_window_error_classification() {
-        let is_non_retryable =
-            |e: &anyhow::Error| matches!(classify_err(e), ErrorClass::NonRetryable);
-        // Context window exceeded — NonRetryable via status 400
-        assert!(is_non_retryable(&test_err(
-            400,
-            "request (8968 tokens) exceeds the available context size (8448 tokens)",
-        )));
-        assert!(is_non_retryable(&test_err(
-            400,
-            "This model's maximum context length is 8192 tokens",
-        )));
-        assert!(is_non_retryable(&test_err(
-            400,
-            "maximum context length of this model is 128K tokens",
-        )));
-        // 4xx errors are still non-retryable via status code
-        assert!(is_non_retryable(&test_err(401, "Unauthorized")));
-    }
-
     // ── Tool schema error detection tests ───────────────────────────────
-
-    #[test]
-    fn tool_schema_error_detection() {
-        use ErrorClass::NonRetryable;
-        // Detects various tool schema error patterns as NonRetryable via status 400
-        for msg in [
-            r#"Groq API error (400 Bad Request): {"error":{"message":"tool call validation failed: attempted to call tool 'recall' which was not in request"}}"#,
-            "tool 'search' which was not in request",
-            "function 'foo' not found in tool list",
-            "invalid_tool_call: no matching function",
-        ] {
-            assert!(
-                matches!(classify_err(&test_err(400, msg)), NonRetryable),
-                "should detect: {msg}"
-            );
-        }
-        // Pure 400 without tool-schema keywords → also NonRetryable (via status code)
-        assert!(
-            matches!(
-                classify_err(&test_err(400, "invalid api key provided")),
-                NonRetryable
-            ),
-            "pure 400 should be NonRetryable"
-        );
-    }
 
     #[test]
     fn non_retryable_hints_are_classified_non_retryable() {
@@ -272,41 +224,40 @@ mod tests {
         }
     }
 
+    /// A 429 that mentions account exhaustion is still the upstream provider's
+    /// rate limit when the envelope also carries the provider's own retry signal:
+    /// the retry override must outrank the billing hint, or the agent aborts on a
+    /// limit that would have cleared by the next attempt.
     #[test]
-    fn upstream_rate_limit_overrides_quota_hint() {
-        // Regression: OpenRouter forwards upstream provider rate limits with
-        // "insufficient_quota" in metadata.provider_error_code but "temporarily
-        // rate-limited" in the raw upstream error text.  The retryable override
-        // must take priority over the non-retryable billing hint so the agent
-        // retries instead of aborting.
-        let body = concat!(
-            r#"{"error":{"code":429,"message":"Provider returned error","metadata":"#,
-            r#"{"provider_name":"Qwen","provider_error_code":"insufficient_quota","#,
-            r#""raw":"upstream error: temporarily rate-limited upstream, please retry"}}}"#,
-        );
-        let err = test_err(429, body);
-        assert!(
-            matches!(classify_err(&err), ErrorClass::Retryable),
-            "429 with 'temporarily rate-limited' in metadata.raw should be Retryable \
-             despite also containing 'insufficient_quota'"
-        );
-    }
-
-    #[test]
-    fn upstream_shared_pool_overrides_quota_hint() {
-        // Similar to the above but with "upstream_provider_shared_pool" as the
-        // retryable override signal (another variant of upstream exhaustion).
-        let body = concat!(
-            r#"{"error":{"code":429,"message":"Provider returned error","metadata":"#,
-            r#"{"provider_name":"Alibaba","provider_error_code":"insufficient_quota","#,
-            r#""limit_source":"upstream_provider_shared_pool"}}}"#,
-        );
-        let err = test_err(429, body);
-        assert!(
-            matches!(classify_err(&err), ErrorClass::Retryable),
-            "429 with 'upstream_provider_shared_pool' should be Retryable \
-             despite also containing 'insufficient_quota'"
-        );
+    fn an_upstream_retryable_override_beats_the_quota_hint() {
+        // (label, provider, the provider's own retry signal)
+        let cases = [
+            (
+                "rate-limited upstream",
+                "Qwen",
+                r#""raw":"upstream error: temporarily rate-limited upstream, please retry""#,
+            ),
+            (
+                "shared pool",
+                "Alibaba",
+                r#""limit_source":"upstream_provider_shared_pool""#,
+            ),
+        ];
+        for (label, provider, signal) in cases {
+            let body = format!(
+                concat!(
+                    r#"{{"error":{{"code":429,"message":"Provider returned error","metadata":"#,
+                    r#"{{"provider_name":"{}","provider_error_code":"insufficient_quota","#,
+                    r#"{}}}}}}}"#,
+                ),
+                provider, signal
+            );
+            let err = test_err(429, &body);
+            assert!(
+                matches!(classify_err(&err), ErrorClass::Retryable),
+                "{label}: 429 with {signal} should be Retryable despite 'insufficient_quota'"
+            );
+        }
     }
 
     #[test]

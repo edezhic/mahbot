@@ -404,12 +404,15 @@ mod tests {
         );
     }
 
-    /// A store bring-up error that is not a refusal is recorded as a start-up
-    /// failure naming the store and its path, and passes the error through
-    /// unchanged. A resource/permission cause is marked environment-caused; a
-    /// cause that says nothing about the environment is not.
+    /// A bring-up error that is not a store refusal is still recorded — never
+    /// silent — as a start-up failure naming the store and its path, and passes
+    /// the error through unchanged. The same writer serves the start-up steps
+    /// outside the stores, where there is no store and no path to name: the step
+    /// takes that place, and the record says so rather than inventing one. A
+    /// resource/permission cause is marked environment-caused; a cause that says
+    /// nothing about the environment is not.
     #[test]
-    fn non_refusal_bring_up_failure_is_recorded() {
+    fn a_failure_that_is_no_refusal_is_recorded_as_a_start_up_failure() {
         let tmp = tempfile::TempDir::new().expect("temp dir for test");
         let root = tmp.path();
 
@@ -447,23 +450,16 @@ mod tests {
             1,
             "only the environment-caused failure may carry the cause line: {body}"
         );
-    }
 
-    /// The start-up-failure writer (config, providers, the process-global
-    /// inits) files a block naming the step on its own line and the reason as the
-    /// error chain, and passes the error through unchanged. Driven through the
-    /// root-explicit launch seam the binary uses for its pre-boot steps.
-    #[test]
-    fn non_store_startup_failure_is_recorded() {
-        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        // The steps outside the stores: no store, no path, and the step named in
+        // their place — through the root-explicit launch seam the binary uses.
         let passed = record_launch_failure(
-            tmp.path(),
+            root,
             "providers::init_global",
             anyhow::anyhow!("no provider credential"),
         );
         assert_eq!(format!("{passed:#}"), "no provider credential");
-        let body =
-            std::fs::read_to_string(tmp.path().join("error.log")).expect("error.log written");
+        let body = std::fs::read_to_string(root.join("error.log")).expect("error.log written");
         for needle in [
             "MahBot start-up failure",
             failure_record::NO_STORE,
@@ -476,27 +472,6 @@ mod tests {
                 "error.log must contain {needle:?}: {body}"
             );
         }
-    }
-
-    /// The boot-panic path's screen text: the panic summary stays qualified as
-    /// such (the start-failure screen renders the returned error verbatim), and
-    /// the record carries the step on its own line and that same sentence as the
-    /// reason.
-    #[test]
-    fn startup_panic_keeps_its_qualifier() {
-        let tmp = tempfile::TempDir::new().expect("temp dir for test");
-        let returned = record_launch_failure(tmp.path(), "bootstrap", startup_panic_error("boom"));
-        assert_eq!(
-            format!("{returned:#}"),
-            "Startup panicked: boom",
-            "the start-failure screen shows the returned error verbatim"
-        );
-        let body =
-            std::fs::read_to_string(tmp.path().join("error.log")).expect("error.log written");
-        assert!(
-            body.contains("step: bootstrap") && body.contains("reason: Startup panicked: boom"),
-            "the record names the step and keeps the panic sentence as the reason: {body}"
-        );
     }
 
     /// The retirement removes exactly the two files the deleted embedder

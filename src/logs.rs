@@ -1471,153 +1471,125 @@ fn workspace_name(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The row a written line becomes, in the shapes the layer produces. A
+    /// record's scope is the row's, not the record's: every spelling of a scope
+    /// value is taken from the record's own fields where present, then from its
+    /// span chain — leaving the values the record does not state alone, and never
+    /// repeating a promoted value as a field. A workspace recorded as a path
+    /// becomes the workspace it names, and an account's personal folder keeps its
+    /// own spelling.
+    ///
+    /// Each case: name, line, the four scope columns, and the fields the row must
+    /// be left holding (`None` where the case makes no claim about them).
+    #[expect(clippy::too_many_lines)] // one table row per record shape
     #[test]
-    fn test_parse_tracing_json_full() {
-        let line = r#"{"timestamp":"2025-05-06T12:34:56.000000Z","level":"INFO","target":"mahbot::orchestrator","span":{"name":"agent","agent_id":"00000000-0000-0000-0000-000000000000","role":"lead","workspace":"mahbot","ticket":"mahbot-42"},"fields":{"message":"Hello world","key":"value"}}"#;
-        let entry = parse_tracing_json(line).unwrap();
-        assert_eq!(entry.timestamp, "2025-05-06T12:34:56.000000Z");
-        assert_eq!(entry.level, "INFO");
-        assert_eq!(entry.target, "mahbot::orchestrator");
-        assert_eq!(entry.message, "Hello world");
-        assert_eq!(entry.fields, serde_json::json!({"key": "value"}));
-        assert_eq!(entry.agent_id, "00000000-0000-0000-0000-000000000000");
-        assert_eq!(entry.agent_role, "lead");
-        assert_eq!(entry.workspace, "mahbot");
-        assert_eq!(entry.ticket, "mahbot-42");
-    }
-
-    #[test]
-    fn test_parse_tracing_json_no_fields() {
-        let line = r#"{"timestamp":"2025-05-06T12:34:56.000000Z","level":"WARN","target":"test","fields":{"message":"warning"}}"#;
-        let entry = parse_tracing_json(line).unwrap();
-        assert_eq!(entry.message, "warning");
-        assert_eq!(entry.fields, serde_json::Value::Null);
-        assert_eq!(entry.agent_id, "");
-        assert_eq!(entry.agent_role, "");
-        assert_eq!(entry.workspace, "");
-        assert_eq!(entry.ticket, "");
-    }
-
-    #[test]
-    fn test_parse_tracing_json_lenient() {
-        let entry = parse_tracing_json(r#"{"incomplete": true}"#).unwrap();
-        assert_eq!(entry.timestamp, "");
-        assert_eq!(entry.level, "");
-        assert_eq!(entry.target, "");
-        assert_eq!(entry.message, "");
-        assert_eq!(entry.fields, serde_json::Value::Null);
-        assert_eq!(entry.agent_id, "");
-        assert_eq!(entry.agent_role, "");
-        assert_eq!(entry.workspace, "");
-        assert_eq!(entry.ticket, "");
-    }
-
-    /// The row's scope is the row's, not the record's: every spelling of a scope
-    /// value is promoted out of the record and its span chain, the record's own
-    /// copy disappears, and a workspace recorded as a path becomes the workspace
-    /// it names.
-    #[test]
-    fn test_parse_tracing_json_promotes_scope_out_of_the_record() {
-        let line = r#"{"timestamp":"...","level":"INFO","target":"test",
-            "spans":[
-                {"name":"ticket","ticket":"mahbot-42","workspace":"mahbot"},
-                {"name":"agent","agent_id":"ticket_mahbot-42_engineer","role":"engineer"}
-            ],
-            "fields":{"message":"writing code","agent_id":"ticket_mahbot-42_engineer",
-                "role":"engineer","workspace_name":"/Users/x/Desktop/mahbot/",
-                "ticket_id":"mahbot-42","path":"src/a.rs","attempt":2}}"#;
-        let entry = parse_tracing_json(line).unwrap();
-        assert_eq!(
-            entry.agent_id, "ticket_mahbot-42_engineer",
-            "agent identity"
-        );
-        assert_eq!(entry.agent_role, "engineer", "role");
-        assert_eq!(
-            entry.workspace, "mahbot",
-            "a path becomes the workspace it names"
-        );
-        assert_eq!(entry.ticket, "mahbot-42", "the ticket from the record");
-        assert_eq!(
-            entry.fields,
-            serde_json::json!({"path": "src/a.rs", "attempt": 2}),
-            "the promoted values are not fields of the same record"
-        );
-    }
-
-    /// The ticket also rides the context the work runs in: a record inside a
-    /// per-ticket span carries that ticket although the record itself never
-    /// states it, and an account's personal folder keeps its own spelling.
-    #[test]
-    fn test_parse_tracing_json_ticket_from_span_and_personal_workspace() {
-        let line = r#"{"timestamp":"...","level":"INFO","target":"mahbot::pipeline::verification",
-            "spans":[{"name":"ticket","ticket":"mahbot-7","workspace":"personal:lyuba"},
-                {"name":"agent","agent_id":"cli","role":"cli"}],
-            "fields":{"message":"project commands finished","passed":3}}"#;
-        let entry = parse_tracing_json(line).unwrap();
-        assert_eq!(entry.ticket, "mahbot-7", "inherited from the phase span");
-        assert_eq!(entry.agent_id, "cli", "the agent span still names its own");
-        assert_eq!(
-            entry.workspace, "personal:lyuba",
-            "an account's folder keeps its own spelling"
-        );
-        assert_eq!(entry.fields, serde_json::json!({"passed": 3}));
-    }
-
-    /// Attribution corners for `parse_tracing_json`: a value is taken from the
-    /// record's own fields where present, then from the span chain — leaving the
-    /// values the record does state alone. Each case: (name, line, agent_id,
-    /// role, workspace).
-    #[test]
-    fn test_parse_tracing_json_agent_attribution() {
+    fn parse_tracing_json_shapes_each_record() {
+        struct Case {
+            name: &'static str,
+            line: &'static str,
+            agent_id: &'static str,
+            role: &'static str,
+            workspace: &'static str,
+            ticket: &'static str,
+            fields: Option<serde_json::Value>,
+        }
         let cases = [
-            (
-                "span only",
-                r#"{"timestamp":"...","level":"INFO","target":"test","span":{"name":"agent","agent_id":"abc-123","role":"analyst"},"fields":{"message":"researching"}}"#,
-                "abc-123",
-                "analyst",
-                "",
-            ),
-            (
-                "spans array",
-                r#"{"timestamp":"...","level":"INFO","target":"test","spans":[{"name":"parent"},{"name":"agent","agent_id":"xyz-456","role":"worker","workspace":"my-ws"}],"fields":{"message":"writing code"}}"#,
-                "xyz-456",
-                "worker",
-                "my-ws",
-            ),
-            (
-                "event fields without span",
-                r#"{"timestamp":"...","level":"ERROR","target":"mahbot::agent","fields":{"message":"Agent failed","agent_id":"ticket_123_engineer","role":"engineer","workspace":"my-ws","classification":"transport"}}"#,
-                "ticket_123_engineer",
-                "engineer",
-                "my-ws",
-            ),
-            (
-                "event beats inherited span",
-                r#"{"timestamp":"...","level":"ERROR","target":"mahbot::agent","span":{"name":"agent","agent_id":"caller_42","role":"engineer","workspace":"parent-ws"},"fields":{"message":"Agent failed","agent_id":"analyze_ws_1_2_analyst","role":"analyst","workspace":"my-ws","classification":"runtime"}}"#,
-                "analyze_ws_1_2_analyst",
-                "analyst",
-                "my-ws",
-            ),
-            (
-                "workspace-only event keeps span agent",
-                r#"{"timestamp":"...","level":"WARN","target":"mahbot::tools::edit","span":{"name":"agent","agent_id":"ticket_7_engineer","role":"engineer","workspace":"my-ws"},"fields":{"message":"Search index capacity exhausted","workspace":"my-ws","path":"src/a.rs"}}"#,
-                "ticket_7_engineer",
-                "engineer",
-                "my-ws",
-            ),
-            (
-                "agent_id-only event merges span role/workspace",
-                r#"{"timestamp":"...","level":"WARN","target":"mahbot::agent","span":{"name":"agent","agent_id":"ticket_7_engineer","role":"engineer","workspace":"my-ws"},"fields":{"message":"Failed to persist incoming messages to session DB","agent_id":"ticket_7_engineer","error":"io"}}"#,
-                "ticket_7_engineer",
-                "engineer",
-                "my-ws",
-            ),
+            Case {
+                name: "promoted scope out of the record",
+                line: r#"{"timestamp":"...","level":"INFO","target":"test",
+                    "spans":[
+                        {"name":"ticket","ticket":"mahbot-42","workspace":"mahbot"},
+                        {"name":"agent","agent_id":"ticket_mahbot-42_engineer","role":"engineer"}
+                    ],
+                    "fields":{"message":"writing code","agent_id":"ticket_mahbot-42_engineer",
+                        "role":"engineer","workspace_name":"/Users/x/Desktop/mahbot/",
+                        "ticket_id":"mahbot-42","path":"src/a.rs","attempt":2}}"#,
+                agent_id: "ticket_mahbot-42_engineer",
+                role: "engineer",
+                workspace: "mahbot",
+                ticket: "mahbot-42",
+                fields: Some(serde_json::json!({"path": "src/a.rs", "attempt": 2})),
+            },
+            Case {
+                name: "ticket from the span and a personal workspace",
+                line: r#"{"timestamp":"...","level":"INFO","target":"mahbot::pipeline::verification",
+                    "spans":[{"name":"ticket","ticket":"mahbot-7","workspace":"personal:lyuba"},
+                        {"name":"agent","agent_id":"cli","role":"cli"}],
+                    "fields":{"message":"project commands finished","passed":3}}"#,
+                agent_id: "cli",
+                role: "cli",
+                workspace: "personal:lyuba",
+                ticket: "mahbot-7",
+                fields: Some(serde_json::json!({"passed": 3})),
+            },
+            Case {
+                name: "span only",
+                line: r#"{"timestamp":"...","level":"INFO","target":"test","span":{"name":"agent","agent_id":"abc-123","role":"analyst"},"fields":{"message":"researching"}}"#,
+                agent_id: "abc-123",
+                role: "analyst",
+                workspace: "",
+                ticket: "",
+                fields: None,
+            },
+            Case {
+                name: "spans array",
+                line: r#"{"timestamp":"...","level":"INFO","target":"test","spans":[{"name":"parent"},{"name":"agent","agent_id":"xyz-456","role":"worker","workspace":"my-ws"}],"fields":{"message":"writing code"}}"#,
+                agent_id: "xyz-456",
+                role: "worker",
+                workspace: "my-ws",
+                ticket: "",
+                fields: None,
+            },
+            Case {
+                name: "event fields without span",
+                line: r#"{"timestamp":"...","level":"ERROR","target":"mahbot::agent","fields":{"message":"Agent failed","agent_id":"ticket_123_engineer","role":"engineer","workspace":"my-ws","classification":"transport"}}"#,
+                agent_id: "ticket_123_engineer",
+                role: "engineer",
+                workspace: "my-ws",
+                ticket: "",
+                fields: None,
+            },
+            Case {
+                name: "event beats inherited span",
+                line: r#"{"timestamp":"...","level":"ERROR","target":"mahbot::agent","span":{"name":"agent","agent_id":"caller_42","role":"engineer","workspace":"parent-ws"},"fields":{"message":"Agent failed","agent_id":"analyze_ws_1_2_analyst","role":"analyst","workspace":"my-ws","classification":"runtime"}}"#,
+                agent_id: "analyze_ws_1_2_analyst",
+                role: "analyst",
+                workspace: "my-ws",
+                ticket: "",
+                fields: None,
+            },
+            Case {
+                name: "workspace-only event keeps span agent",
+                line: r#"{"timestamp":"...","level":"WARN","target":"mahbot::tools::edit","span":{"name":"agent","agent_id":"ticket_7_engineer","role":"engineer","workspace":"my-ws"},"fields":{"message":"Search index capacity exhausted","workspace":"my-ws","path":"src/a.rs"}}"#,
+                agent_id: "ticket_7_engineer",
+                role: "engineer",
+                workspace: "my-ws",
+                ticket: "",
+                fields: None,
+            },
+            Case {
+                name: "agent_id-only event merges span role/workspace",
+                line: r#"{"timestamp":"...","level":"WARN","target":"mahbot::agent","span":{"name":"agent","agent_id":"ticket_7_engineer","role":"engineer","workspace":"my-ws"},"fields":{"message":"Failed to persist incoming messages to session DB","agent_id":"ticket_7_engineer","error":"io"}}"#,
+                agent_id: "ticket_7_engineer",
+                role: "engineer",
+                workspace: "my-ws",
+                ticket: "",
+                fields: None,
+            },
         ];
-        for (name, line, id, role, ws) in cases {
-            let entry = parse_tracing_json(line).unwrap();
-            assert_eq!(entry.agent_id, id, "{name}: agent_id");
-            assert_eq!(entry.agent_role, role, "{name}: agent_role");
-            assert_eq!(entry.workspace, ws, "{name}: workspace");
+        for case in cases {
+            let entry = parse_tracing_json(case.line).unwrap();
+            assert_eq!(entry.agent_id, case.agent_id, "{}: agent_id", case.name);
+            assert_eq!(entry.agent_role, case.role, "{}: agent_role", case.name);
+            assert_eq!(entry.workspace, case.workspace, "{}: workspace", case.name);
+            assert_eq!(entry.ticket, case.ticket, "{}: ticket", case.name);
+            if let Some(fields) = case.fields {
+                assert_eq!(
+                    entry.fields, fields,
+                    "{}: the promoted values are not fields of the same record",
+                    case.name
+                );
+            }
         }
     }
 
@@ -1750,8 +1722,96 @@ mod tests {
         tmp
     }
 
+    /// Poll `store.query` until the total entry count reaches `expected` or the
+    /// timeout elapses. Avoids the fixed-sleep races of the earlier version
+    /// (the writer and the test share a runtime, so wall-clock sleeps can be
+    /// skewed by writer-side DB work on loaded machines).
+    async fn wait_for_total(store: &LogStore, expected: usize, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let (_, total) = store.query(&LogQuery::default()).await.unwrap();
+            if total == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for total == {expected}, got {total}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// [`flush_log_batch`] on both outcomes: a healthy flush persists the batch's
+    /// rows and records no write failure; a batch the store refuses is dropped
+    /// all the same — entries are diagnostics — and the refusal is visible on the
+    /// sanctioned surface. The bounded-retry retry-then-succeed branch
+    /// (`LOG_INSERT_MAX_ATTEMPTS` loop) is deliberately left untested since
+    /// failure injection isn't worth the machinery.
     #[tokio::test]
-    async fn test_spawn_log_writer_writes_to_store() {
+    #[serial_test::serial(log_surface)] // serializes the process-global write-failure counter
+    async fn flush_log_batch_persists_and_records_only_a_refused_batch() {
+        let baseline = log_write_error_info().count;
+
+        let (store, _dir) = test_store().await;
+        let mut batch = vec![LogEntry {
+            timestamp: "2025-01-01T00:00:01Z".to_string(),
+            level: "INFO".to_string(),
+            target: "test".to_string(),
+            message: "persisted".to_string(),
+            ..Default::default()
+        }];
+        flush_log_batch(&store, &mut batch).await;
+
+        assert!(batch.is_empty());
+        assert_eq!(
+            log_write_error_info().count,
+            baseline,
+            "no failure recorded"
+        );
+        let (entries, total) = store.query(&LogQuery::default()).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(entries[0].message, "persisted");
+
+        // Deterministic insert failure: drop the logs table through the store's
+        // own connection, so the batch INSERT fails at prepare time.
+        let (store, _dir) = test_store().await;
+        store
+            .conn
+            .execute("DROP TABLE logs", ())
+            .await
+            .expect("drop logs table for failure test");
+
+        let mut batch = vec![LogEntry {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            level: "INFO".to_string(),
+            target: "test".to_string(),
+            message: "should not persist".to_string(),
+            ..Default::default()
+        }];
+        flush_log_batch(&store, &mut batch).await;
+
+        // The batch must be dropped and the failure must be visible on the
+        // sanctioned surface.
+        assert!(batch.is_empty(), "failed batch must still be cleared");
+        let info = log_write_error_info();
+        assert!(
+            info.count > baseline,
+            "failure count must advance: baseline {baseline}, now {}",
+            info.count
+        );
+        assert!(
+            info.last_message.is_some(),
+            "last-error message must be recorded"
+        );
+    }
+
+    /// The writer's three ways into the store, one test each: closing the channel
+    /// flushes what is buffered (the rows landing newest first), a full batch
+    /// flushes at the cap while the timer holds the odd earlier entry, and the
+    /// timer flushes a lone buffered entry with neither cap nor close.
+    #[tokio::test]
+    async fn the_log_writer_flushes_on_close_the_batch_cap_and_the_timer() {
+        // Close: two records reach the store, parsed, newest first.
         let (store, _dir) = test_store().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (broadcast_tx, _) = tokio::sync::broadcast::channel(256);
@@ -1779,99 +1839,7 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].message, "oh no");
         assert_eq!(entries[1].message, "hi");
-    }
 
-    /// Poll `store.query` until the total entry count reaches `expected` or the
-    /// timeout elapses. Avoids the fixed-sleep races of the earlier version
-    /// (the writer and the test share a runtime, so wall-clock sleeps can be
-    /// skewed by writer-side DB work on loaded machines).
-    async fn wait_for_total(store: &LogStore, expected: usize, timeout: std::time::Duration) {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let (_, total) = store.query(&LogQuery::default()).await.unwrap();
-            if total == expected {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for total == {expected}, got {total}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(log_surface)] // serializes the process-global write-failure counter
-    async fn test_flush_log_batch_records_failure_on_surface() {
-        let (store, _dir) = test_store().await;
-        let baseline = log_write_error_info().count;
-
-        let entry = LogEntry {
-            timestamp: "2025-01-01T00:00:00Z".to_string(),
-            level: "INFO".to_string(),
-            target: "test".to_string(),
-            message: "should not persist".to_string(),
-            ..Default::default()
-        };
-
-        // Deterministic insert failure: drop the logs table through the store's
-        // own connection, so the batch INSERT fails at prepare time.
-        store
-            .conn
-            .execute("DROP TABLE logs", ())
-            .await
-            .expect("drop logs table for failure test");
-
-        let mut batch = vec![entry];
-        flush_log_batch(&store, &mut batch).await;
-
-        // The batch must be dropped (entries are diagnostics) and the failure
-        // must be visible on the sanctioned surface.
-        assert!(batch.is_empty(), "failed batch must still be cleared");
-        let info = log_write_error_info();
-        assert!(
-            info.count > baseline,
-            "failure count must advance: baseline {baseline}, now {}",
-            info.count
-        );
-        assert!(
-            info.last_message.is_some(),
-            "last-error message must be recorded"
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(log_surface)] // serializes the process-global write-failure counter
-    async fn test_flush_log_batch_persists_without_failure() {
-        // A healthy flush clears the batch, persists the entry, and records no
-        // write failure. The bounded-retry retry-then-succeed branch
-        // (`LOG_INSERT_MAX_ATTEMPTS` loop) is deliberately left untested since
-        // failure injection isn't worth the machinery.
-        let (store, _dir) = test_store().await;
-        let baseline = log_write_error_info().count;
-
-        let mut batch = vec![LogEntry {
-            timestamp: "2025-01-01T00:00:01Z".to_string(),
-            level: "INFO".to_string(),
-            target: "test".to_string(),
-            message: "persisted".to_string(),
-            ..Default::default()
-        }];
-        flush_log_batch(&store, &mut batch).await;
-
-        assert!(batch.is_empty());
-        assert_eq!(
-            log_write_error_info().count,
-            baseline,
-            "no failure recorded"
-        );
-        let (entries, total) = store.query(&LogQuery::default()).await.unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(entries[0].message, "persisted");
-    }
-
-    #[tokio::test]
-    async fn test_log_writer_batches_and_timer_flushes() {
         // Writer 1: a flush interval long enough that the timer can never fire
         // during the test — only the batch-cap path can insert rows.
         let (store, _dir) = test_store().await;
@@ -1929,99 +1897,88 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
+    /// What the search box reads over stored rows: a plain substring over the
+    /// message and the target, a wildcard character that is just that character
+    /// (an empty search returning every row), the row's own scope — workspace and
+    /// ticket — and the level, target and since filters it combines with.
+    #[expect(clippy::too_many_lines)] // four fixtures, one claim each
     #[tokio::test]
-    async fn test_like_search_substring() {
+    async fn stored_search_matches_substrings_targets_scope_and_filters() {
+        // A plain substring over the message and the target.
         let (store, _dir) = test_store().await;
+        seed_entries(
+            &store,
+            &[
+                LogEntry {
+                    timestamp: "2025-01-01T00:00:00Z".into(),
+                    level: "INFO".into(),
+                    target: "module_a".into(),
+                    message: "processing request".into(),
+                    ..Default::default()
+                },
+                LogEntry {
+                    timestamp: "2025-01-01T00:00:01Z".into(),
+                    level: "ERROR".into(),
+                    target: "module_b".into(),
+                    message: "failed to process".into(),
+                    ..Default::default()
+                },
+                LogEntry {
+                    timestamp: "2025-01-01T00:00:02Z".into(),
+                    level: "INFO".into(),
+                    target: "module_c".into(),
+                    message: "started".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        // "proc" matches "processing" and "process"; the target is read too.
+        for (search, total) in [("proc", 2), ("request", 1), ("module", 3)] {
+            let (results, found) = store
+                .query(&LogQuery {
+                    search: Some(search.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(found, total, "search {search:?}");
+            assert_eq!(results.len(), total, "search {search:?}");
+            if search == "request" {
+                assert_eq!(results[0].message, "processing request");
+            }
+        }
 
-        let entries = vec![
-            LogEntry {
-                timestamp: "2025-01-01T00:00:00Z".into(),
-                level: "INFO".into(),
-                target: "module_a".into(),
-                message: "processing request".into(),
-                ..Default::default()
-            },
-            LogEntry {
-                timestamp: "2025-01-01T00:00:01Z".into(),
-                level: "ERROR".into(),
-                target: "module_b".into(),
-                message: "failed to process".into(),
-                ..Default::default()
-            },
-            LogEntry {
-                timestamp: "2025-01-01T00:00:02Z".into(),
-                level: "INFO".into(),
-                target: "module_c".into(),
-                message: "started".into(),
-                ..Default::default()
-            },
-        ];
-
-        seed_entries(&store, &entries).await;
-
-        // LIKE %...% matches substrings: "proc" matches "processing" and "process"
-        let (results, total) = store
-            .query(&LogQuery {
-                search: Some("proc".into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(total, 2, "substring 'proc' should match both entries");
-        assert_eq!(results.len(), 2);
-        let (results, total) = store
-            .query(&LogQuery {
-                search: Some("request".into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(results[0].message, "processing request");
-
-        // LIKE matches the target column too
-        let (_results, total) = store
-            .query(&LogQuery {
-                search: Some("module".into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(total, 3, "all targets contain 'module'");
-    }
-
-    #[tokio::test]
-    async fn test_like_search_combined_filters() {
+        // The search combined with the level, target and since filters.
         let (store, _dir) = test_store().await;
-
-        let entries = vec![
-            LogEntry {
-                timestamp: "2025-01-01T00:00:00Z".into(),
-                level: "INFO".into(),
-                target: "mahbot::orchestrator".into(),
-                message: "processing request".into(),
-                ..Default::default()
-            },
-            LogEntry {
-                timestamp: "2025-01-01T00:00:01Z".into(),
-                level: "ERROR".into(),
-                target: "mahbot::tools".into(),
-                message: "failed to process".into(),
-                fields: serde_json::json!({"code": 1}),
-                ..Default::default()
-            },
-            LogEntry {
-                timestamp: "2025-01-01T00:00:02Z".into(),
-                level: "INFO".into(),
-                target: "mahbot::api".into(),
-                message: "started".into(),
-                ..Default::default()
-            },
-        ];
-
-        seed_entries(&store, &entries).await;
-
-        // LIKE + level filter
+        seed_entries(
+            &store,
+            &[
+                LogEntry {
+                    timestamp: "2025-01-01T00:00:00Z".into(),
+                    level: "INFO".into(),
+                    target: "mahbot::orchestrator".into(),
+                    message: "processing request".into(),
+                    ..Default::default()
+                },
+                LogEntry {
+                    timestamp: "2025-01-01T00:00:01Z".into(),
+                    level: "ERROR".into(),
+                    target: "mahbot::tools".into(),
+                    message: "failed to process".into(),
+                    fields: serde_json::json!({"code": 1}),
+                    ..Default::default()
+                },
+                LogEntry {
+                    timestamp: "2025-01-01T00:00:02Z".into(),
+                    level: "INFO".into(),
+                    target: "mahbot::api".into(),
+                    message: "started".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
         let (results, total) = store
             .query(&LogQuery {
                 level: Some("ERROR".into()),
@@ -2041,8 +1998,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, 1, "only tools target entry matching 'process'");
-
-        // LIKE + since
         let (_results, total) = store
             .query(&LogQuery {
                 since: Some("2025-01-01T00:00:01Z".into()),
@@ -2052,14 +2007,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, 1, "only entry after timestamp matching 'process'");
-    }
 
-    /// The search covers the row's scope: a workspace or a ticket typed into the
-    /// box finds the rows that belong to it, and a wildcard character is the
-    /// character — the stored-row query reads exactly like the live filter's
-    /// plain substring match.
-    #[tokio::test]
-    async fn test_search_finds_rows_by_workspace_and_ticket() {
+        // The row's scope: a workspace or a ticket typed into the box finds the
+        // rows that belong to it, and a wildcard character is the character —
+        // the stored-row query reads exactly like the live filter's plain
+        // substring match.
         let (store, _dir) = test_store().await;
         seed_entries(
             &store,
@@ -2081,7 +2033,6 @@ mod tests {
             ],
         )
         .await;
-
         for (search, total) in [
             ("mahbot-42", 1),  // the ticket
             ("mahbot_rlx", 1), // the workspace
@@ -2098,6 +2049,50 @@ mod tests {
                 .unwrap();
             assert_eq!(found, total, "search {search:?}");
         }
+
+        // Characters the query language would treat as syntax are literal here,
+        // and no search at all is every row.
+        let (store, _dir) = test_store().await;
+        seed_entries(
+            &store,
+            &[
+                LogEntry {
+                    timestamp: "2025-01-01T00:00:00Z".into(),
+                    level: "INFO".into(),
+                    target: "module_a".into(),
+                    message: "processing `Hello ${name}` template".into(),
+                    ..Default::default()
+                },
+                LogEntry {
+                    timestamp: "2025-01-01T00:00:01Z".into(),
+                    level: "ERROR".into(),
+                    target: "module_b".into(),
+                    message: "normal log entry".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        let (results, total) = store
+            .query(&LogQuery {
+                search: Some("template".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "LIKE should match partial word in message");
+        assert!(
+            results[0].message.contains("template"),
+            "should match the correct entry"
+        );
+        let (_results, total) = store
+            .query(&LogQuery {
+                search: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total, 2, "no search filter should return all entries");
     }
 
     /// The live filter matches the same four parts the stored-row query binds, so
@@ -2116,54 +2111,6 @@ mod tests {
             assert!(entry.matches_search(query), "{query}");
         }
         assert!(!entry.matches_search("mahbot_rlx"));
-    }
-
-    #[tokio::test]
-    async fn test_like_search_with_special_chars() {
-        let (store, _dir) = test_store().await;
-
-        let entries = vec![
-            LogEntry {
-                timestamp: "2025-01-01T00:00:00Z".into(),
-                level: "INFO".into(),
-                target: "module_a".into(),
-                message: "processing `Hello ${name}` template".into(),
-                ..Default::default()
-            },
-            LogEntry {
-                timestamp: "2025-01-01T00:00:01Z".into(),
-                level: "ERROR".into(),
-                target: "module_b".into(),
-                message: "normal log entry".into(),
-                ..Default::default()
-            },
-        ];
-
-        seed_entries(&store, &entries).await;
-
-        // LIKE is literal substring — backtick and ${} match as-is
-        let (results, total) = store
-            .query(&LogQuery {
-                search: Some("template".into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(total, 1, "LIKE should match partial word in message");
-        assert!(
-            results[0].message.contains("template"),
-            "should match the correct entry"
-        );
-
-        // Empty search returns all entries
-        let (_results, total) = store
-            .query(&LogQuery {
-                search: None,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(total, 2, "no search filter should return all entries");
     }
 
     /// The writer's panic-restart bound: after enough consecutive panics the

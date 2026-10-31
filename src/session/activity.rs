@@ -73,61 +73,62 @@ mod tests {
         }
     }
 
-    /// Nothing was ever shown, so the first message carries no line — it only
-    /// establishes what the assistant has seen.
-    #[test]
-    fn a_first_message_sets_the_reference_silently() {
-        assert_eq!(
-            line(None, at_computer(), "hi"),
-            ("hi".to_string(), Some(Location::AtComputer))
-        );
-    }
-
-    /// A moved location opens the message with its own line, ahead of everything
-    /// else the turn carries.
-    #[test]
-    fn a_change_rides_the_head_of_the_message() {
-        let (content, state) = line(Some("absent"), at_computer(), "hi");
-        assert!(
-            content.starts_with("<user-activity>active</user-activity>\n\n"),
-            "{content}"
-        );
-        assert!(content.ends_with("hi"), "{content}");
-        assert_eq!(state, Some(Location::AtComputer));
-
-        let (content, state) = line(Some("active"), away(), "hi");
-        assert!(
-            content.starts_with("<user-activity>absent</user-activity>\n\n"),
-            "{content}"
-        );
-        assert!(content.ends_with("hi"), "{content}");
-        assert_eq!(state, Some(Location::Away));
-    }
-
-    /// A spoken message typed while the assistant already knows the user is
-    /// present has nothing new to say.
-    #[test]
-    fn an_unchanged_state_shows_nothing() {
-        let spoken = State {
+    fn spoken() -> State {
+        State {
             location: Location::AtComputer,
             by_voice: true,
-        };
-        assert_eq!(line(Some("active"), spoken, "hi"), ("hi".to_string(), None));
+        }
     }
 
-    /// Speaking aloud is a change worth reporting: it is the one thing that
-    /// tells the assistant the user is waiting to hear an answer.
+    /// The one rule at every entry point: the line rides the message only when
+    /// the location moved since the assistant was last shown one, ahead of
+    /// everything else the turn carries and saying so when speech is what put
+    /// the user there; the state is recorded whenever it is known — silently,
+    /// without a line, on the first message, and not at all when it did not
+    /// change.
     #[test]
-    fn a_spoken_change_says_so() {
-        let spoken = State {
-            location: Location::AtComputer,
-            by_voice: true,
-        };
-        let (content, state) = line(Some("absent"), spoken, "hi");
-        assert!(
-            content.starts_with("<user-activity>active, by voice</user-activity>\n\n"),
-            "{content}"
+    fn the_line_rides_a_change_and_the_reference_always_moves() {
+        type Case = (
+            Option<&'static str>,
+            State,
+            Option<&'static str>,
+            Option<Location>,
         );
-        assert_eq!(state, Some(Location::AtComputer));
+        let cases: [Case; 5] = [
+            // Nothing was ever shown: only what the assistant has seen is set.
+            (None, at_computer(), None, Some(Location::AtComputer)),
+            (
+                Some("absent"),
+                at_computer(),
+                Some("<user-activity>active</user-activity>\n\n"),
+                Some(Location::AtComputer),
+            ),
+            (
+                Some("active"),
+                away(),
+                Some("<user-activity>absent</user-activity>\n\n"),
+                Some(Location::Away),
+            ),
+            (
+                Some("absent"),
+                spoken(),
+                Some("<user-activity>active, by voice</user-activity>\n\n"),
+                Some(Location::AtComputer),
+            ),
+            // A spoken message while the assistant already knows the user is
+            // present has nothing new to say.
+            (Some("active"), spoken(), None, None),
+        ];
+        for (shown, current, head, recorded) in cases {
+            let (content, state) = line(shown, current, "hi");
+            match head {
+                Some(head) => assert!(
+                    content.starts_with(head) && content.ends_with("hi"),
+                    "a change opens the message: {content:?}"
+                ),
+                None => assert_eq!(content, "hi", "no line for this state"),
+            }
+            assert_eq!(state, recorded);
+        }
     }
 }

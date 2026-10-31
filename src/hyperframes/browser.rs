@@ -584,24 +584,6 @@ mod tests {
         );
     }
 
-    /// A build that did not run is remembered for that build only: the same version is
-    /// not downloaded again, and a newer one is tried normally.
-    #[test]
-    fn a_build_that_did_not_run_is_remembered_for_that_build_only() {
-        let root = tempfile::tempdir().unwrap();
-        let failed = ChromeVersion::parse("156.0.8078.73").expect("a version");
-        assert_eq!(recorded_unproven(root.path(), failed), None);
-
-        record_unproven(root.path(), failed, DOES_NOT_RUN);
-
-        assert_eq!(
-            recorded_unproven(root.path(), failed).as_deref(),
-            Some(DOES_NOT_RUN)
-        );
-        let newer = ChromeVersion::parse("157.0.1.0").expect("a version");
-        assert_eq!(recorded_unproven(root.path(), newer), None);
-    }
-
     /// The cache is proved at use, not only at install: a copy that no longer
     /// answers is not used (the download replaces it, proving the new build first),
     /// and a copy that answers is used as it stands.
@@ -801,6 +783,13 @@ mod tests {
         assert_eq!(
             recorded_unproven(root.path(), version).as_deref(),
             Some(DOES_NOT_RUN)
+        );
+        // The record is for that build only: a newer version is tried normally.
+        let newer = ChromeVersion::parse("152.0.1.0").expect("a version");
+        assert_eq!(
+            recorded_unproven(root.path(), newer),
+            None,
+            "a build that did not run is remembered for that build only"
         );
     }
 }

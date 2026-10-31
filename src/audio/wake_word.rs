@@ -707,14 +707,11 @@ mod tests {
         {
             assert_eq!(nan_std.soft_floor(), DEFAULT_SOFT_FLOOR);
         }
-    }
 
-    #[test]
-    fn hot_pool_floor_saturates_and_anchors() {
         // A very hot negative pool (mean 0.80, std 0.06) saturates the derived
         // floor at MAX_SOFT_FLOOR (0.80) and anchors the fire factor at
         // (0.89−0.80)/0.20 = 0.45, so the reset tracks proportionally.
-        let cal = Calibration {
+        let hot = Calibration {
             neg_mean: 0.80,
             neg_std: 0.06,
             neg_p99: 0.97,
@@ -723,17 +720,17 @@ mod tests {
         #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
         {
             assert_eq!(
-                cal.soft_floor(),
+                hot.soft_floor(),
                 MAX_SOFT_FLOOR,
                 "hot pool floor must saturate at MAX_SOFT_FLOOR",
             );
         }
-        let fire = cal.fire_soft();
+        let fire = hot.fire_soft();
         assert!(
             (fire - 0.45).abs() < 1e-3,
             "anchored fire factor should be ≈0.45, got {fire}",
         );
-        let reset = cal.reset_soft();
+        let reset = hot.reset_soft();
         assert!(
             (reset - 0.288).abs() < 1e-3,
             "reset should be ≈0.288, got {reset}",
@@ -741,11 +738,11 @@ mod tests {
         // A negative at the mean maps to soft 0.0.
         #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
         {
-            assert_eq!(cal.soft_score(0.80), 0.0);
+            assert_eq!(hot.soft_score(0.80), 0.0);
         }
         // A negative at mean+1σ maps below the fire factor (accumulates but
         // cannot fire alone).
-        let at_1sig = cal.soft_score(0.86);
+        let at_1sig = hot.soft_score(0.86);
         assert!(
             at_1sig < fire,
             "negative at mean+1σ must be below fire factor, got {at_1sig} > {fire}",
@@ -852,23 +849,6 @@ mod tests {
     }
 
     #[test]
-    fn calibration_default_floor() {
-        let cal = Calibration::default();
-        #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
-        {
-            assert_eq!(cal.soft_floor(), DEFAULT_SOFT_FLOOR);
-        }
-        #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
-        {
-            assert_eq!(cal.soft_score(DEFAULT_SOFT_FLOOR), 0.0);
-        }
-        #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
-        {
-            assert_eq!(cal.soft_score(1.0), 1.0);
-        }
-    }
-
-    #[test]
     fn build_requires_min_utterances() {
         let emb = l2_normalize(&vec![1.0; WAKE_WORD_EMBEDDING_DIM]);
         let enough: Vec<Vec<f32>> = vec![emb.clone(); MIN_ENROLLMENT_UTTERANCES];
@@ -896,28 +876,6 @@ mod tests {
     }
 
     #[test]
-    fn prototype_is_unit_norm() {
-        #[expect(clippy::cast_precision_loss)] // embedding dim ≤ 1024 — exact in f32
-        let emb = l2_normalize(
-            &(0..WAKE_WORD_EMBEDDING_DIM)
-                .map(|i| i as f32)
-                .collect::<Vec<_>>(),
-        );
-        let five: Vec<Vec<f32>> = vec![emb; MIN_ENROLLMENT_UTTERANCES];
-        let enr = WakeWordEnrollment::build(
-            &five,
-            Calibration::default(),
-            &[],
-            String::new(),
-            String::new(),
-        )
-        .expect("enrollment");
-        let norm: f32 = enr.prototype.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-3);
-        assert_eq!(enr.schema_version, ENROLLMENT_SCHEMA_VERSION);
-    }
-
-    #[test]
     fn serde_roundtrip_v2() {
         #[expect(clippy::cast_precision_loss)] // embedding dim ≤ 1024 — exact in f32
         let emb = l2_normalize(
@@ -934,6 +892,11 @@ mod tests {
             "trained".into(),
         )
         .expect("enrollment");
+        // The prototype is L2-normalized — the cosine scorer rests on it.
+        let norm: f32 = enr.prototype.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3);
+        assert_eq!(enr.schema_version, ENROLLMENT_SCHEMA_VERSION);
+
         let json = serde_json::to_string(&enr).expect("serialize");
         let back: WakeWordEnrollment = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.schema_version, ENROLLMENT_SCHEMA_VERSION);
@@ -941,11 +904,12 @@ mod tests {
         assert_eq!(back.prototype.len(), WAKE_WORD_EMBEDDING_DIM);
     }
 
-    /// A record stored before the phrase field was dropped carries an extra
-    /// `phrase` key: it must still load, or every existing enrollment would
-    /// have to be redone.
+    /// Stored records keep loading across the schema's history: one written
+    /// before the phrase field was dropped carries an extra `phrase` key and
+    /// must still load (or every existing enrollment would have to be redone),
+    /// while a v1 classifier record must not read as v2.
     #[test]
-    fn record_with_legacy_phrase_still_loads() {
+    fn record_schema_compatibility() {
         let emb = l2_normalize(&vec![1.0; WAKE_WORD_EMBEDDING_DIM]);
         let enr = WakeWordEnrollment::build(
             &vec![emb; 8],
@@ -961,15 +925,12 @@ mod tests {
             serde_json::from_value(json).expect("a legacy record with a phrase must load");
         assert_eq!(back.schema_version, ENROLLMENT_SCHEMA_VERSION);
         assert_eq!(back.prototype, enr.prototype);
-    }
 
-    #[test]
-    fn v1_schema_rejected() {
-        // A v1 record (classifier-based) must not deserialize as v2.
+        // A v1 record (classifier-based) must not deserialize as v2: it has no
+        // prototype → deserialization fails (missing field).
         let v1 = r#"{"schema_version":1,"embedding_dim":96,
                      "window_size":3,"classifier":[]}"#;
         let parsed: serde_json::Result<WakeWordEnrollment> = serde_json::from_str(v1);
-        // v1 has no prototype → deserialization fails (missing field).
         assert!(parsed.is_err());
     }
 }

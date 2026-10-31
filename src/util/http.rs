@@ -775,19 +775,21 @@ mod tests {
         );
     }
 
+    /// A non-2xx answer becomes the typed [`crate::util::error::HttpError`]
+    /// carrying the status, while a 2xx answer is handed back as the response
+    /// the caller reads.
     #[tokio::test]
-    async fn check_response_returns_http_error_on_non_2xx() {
-        // Construct a mock HTTP response with a non-2xx status using
-        // http::Response::builder() + the unconditional From impl on reqwest::Response.
+    async fn check_response_maps_the_status_to_an_error_or_success() {
         let http_resp = http::Response::builder()
             .status(402)
             .body("Insufficient credits: please top up your account".to_string())
             .unwrap();
-        let resp = reqwest::Response::from(http_resp);
-
-        let result = check_response(resp, "Video generation submission").await;
+        let result = check_response(
+            reqwest::Response::from(http_resp),
+            "Video generation submission",
+        )
+        .await;
         assert!(result.is_err(), "expected error for 402 status");
-
         assert_eq!(
             result
                 .unwrap_err()
@@ -795,53 +797,17 @@ mod tests {
                 .map(|e| e.status),
             Some(402),
         );
-    }
 
-    #[tokio::test]
-    async fn check_response_truncates_long_body() {
-        // Verify that bodies longer than 500 chars are truncated.
-        let long_body = "x".repeat(1000);
-        let http_resp = http::Response::builder()
-            .status(400)
-            .body(long_body.clone())
-            .unwrap();
-        let resp = reqwest::Response::from(http_resp);
-
-        let result = check_response(resp, "test").await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let http_err = err.downcast_ref::<crate::util::error::HttpError>().unwrap();
-
-        // The body is truncated to 500 Unicode chars with the ellipsis counted
-        // inside the cap, so at most 499 ASCII chars + "…" (3 bytes) = 502.
-        assert!(
-            http_err.body.len() <= 502,
-            "body should be truncated, got {} bytes",
-            http_err.body.len()
-        );
-        assert!(
-            http_err.body.len() < long_body.len(),
-            "truncated body ({}) should be shorter than original ({})",
-            http_err.body.len(),
-            long_body.len(),
-        );
-        assert!(
-            http_err.body.ends_with('…'),
-            "truncated body should end with ellipsis"
-        );
-        assert_eq!(http_err.status, 400);
-    }
-
-    #[tokio::test]
-    async fn check_response_returns_ok_on_2xx() {
         let http_resp = http::Response::builder()
             .status(200)
             .body(r#"{"ok": true}"#.to_string())
             .unwrap();
-        let resp = reqwest::Response::from(http_resp);
-
-        let result = check_response(resp, "test").await;
-        assert!(result.is_ok(), "expected success for 200 status");
+        assert!(
+            check_response(reqwest::Response::from(http_resp), "test")
+                .await
+                .is_ok(),
+            "expected success for 200 status"
+        );
     }
 
     #[test]

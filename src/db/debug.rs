@@ -1529,33 +1529,168 @@ mod tests {
         );
     }
 
-    /// End-to-end: `run_debug_with_args` opens a real (temporary) store
-    /// read-only through the `turso::core` path and runs a query against it.
+    /// A `mahbot debug` invocation over the given verb tail.
+    fn debug_args(tail: &[&str]) -> Vec<String> {
+        ["mahbot", "debug"]
+            .into_iter()
+            .chain(tail.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The direct route and the `--db all` walk read the store they name and
+    /// create nothing beside it; the walk reports every store it could not read
+    /// per store instead of stopping at the first.
     #[serial_test::serial(read_limit)]
     #[tokio::test]
-    async fn run_debug_queries_a_real_store_read_only() {
+    async fn run_debug_reads_one_store_and_the_whole_set_without_creating_anything() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let db_dir = dir.path().join("db");
         let before = dir_names(&db_dir);
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "--db".to_string(),
-            "logs".to_string(),
-            "SELECT COUNT(*) FROM logs".to_string(),
-        ];
-        let result = run_debug_with_args(args, Some(dir.path().to_path_buf())).await;
+
+        let result = run_debug_with_args(
+            debug_args(&["--db", "logs", "SELECT COUNT(*) FROM logs"]),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
         assert!(
             result.is_ok(),
-            "read-only query on a real store must succeed: {result:?}"
+            "direct route: a read-only query must succeed: {result:?}"
         );
-
-        // The read-only open must create nothing in the store directory.
         assert_eq!(
             dir_names(&db_dir),
             before,
-            "the read-only open must leave the store directory unchanged"
+            "direct route: the read-only open must leave the store directory unchanged"
         );
+
+        // Computed from the physical store source (the single source of truth), so
+        // the test does not hardcode the current store count — only the logs store
+        // exists here, so the consolidated core file is missing.
+        let err = run_debug_with_args(debug_args(&["--db", "all"]), Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("--db all: a missing store must report a failure summary");
+        let msg = format!("{err:#}");
+        let total = physical_store_list(dir.path()).len();
+        assert!(
+            msg.contains(&format!("{} of {total} store(s) failed", total - 1)),
+            "--db all: must summarize per-store failures, got: {msg}"
+        );
+    }
+
+    /// The family route reads a pre-reindex family in place: the committed but
+    /// never-checkpointed row lives only in the family's wal, so reading it
+    /// proves the query covers both members — and touches neither.
+    #[serial_test::serial(read_limit)]
+    #[tokio::test]
+    async fn run_debug_queries_a_pre_reindex_family_in_place() {
+        let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let db_dir = dir.path().join("db");
+        store
+            .flush_batch(
+                "j1",
+                "Engineer",
+                "ws1",
+                crate::stats::CallSource::Agent,
+                &crate::db::now(),
+                &[crate::ToolCallRecord {
+                    tool_name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                    duration_ms: 1,
+                    success: true,
+                    error_message: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let fam = "logs.db.pre-reindex-20260812T120000Z-4242";
+        move_family_aside(&db_dir, &db_dir.join("logs.db"), fam);
+        assert!(
+            std::fs::metadata(db_dir.join(format!("{fam}-wal")))
+                .unwrap()
+                .len()
+                > 0,
+            "family route: the pre-reindex wal must hold committed frames"
+        );
+        let family_before: Vec<((u64, std::time::SystemTime), String)> = std::fs::read_dir(&db_dir)
+            .unwrap()
+            .map(|e| {
+                let path = e.unwrap().path();
+                (
+                    file_state(&path),
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+
+        run_debug_with_args(
+            debug_args(&["--family", fam, "SELECT COUNT(*) FROM tool_calls"]),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect("family route: a pre-reindex family must be queryable in place");
+
+        let after_names: Vec<String> = std::fs::read_dir(&db_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            after_names.len(),
+            family_before.len(),
+            "family route: an in-place query must not create files beside the family"
+        );
+        for (state, name) in &family_before {
+            assert_eq!(
+                file_state(&db_dir.join(name)),
+                *state,
+                "family route: file must be unchanged: {name}"
+            );
+        }
+
+        let budget = Budget::start();
+        let read = Read::direct(fam, &budget);
+        let out =
+            execute_family_query(read, fam, "SELECT COUNT(*) FROM tool_calls", dir.path()).unwrap();
+        assert_eq!(
+            out, "COUNT(*)\n1\n",
+            "family route: the in-place query must read the wal-only row"
+        );
+    }
+
+    /// The held-location route: with the location held, the CLI must reach the
+    /// instance's endpoint instead of opening the store — the CLI's own root
+    /// holds no openable store, so a successful read can only have come from the
+    /// running instance.
+    #[serial_test::serial(read_limit)]
+    #[tokio::test]
+    async fn run_debug_reaches_a_held_location_over_the_channel() {
+        let (instance_store, _instance_dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        instance_store
+            .conn
+            .execute_batch(
+                "INSERT INTO logs (timestamp, level, target, message) \
+                 VALUES ('2026-01-01T00:00:00Z', 'INFO', 'test', 'ipc-row')",
+            )
+            .await
+            .expect("insert a committed row");
+        let root = tempfile::TempDir::new().unwrap();
+        let ipc_db_dir = root.path().join("db");
+        std::fs::create_dir_all(&ipc_db_dir).unwrap();
+        std::fs::write(ipc_db_dir.join("logs.db"), b"not a store").unwrap();
+        let _held = hold_location(root.path());
+        let listener_root = root.path().to_path_buf();
+        let listener = tokio::spawn(async move {
+            crate::db::ipc::run_ipc_listener(&listener_root, std::sync::Arc::new(instance_store))
+                .await;
+        });
+        // No wait for the endpoint to be bound: the CLI's own channel-bound retry
+        // covers a late bind, which is what makes this portable.
+        run_debug_with_args(
+            debug_args(&["--db", "logs", "SELECT COUNT(*) FROM logs"]),
+            Some(root.path().to_path_buf()),
+        )
+        .await
+        .expect("held location: must be queried through the instance's channel");
+        listener.abort();
     }
 
     /// The schema dump (`--db <name>` with no SQL) reflects the LIVE stored
@@ -1610,24 +1745,17 @@ mod tests {
             !dump.contains("sqlite_sequence"),
             "sqlite_sequence must be excluded: {dump}"
         );
-    }
 
-    /// `mahbot debug --db <name>` without a SQL argument dumps the store schema
-    /// and exits 0 — and, like the query path, leaves the store directory
-    /// untouched.
-    #[serial_test::serial(read_limit)]
-    #[tokio::test]
-    async fn run_debug_dumps_schema_without_sql() {
-        let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        // Without a SQL argument the same dump is what `mahbot debug --db
+        // <name>` prints: it exits 0 and leaves the store directory untouched,
+        // like the query path.
         let db_dir = dir.path().join("db");
         let before = dir_names(&db_dir);
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "--db".to_string(),
-            "logs".to_string(),
-        ];
-        let result = run_debug_with_args(args, Some(dir.path().to_path_buf())).await;
+        let result = run_debug_with_args(
+            debug_args(&["--db", "logs"]),
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
         assert!(
             result.is_ok(),
             "schema dump without SQL must succeed: {result:?}"
@@ -1639,56 +1767,30 @@ mod tests {
         );
     }
 
-    /// `mahbot debug --db all` without a SQL argument dumps every present
-    /// store and reports missing stores per-store with a failure summary
-    /// (exit 1) — matching the query verb's `--db all` failure semantics.
-    #[serial_test::serial(read_limit)]
-    #[tokio::test]
-    async fn run_debug_dump_all_reports_missing_stores() {
-        let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "--db".to_string(),
-            "all".to_string(),
-        ];
-        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
-            .await
-            .expect_err("--db all with missing stores must report a failure summary");
-        let msg = format!("{err:#}");
-        // Compute the expectation from the physical store source (the single
-        // source of truth) so the test does not hardcode the current store
-        // count — only the logs store exists, so the consolidated core file
-        // is missing.
-        let total = physical_store_list(dir.path()).len();
-        assert!(
-            msg.contains(&format!("{} of {total} store(s) failed", total - 1)),
-            "must summarize per-store failures, got: {msg}"
-        );
-    }
-
     // ── read-limit tests ─────────────────────────────────────────────
 
-    /// With the read limit at zero the direct route fails before it opens the
-    /// store: the error names the store and the limit, and the store directory
-    /// is byte-identical (nothing was opened).
+    /// A spent budget fails every route before it opens anything: the error names
+    /// the store or the family id it was given and the limit, the store directory
+    /// stays byte-identical (nothing was opened), and every store the `--db all`
+    /// walk reaches is counted as failed through its summary rather than silently
+    /// skipped. The stack's end-of-read verdict — a read that comes back past the
+    /// limit is the limit's failure — is pinned deterministically by
+    /// `run_debug_read_limit_fails_a_read_that_finished_after_it`.
     #[serial_test::serial(read_limit)]
     #[tokio::test]
-    async fn run_debug_read_limit_fails_the_direct_route_immediately() {
+    async fn run_debug_read_limit_fails_every_route() {
         let _env = crate::util::test::set_env_var(read_limit::ENV, Some("0"));
+
+        // Direct: the error names the store, the limit and the knob.
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let db_dir = dir.path().join("db");
         let before = dir_names(&db_dir);
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "--db".to_string(),
-            "logs".to_string(),
-            "SELECT COUNT(*) FROM logs".to_string(),
-        ];
-        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
-            .await
-            .expect_err("a spent read budget must fail the read");
+        let err = run_debug_with_args(
+            debug_args(&["--db", "logs", "SELECT COUNT(*) FROM logs"]),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect_err("a spent read budget must fail the read");
         let msg = format!("{err:#}");
         assert!(msg.contains("'logs'"), "error must name the store: {msg}");
         assert!(
@@ -1703,6 +1805,39 @@ mod tests {
             dir_names(&db_dir),
             before,
             "a spent budget must fail before the store is opened"
+        );
+
+        // Family: refused before the snapshot file is opened, naming the id.
+        let fam_dir = tempfile::TempDir::new().unwrap();
+        let fam_db_dir = fam_dir.path().join("db");
+        std::fs::create_dir_all(&fam_db_dir).unwrap();
+        let fam = "logs.db.quarantine-20260812T120000Z-4242";
+        std::fs::write(fam_db_dir.join(fam), valid_db_bytes()).unwrap();
+        let err = run_debug_with_args(
+            debug_args(&["--family", fam, "SELECT 1"]),
+            Some(fam_dir.path().to_path_buf()),
+        )
+        .await
+        .expect_err("a spent read budget must fail the family read");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(fam), "error must name the family id: {msg}");
+        assert!(
+            msg.contains("0s read limit"),
+            "error must name the limit: {msg}"
+        );
+
+        // `--db all`: never an empty result, never a silent skip. The per-store
+        // "was not read" lines are stderr text, which a test cannot capture
+        // in-process; what is pinned is that every store the walk reached is
+        // counted as failed and the exit is non-zero.
+        let err = run_debug_with_args(debug_args(&["--db", "all"]), Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("a spent budget must fail --db all");
+        let msg = format!("{err:#}");
+        let total = physical_store_list(dir.path()).len();
+        assert!(
+            msg.contains(&format!("{total} of {total} store(s) failed")),
+            "must summarize every store as failed, got: {msg}"
         );
     }
 
@@ -1738,67 +1873,6 @@ mod tests {
         assert!(
             msg.contains("1s read limit"),
             "error must name the limit: {msg}"
-        );
-    }
-
-    /// The `--family` snapshot route reads under the same command budget and on the
-    /// same read-only stack as the `--db` routes ([`open_and_run_readonly`]), so with
-    /// the budget spent it fails naming the family id it was given, before the
-    /// snapshot file is opened. The stack's end-of-read verdict — a read that comes
-    /// back past the limit is the limit's failure — is pinned deterministically by
-    /// `run_debug_read_limit_fails_a_read_that_finished_after_it`.
-    #[serial_test::serial(read_limit)]
-    #[tokio::test]
-    async fn run_debug_read_limit_fails_the_family_route() {
-        let _env = crate::util::test::set_env_var(read_limit::ENV, Some("0"));
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_dir = dir.path().join("db");
-        std::fs::create_dir_all(&db_dir).unwrap();
-        let fam = "logs.db.quarantine-20260812T120000Z-4242";
-        std::fs::write(db_dir.join(fam), valid_db_bytes()).unwrap();
-
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "--family".to_string(),
-            fam.to_string(),
-            "SELECT 1".to_string(),
-        ];
-        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
-            .await
-            .expect_err("a spent read budget must fail the family read");
-        let msg = format!("{err:#}");
-        assert!(msg.contains(fam), "error must name the family id: {msg}");
-        assert!(
-            msg.contains("0s read limit"),
-            "error must name the limit: {msg}"
-        );
-    }
-
-    /// `--db all` under a spent budget reports every remaining store as not read
-    /// and exits non-zero through the per-store summary — never an empty result
-    /// and never a silent skip. The per-store "was not read" lines are stderr text,
-    /// which a test cannot capture in-process; what is pinned here is that every
-    /// store the walk reached is counted as failed and the exit is non-zero.
-    #[serial_test::serial(read_limit)]
-    #[tokio::test]
-    async fn run_debug_read_limit_fails_db_all_with_a_summary() {
-        let _env = crate::util::test::set_env_var(read_limit::ENV, Some("0"));
-        let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "--db".to_string(),
-            "all".to_string(),
-        ];
-        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
-            .await
-            .expect_err("a spent budget must fail --db all");
-        let msg = format!("{err:#}");
-        let total = physical_store_list(dir.path()).len();
-        assert!(
-            msg.contains(&format!("{total} of {total} store(s) failed")),
-            "must summarize every store as failed, got: {msg}"
         );
     }
 
@@ -1937,14 +2011,10 @@ mod tests {
         std::fs::create_dir_all(&db_dir).unwrap();
         let fam = "logs.db.quarantine-20260812T120000Z-4242";
         let run = |sql: &str| {
-            let args = vec![
-                "mahbot".to_string(),
-                "debug".to_string(),
-                "--family".to_string(),
-                fam.to_string(),
-                sql.to_string(),
-            ];
-            run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            run_debug_with_args(
+                debug_args(&["--family", fam, sql]),
+                Some(dir.path().to_path_buf()),
+            )
         };
 
         // Sidecar-only quarantine: listed but not queryable — a clear
@@ -1978,100 +2048,6 @@ mod tests {
         assert!(is_engine_panic_error(&err), "panic must be engine-panic");
     }
 
-    /// A forensic family (db + wal) is queried **in place** — the read-only
-    /// open must not create or modify any file beside the family.
-    #[serial_test::serial(read_limit)]
-    #[tokio::test]
-    async fn run_debug_queries_a_family_in_place() {
-        let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
-        let db_dir = dir.path().join("db");
-        let fam = "logs.db.pre-reindex-20260812T120000Z-4242";
-        // The committed row lives only in the wal (no checkpoint): the query
-        // result below must show it, behaviorally proving the read reads
-        // db + wal — a db-only read would report COUNT 0.
-        store
-            .flush_batch(
-                "j1",
-                "Engineer",
-                "ws1",
-                crate::stats::CallSource::Agent,
-                &crate::db::now(),
-                &[crate::ToolCallRecord {
-                    tool_name: "read".to_string(),
-                    arguments: "{}".to_string(),
-                    duration_ms: 1,
-                    success: true,
-                    error_message: None,
-                }],
-            )
-            .await
-            .unwrap();
-
-        // Move the whole family aside (db + wal) — the pre-reindex shape.
-        move_family_aside(&db_dir, &db_dir.join("logs.db"), fam);
-
-        // The moved wal holds the store's schema frames (the test store is
-        // dropped without a checkpoint), so a successful query exercises the
-        // db + wal read.
-        assert!(
-            std::fs::metadata(db_dir.join(format!("{fam}-wal")))
-                .unwrap()
-                .len()
-                > 0,
-            "pre-reindex wal must hold committed frames"
-        );
-
-        let before: Vec<((u64, std::time::SystemTime), String)> = std::fs::read_dir(&db_dir)
-            .unwrap()
-            .map(|e| {
-                let path = e.unwrap().path();
-                (
-                    file_state(&path),
-                    path.file_name().unwrap().to_string_lossy().into_owned(),
-                )
-            })
-            .collect();
-
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "--family".to_string(),
-            fam.to_string(),
-            "SELECT COUNT(*) FROM tool_calls".to_string(),
-        ];
-        run_debug_with_args(args, Some(dir.path().to_path_buf()))
-            .await
-            .expect("pre-reindex family must be queryable in place");
-
-        // The family must be untouched and no new files created beside it.
-        let after_names: Vec<String> = std::fs::read_dir(&db_dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            after_names.len(),
-            before.len(),
-            "in-place family query must not create files beside the family"
-        );
-        for (state, name) in &before {
-            assert_eq!(
-                file_state(&db_dir.join(name)),
-                *state,
-                "family file must be unchanged: {name}"
-            );
-        }
-
-        // Data fidelity: the wal-only committed row must be visible.
-        let budget = Budget::start();
-        let read = Read::direct(fam, &budget);
-        let out =
-            execute_family_query(read, fam, "SELECT COUNT(*) FROM tool_calls", dir.path()).unwrap();
-        assert_eq!(
-            out, "COUNT(*)\n1\n",
-            "in-place query must read the wal-only row"
-        );
-    }
-
     /// `--family` rejects ids that are not family names (path-safety gate).
     #[tokio::test]
     async fn run_debug_family_rejects_invalid_id() {
@@ -2081,16 +2057,12 @@ mod tests {
             "board.db",
             "board.db.quarantine-20260812T120000Z-1-wal",
         ] {
-            let args = vec![
-                "mahbot".to_string(),
-                "debug".to_string(),
-                "--family".to_string(),
-                bad.to_string(),
-                "SELECT 1".to_string(),
-            ];
-            let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
-                .await
-                .expect_err("invalid family id must be rejected");
+            let err = run_debug_with_args(
+                debug_args(&["--family", bad, "SELECT 1"]),
+                Some(dir.path().to_path_buf()),
+            )
+            .await
+            .expect_err("invalid family id must be rejected");
             let msg = format!("{err:#}");
             assert!(msg.contains("invalid family id"), "got: {msg}");
         }
@@ -2125,9 +2097,7 @@ mod tests {
             vec!["--db", "board", "-h", "extra"],
             vec!["families", "--db", "board", "--help"],
         ] {
-            let mut args = vec!["mahbot".to_string(), "debug".to_string()];
-            args.extend(tail.into_iter().map(str::to_owned));
-            run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            run_debug_with_args(debug_args(&tail), Some(dir.path().to_path_buf()))
                 .await
                 .unwrap_or_else(|e| panic!("help must print usage and exit 0: {e:#}"));
         }
@@ -2143,27 +2113,23 @@ mod tests {
         // A name matching no family (canonical store without families,
         // unknown/legacy name) prints nothing and exits 0 — the filter never
         // depends on the current listing content.
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "families".to_string(),
-            "--db".to_string(),
-            "nonexistent".to_string(),
-        ];
-        run_debug_with_args(args, Some(dir.path().to_path_buf()))
-            .await
-            .expect("families --db <matching-nothing> must print nothing and exit 0");
+        run_debug_with_args(
+            debug_args(&["families", "--db", "nonexistent"]),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect("families --db <matching-nothing> must print nothing and exit 0");
 
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "--family".to_string(),
-            "logs.db.quarantine-20260812T120000Z-4242".to_string(),
-            "SELECT 1".to_string(),
-        ];
-        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
-            .await
-            .expect_err("a well-formed but missing family must fail");
+        let err = run_debug_with_args(
+            debug_args(&[
+                "--family",
+                "logs.db.quarantine-20260812T120000Z-4242",
+                "SELECT 1",
+            ]),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect_err("a well-formed but missing family must fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("not found"), "got: {msg}");
         assert!(!msg.contains("sidecar-only"), "got: {msg}");
@@ -2174,16 +2140,12 @@ mod tests {
         std::fs::create_dir_all(&db_dir).unwrap();
         let legacy = "stats.db.quarantine-20260812T120000Z-7";
         std::fs::write(db_dir.join(legacy), valid_db_bytes()).unwrap();
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "families".to_string(),
-            "--db".to_string(),
-            "stats".to_string(),
-        ];
-        run_debug_with_args(args, Some(dir.path().to_path_buf()))
-            .await
-            .expect("legacy store family must be filterable by --db");
+        run_debug_with_args(
+            debug_args(&["families", "--db", "stats"]),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect("legacy store family must be filterable by --db");
     }
 
     /// End-to-end no-instance path: a row committed to the WAL (the store is
@@ -2211,16 +2173,12 @@ mod tests {
             ),
             "temp root has no mahbot.lock — no instance must be considered to hold it"
         );
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "--db".to_string(),
-            "logs".to_string(),
-            "SELECT COUNT(*) FROM logs".to_string(),
-        ];
-        run_debug_with_args(args, Some(dir.path().to_path_buf()))
-            .await
-            .expect("direct read of committed WAL rows must succeed");
+        run_debug_with_args(
+            debug_args(&["--db", "logs", "SELECT COUNT(*) FROM logs"]),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect("direct read of committed WAL rows must succeed");
 
         // Prove the WAL-only row is actually visible via the direct open.
         let db_path = dir.path().join("db").join("logs.db");
@@ -2249,106 +2207,45 @@ mod tests {
         lock
     }
 
-    /// While an instance holds the storage location, the CLI must reach it
-    /// through the channel instead of opening the store: the CLI's own root
-    /// holds no openable store here, so a successful read can only have come
-    /// from the running instance's endpoint.
-    // `read_limit` is shared with the refusal test: both read/shrink the same
-    // process-global read-limit knob.
+    /// A held location the CLI cannot reach is refused, never opened: the store
+    /// here is a real one it could read directly, so an `Ok` would mean it read
+    /// the live store behind the instance's back. The probe's third state is a
+    /// refusal too — a lock file that exists but cannot be opened must never be
+    /// read as "no instance is running".
     #[serial_test::serial(read_limit)]
     #[tokio::test]
-    async fn run_debug_reaches_a_held_location_through_the_channel() {
-        // The instance side: a live store in a root of its own.
-        let (store, _store_dir) = crate::open_test_store!(crate::logs::LogStore, "log");
-        store
-            .conn
-            .execute_batch(
-                "INSERT INTO logs (timestamp, level, target, message) \
-                 VALUES ('2026-01-01T00:00:00Z', 'INFO', 'test', 'ipc-row')",
-            )
-            .await
-            .expect("insert a committed row");
-
-        // The CLI side: the location is held, and its store file is NOT a store
-        // — a direct open would fail, so the answer can only come over IPC.
-        let root = tempfile::TempDir::new().unwrap();
-        let db_dir = root.path().join("db");
-        std::fs::create_dir_all(&db_dir).unwrap();
-        std::fs::write(db_dir.join("logs.db"), b"not a store").unwrap();
-        let _held = hold_location(root.path());
-
-        let listener_root = root.path().to_path_buf();
-        let listener = tokio::spawn(async move {
-            crate::db::ipc::run_ipc_listener(&listener_root, std::sync::Arc::new(store)).await;
-        });
-        // No wait for the endpoint to be bound: the CLI's own channel-bound
-        // retry covers a late bind, which is what makes this test portable.
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "--db".to_string(),
-            "logs".to_string(),
-            "SELECT COUNT(*) FROM logs".to_string(),
-        ];
-        run_debug_with_args(args, Some(root.path().to_path_buf()))
-            .await
-            .expect("a held location must be queried through the instance's channel");
-        listener.abort();
-    }
-
-    /// While an instance holds the storage location but its channel cannot be
-    /// reached, the CLI must refuse with its own sentence and leave the store
-    /// alone. The store here is a real one the CLI could read directly, so an
-    /// `Ok` would mean it opened the live store behind the instance's back.
-    #[tokio::test]
-    // `read_limit` is shared with the held-location test: both read the same
-    // process-global knob, and shrinking it is what keeps this refusal short.
-    #[serial_test::serial(read_limit)]
-    async fn run_debug_refuses_a_held_location_without_a_channel() {
+    async fn run_debug_refuses_a_held_location_it_cannot_reach() {
         // One second, not zero: a spent budget is reported as the limit's own
         // failure without ever reaching the channel, which is a different
-        // sentence — this test is about the channel that cannot be reached, so
-        // the retries must still happen, within a second instead of the default.
-        let _env = crate::util::test::set_env_var(read_limit::ENV, Some("1"));
-        let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
-        let _held = hold_location(dir.path());
+        // sentence — this is about the channel that cannot be reached, so the
+        // retries must still happen, within a second instead of the default.
+        {
+            let _env = crate::util::test::set_env_var(read_limit::ENV, Some("1"));
+            let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+            let _held = hold_location(dir.path());
 
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "--db".to_string(),
-            "logs".to_string(),
-            "SELECT COUNT(*) FROM logs".to_string(),
-        ];
-        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            let err = run_debug_with_args(
+                debug_args(&["--db", "logs", "SELECT COUNT(*) FROM logs"]),
+                Some(dir.path().to_path_buf()),
+            )
             .await
             .expect_err("a held location without a reachable channel must refuse");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("instance is running"), "got: {msg}");
-        assert!(msg.contains("left untouched"), "got: {msg}");
-    }
+            let msg = format!("{err:#}");
+            assert!(msg.contains("instance is running"), "got: {msg}");
+            assert!(msg.contains("left untouched"), "got: {msg}");
+        }
 
-    /// The probe's third state is also a refusal: when the CLI cannot tell
-    /// whether an instance holds the location (here the lock file exists but
-    /// cannot be opened), it must refuse and leave the store alone rather than
-    /// treat the failed probe as "no instance is running".
-    #[tokio::test]
-    async fn run_debug_refuses_when_the_lock_probe_cannot_tell() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         // A directory where the lock file belongs: the probe cannot open it.
         std::fs::create_dir(crate::util::lock::lock_file_path(dir.path()))
             .expect("occupy the lock file path");
 
-        let args = vec![
-            "mahbot".to_string(),
-            "debug".to_string(),
-            "--db".to_string(),
-            "logs".to_string(),
-            "SELECT COUNT(*) FROM logs".to_string(),
-        ];
-        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
-            .await
-            .expect_err("an undecidable lock probe must refuse");
+        let err = run_debug_with_args(
+            debug_args(&["--db", "logs", "SELECT COUNT(*) FROM logs"]),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect_err("an undecidable lock probe must refuse");
         let msg = format!("{err:#}");
         assert!(msg.contains("cannot tell whether"), "got: {msg}");
         assert!(msg.contains("left untouched"), "got: {msg}");

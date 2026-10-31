@@ -813,26 +813,51 @@ mod tests {
         assert_eq!(data_uri_base64_payload(&over), None);
     }
 
+    /// A local target is a path the classifier can decode. A placeholder, a
+    /// relative basename, a missing path, a non-image file and a
+    /// magic-valid-but-truncated raster are all refused as targets — the
+    /// classifier requires a real decode, so nothing downstream renders a broken
+    /// image or emits a junk data-URI.
     #[test]
-    fn local_raster_and_non_image() {
+    fn local_targets_classify_by_a_real_decode() {
         let png = write_temp_png("valid");
-        let text = std::env::temp_dir().join(format!(
+        let dir = png.parent().expect("temp path has a parent");
+        let text = dir.join(format!(
             "mahbot_media_target_{}_notimage.txt",
             std::process::id()
         ));
         std::fs::write(&text, b"top secret").unwrap();
+        let corrupt = dir.join(format!(
+            "mahbot_media_target_{}_trunc.png",
+            std::process::id()
+        ));
+        let bytes = std::fs::read(&png).unwrap();
+        std::fs::write(&corrupt, &bytes[..bytes.len().min(24)]).unwrap();
 
         assert_eq!(
             classify_media_image_target(png.to_str().unwrap()),
             MediaTarget::LocalImage
         );
-        assert_eq!(
-            classify_media_image_target(text.to_str().unwrap()),
-            MediaTarget::Invalid
-        );
+        for invalid in [
+            "",
+            "   ",
+            "...",
+            // Relative basename is never a valid local image target.
+            "photo.png",
+            "/tmp/definitely_missing_mahbot.png",
+            text.to_str().unwrap(),
+            corrupt.to_str().unwrap(),
+        ] {
+            assert_eq!(
+                classify_media_image_target(invalid),
+                MediaTarget::Invalid,
+                "target: {invalid:?}"
+            );
+        }
 
         let _ = std::fs::remove_file(&png);
         let _ = std::fs::remove_file(&text);
+        let _ = std::fs::remove_file(&corrupt);
     }
 
     #[test]
@@ -848,23 +873,6 @@ mod tests {
             .expect("a sparse oversized raster");
         assert_eq!(local_refusal(MediaMarkerKind::Image, &png), None);
         let _ = std::fs::remove_file(&png);
-    }
-
-    #[test]
-    fn placeholders_and_relative_are_invalid() {
-        assert_eq!(classify_media_image_target(""), MediaTarget::Invalid);
-        assert_eq!(classify_media_image_target("   "), MediaTarget::Invalid);
-        assert_eq!(classify_media_image_target("..."), MediaTarget::Invalid);
-        // Relative basename is never a valid local image target.
-        assert_eq!(
-            classify_media_image_target("photo.png"),
-            MediaTarget::Invalid
-        );
-        // Nonexistent absolute path.
-        assert_eq!(
-            classify_media_image_target("/tmp/definitely_missing_mahbot.png"),
-            MediaTarget::Invalid
-        );
     }
 
     #[test]
@@ -914,28 +922,5 @@ mod tests {
             resolve_marker_target("plot.png", &roots),
             MarkerTarget::Local(dir.path().join("plot.png"))
         );
-    }
-
-    #[test]
-    fn truncated_local_raster_is_invalid() {
-        // A local file whose leading bytes sniff as PNG (valid magic + IHDR) but
-        // whose payload is truncated must classify as INVALID, not LocalImage:
-        // the classifier is the single authoritative gate and requires a real
-        // decode, so a corrupt-but-magic-valid file is never accepted (it would
-        // render as a broken image / emit a junk data-URI downstream).
-        let png = write_temp_png("trunc");
-        let bytes = std::fs::read(&png).unwrap();
-        let truncated = &bytes[..bytes.len().min(24)];
-        let corrupt = std::env::temp_dir().join(format!(
-            "mahbot_media_target_{}_trunc.png",
-            std::process::id()
-        ));
-        std::fs::write(&corrupt, truncated).unwrap();
-        assert_eq!(
-            classify_media_image_target(corrupt.to_str().unwrap()),
-            MediaTarget::Invalid
-        );
-        let _ = std::fs::remove_file(&png);
-        let _ = std::fs::remove_file(&corrupt);
     }
 }

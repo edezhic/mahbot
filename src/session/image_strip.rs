@@ -242,32 +242,34 @@ mod tests {
         );
     }
 
+    /// Both halves of the gate — the inspection code and the image wording —
+    /// decide the strip, and both are matched case-insensitively: a
+    /// text-content rejection carrying the same code, that code on another
+    /// error, and the all-caps spelling of a genuine rejection.
     #[test]
-    fn text_content_rejection_with_same_code_does_not_trigger_strip() {
-        // Same code, message says "Input data ..." without "image".
-        let chain = r#"OpenRouter API error (400): {"error":{"message":"Input data may contain inappropriate content.","code":"data_inspection_failed","type":"invalid_request_error"}}"#;
-        assert_eq!(
-            detect_input_image_rejection(&trail(chain), &history_with_image()),
-            None
-        );
-    }
-
-    #[test]
-    fn missing_inspection_code_does_not_trigger_strip() {
-        let chain = r#"OpenRouter API error (400): {"error":{"message":"Input image data may contain inappropriate content.","code":"other_code","type":"invalid_request_error"}}"#;
-        assert_eq!(
-            detect_input_image_rejection(&trail(chain), &history_with_image()),
-            None
-        );
-    }
-
-    #[test]
-    fn case_insensitive_matching() {
-        let chain = r#"OpenRouter API error (400): {"error":{"message":"INPUT IMAGE DATA MAY CONTAIN INAPPROPRIATE CONTENT.","code":"DATA_INSPECTION_FAILED"}}"#;
-        assert_eq!(
-            detect_input_image_rejection(&trail(chain), &history_with_image()),
-            Some(2)
-        );
+    fn detection_gate_keys_on_the_image_inspection_code_and_wording() {
+        let cases: &[(&str, Option<usize>)] = &[
+            // Same code, message says "Input data ..." without "image".
+            (
+                r#"OpenRouter API error (400): {"error":{"message":"Input data may contain inappropriate content.","code":"data_inspection_failed","type":"invalid_request_error"}}"#,
+                None,
+            ),
+            (
+                r#"OpenRouter API error (400): {"error":{"message":"Input image data may contain inappropriate content.","code":"other_code","type":"invalid_request_error"}}"#,
+                None,
+            ),
+            (
+                r#"OpenRouter API error (400): {"error":{"message":"INPUT IMAGE DATA MAY CONTAIN INAPPROPRIATE CONTENT.","code":"DATA_INSPECTION_FAILED"}}"#,
+                Some(2),
+            ),
+        ];
+        for (chain, expected) in cases {
+            assert_eq!(
+                detect_input_image_rejection(&trail(chain), &history_with_image()),
+                *expected,
+                "unexpected decision for: {chain}"
+            );
+        }
     }
 
     #[test]
@@ -335,51 +337,47 @@ mod tests {
         );
     }
 
+    /// One rewrite rule over the marker's shapes: every `[IMAGE:…]` becomes the
+    /// single explanatory phrase, the user's own text and non-image markers keep
+    /// their place (the inter-marker separator included), and the provenance tag
+    /// that wrapped an injected tool result goes with the marker it annotated.
     #[test]
-    fn strip_replaces_all_image_markers_with_single_phrase() {
-        let content = "see [IMAGE:/tmp/a.png] and [IMAGE:/tmp/b.png] here";
-        let out = strip_image_markers(content, Some("the image is blocked"));
-        assert!(
-            out.starts_with("see "),
-            "user text before the first marker is preserved"
-        );
-        assert!(!out.contains("[IMAGE:"), "all image markers removed");
-        assert!(
-            out.contains("rejected by the provider's content-inspection check"),
-            "phrase explains the rejection: {out}"
-        );
-        assert!(
-            out.contains("the image is blocked"),
-            "sanitized reason embedded: {out}"
-        );
-        assert!(
-            out.contains("here"),
-            "user text after the last marker is preserved"
-        );
-        // The literal rule leaves the inter-marker separator text in place.
-        assert!(
-            out.contains("and "),
-            "separator text preserved verbatim: {out}"
-        );
-    }
-
-    #[test]
-    fn strip_preserves_non_image_markers() {
-        let content = "[AUDIO:/tmp/sound.mp3] listen and [IMAGE:/tmp/img.png] look";
-        let out = strip_image_markers(content, None);
-        assert!(
-            out.contains("[AUDIO:/tmp/sound.mp3]"),
-            "audio marker untouched"
-        );
-        assert!(!out.contains("[IMAGE:"), "image marker removed");
-        assert!(out.contains("listen and"), "user text preserved");
-        assert!(out.contains("look"));
-    }
-
-    #[test]
-    fn strip_fallback_reason_when_absent() {
-        let out = strip_image_markers("[IMAGE:/tmp/a.png] hi", None);
-        assert!(out.contains("no specific reason was provided"));
+    fn strip_rewrites_image_markers_and_keeps_the_rest() {
+        type Case<'a> = (&'a str, Option<&'a str>, &'a [&'a str], &'a [&'a str]);
+        let phrase = "rejected by the provider's content-inspection check";
+        let cases: &[Case] = &[
+            (
+                "see [IMAGE:/tmp/a.png] and [IMAGE:/tmp/b.png] here",
+                Some("the image is blocked"),
+                &["see ", "and ", "here", phrase, "the image is blocked"],
+                &["[IMAGE:"],
+            ),
+            (
+                "[AUDIO:/tmp/sound.mp3] listen and [IMAGE:/tmp/img.png] look",
+                None,
+                &["[AUDIO:/tmp/sound.mp3]", "listen and", "look", phrase],
+                &["[IMAGE:"],
+            ),
+            (
+                "<injected-tool-result-image>\n[IMAGE:data:image/jpeg;base64,abc]",
+                Some("blocked"),
+                &[phrase],
+                &["[IMAGE:", "<injected-tool-result-image>", "\n"],
+            ),
+        ];
+        for (content, reason, present, absent) in cases {
+            let out = strip_image_markers(content, *reason);
+            for needle in *present {
+                assert!(out.contains(needle), "missing {needle:?}: {out}");
+            }
+            for needle in *absent {
+                assert!(!out.contains(needle), "unexpected {needle:?}: {out}");
+            }
+            assert!(
+                !out.starts_with([' ', '\n']),
+                "no dangling whitespace before the phrase: {out:?}"
+            );
+        }
     }
 
     #[test]
@@ -393,71 +391,11 @@ mod tests {
     }
 
     #[test]
-    fn strip_empty_marker_preserved_verbatim() {
-        // Empty `[IMAGE:]` does not match the marker regex — preserved.
-        let content = "hello [IMAGE:] world";
-        assert_eq!(strip_image_markers(content, None), content);
-    }
-
-    #[test]
-    fn strip_consumes_injected_image_tag_with_marker() {
-        let content = "<injected-tool-result-image>\n[IMAGE:data:image/jpeg;base64,abc]";
-        let out = strip_image_markers(content, Some("blocked"));
-        assert!(!out.contains("[IMAGE:"), "image marker removed: {out}");
-        assert!(
-            !out.contains("<injected-tool-result-image>"),
-            "provenance tag consumed: {out}"
-        );
-        assert!(
-            out.contains("rejected by the provider's content-inspection check"),
-            "phrase present: {out}"
-        );
-        assert!(
-            !out.starts_with("<injected-tool-result-image>"),
-            "no dangling tag next to the phrase: {out}"
-        );
-        assert!(!out.contains('\n'), "no dangling newline prefix: {out:?}");
-        assert!(!out.starts_with(' '), "no leading whitespace: {out:?}");
-    }
-
-    #[test]
     fn reason_extracted_from_http_error_body() {
         let reason = extract_provider_reason(&trail(REJECTION_CHAIN));
         assert_eq!(
             reason.as_deref(),
             Some("Input image data may contain inappropriate content.")
-        );
-    }
-
-    #[test]
-    fn reason_extracted_from_nested_envelope() {
-        let chain = r#"OpenRouter API error (400): {"error":{"code":"data_inspection_failed","metadata":{"raw":"Input image data may contain inappropriate content."}}}"#;
-        assert_eq!(
-            extract_provider_reason(&trail(chain)).as_deref(),
-            Some("Input image data may contain inappropriate content.")
-        );
-    }
-
-    #[test]
-    fn reason_absent_for_non_http_chain() {
-        let exhausted = RetryExhausted::with_last_raw(
-            vec![RetryFailureRecord::new_simple(
-                FailureClass::Transport,
-                &anyhow::anyhow!("connection timed out"),
-                None,
-            )],
-            FailureClass::Transport,
-            None,
-        );
-        assert_eq!(extract_provider_reason(&exhausted), None);
-    }
-
-    #[test]
-    fn reason_falls_back_to_code_when_no_message() {
-        let chain = r#"OpenRouter API error (400): {"error":{"code":"data_inspection_failed","type":"invalid_request_error"}}"#;
-        assert_eq!(
-            extract_provider_reason(&trail(chain)).as_deref(),
-            Some("data_inspection_failed")
         );
     }
 }

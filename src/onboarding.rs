@@ -244,98 +244,70 @@ pub async fn kickoff_onboarding(user_name: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// Every shape the owner's Phase-1 entry can take, and the one form it is
+    /// read as: the `sk-or-v1-` token wherever it stands in a pasted blob, the
+    /// two-line and keyless custom endpoints, and the entries that must be
+    /// refused rather than persisted — a bare default endpoint, a URL with junk
+    /// pasted on its line, a default endpoint under a key that is not
+    /// OpenRouter's, and text that is neither. Refusing rather than persisting is
+    /// what keeps `provider_configured()` from turning true on a value that
+    /// cannot reach a provider (which would re-prompt forever).
     #[test]
-    fn parses_openrouter_key() {
-        // A token containing sk-or-v1- is an OpenRouter key.
-        match parse_provider_input(" sk-or-v1-abc123def456 ") {
-            ProviderInput::OpenRouterKey(k) => assert_eq!(k, "sk-or-v1-abc123def456"),
-            other => panic!("expected OpenRouterKey, got {other:?}"),
+    fn provider_input_is_read_as_the_one_form_it_is() {
+        /// What an entry must be read as, compared field for field.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Read {
+            Key(String),
+            Endpoint { url: String, key: Option<String> },
+            Invalid,
         }
-    }
 
-    #[test]
-    fn parses_keyless_custom_endpoint_url() {
-        match parse_provider_input("https://ollama.local:11434/v1") {
-            ProviderInput::CustomEndpoint { url, key } => {
-                assert_eq!(url, "https://ollama.local:11434/v1");
-                assert_eq!(key, None);
-            }
-            other => panic!("expected keyless CustomEndpoint, got {other:?}"),
+        let key = |key: &str| Read::Key(key.to_string());
+        let endpoint = |url: &str, name: Option<&str>| Read::Endpoint {
+            url: url.to_string(),
+            key: name.map(str::to_string),
+        };
+        let read = |raw: &str| match parse_provider_input(raw) {
+            ProviderInput::OpenRouterKey(key) => Read::Key(key),
+            ProviderInput::CustomEndpoint { url, key } => Read::Endpoint { url, key },
+            ProviderInput::Invalid => Read::Invalid,
+        };
+
+        for (raw, expected) in [
+            // A token containing `sk-or-v1-` is an OpenRouter key, however it was
+            // pasted — alone, with the default endpoint above it, or with a
+            // custom URL below it (the reversed order the grammar does not
+            // document, whose whole blob must never become the provider key).
+            (" sk-or-v1-abc123def456 ", key("sk-or-v1-abc123def456")),
+            (
+                "https://openrouter.ai/api/v1\nsk-or-v1-abc123def456",
+                key("sk-or-v1-abc123def456"),
+            ),
+            (
+                "sk-or-v1-abc123def456\nhttps://custom.example/v1",
+                key("sk-or-v1-abc123def456"),
+            ),
+            // A custom endpoint is a URL on line 1 and an optional key on line 2;
+            // a bare URL alone is a keyless one.
+            (
+                "https://ollama.local:11434/v1",
+                endpoint("https://ollama.local:11434/v1", None),
+            ),
+            (
+                "http://localhost:8080/v1\nsk-local-123",
+                endpoint("http://localhost:8080/v1", Some("sk-local-123")),
+            ),
+            // The default endpoint alone never configures the provider, and
+            // neither does it under a key that is not OpenRouter's.
+            ("https://openrouter.ai/api/v1", Read::Invalid),
+            ("https://openrouter.ai/api/v1\nmy-random-key", Read::Invalid),
+            // A URL cannot contain a literal space: a key pasted onto its line is
+            // outside the documented grammar.
+            ("https://custom.example/v1 sk-local-123", Read::Invalid),
+            ("https://custom.example/v1 extra", Read::Invalid),
+            ("just some chat text", Read::Invalid),
+        ] {
+            assert_eq!(read(raw), expected, "entry {raw:?}");
         }
-    }
-
-    #[test]
-    fn parses_two_line_custom_endpoint_with_key() {
-        match parse_provider_input("http://localhost:8080/v1\nsk-local-123") {
-            ProviderInput::CustomEndpoint { url, key } => {
-                assert_eq!(url, "http://localhost:8080/v1");
-                assert_eq!(key.as_deref(), Some("sk-local-123"));
-            }
-            other => panic!("expected CustomEndpoint with key, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_default_openrouter_url_with_key_as_openrouter() {
-        // The default OpenRouter endpoint on line 1 + `sk-or-v1-` key on line 2
-        // is an OpenRouter key, not a custom endpoint (a default endpoint never
-        // makes `provider_configured()` true, which would re-prompt forever).
-        match parse_provider_input("https://openrouter.ai/api/v1\nsk-or-v1-abc123def456") {
-            ProviderInput::OpenRouterKey(k) => assert_eq!(k, "sk-or-v1-abc123def456"),
-            other => panic!("expected OpenRouterKey, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_reversed_key_then_url_as_openrouter_key() {
-        // Key on line 1, URL on line 2 (reversed from the documented order) — the
-        // `sk-or-v1-` line is extracted instead of persisting the whole blob as
-        // the provider key (which would falsely report `provider_configured()`).
-        match parse_provider_input("sk-or-v1-abc123def456\nhttps://custom.example/v1") {
-            ProviderInput::OpenRouterKey(k) => assert_eq!(k, "sk-or-v1-abc123def456"),
-            other => panic!("expected OpenRouterKey, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_bare_default_openrouter_url() {
-        // The default endpoint alone is not a custom endpoint: it never makes
-        // `provider_configured()` true, so accept no key-less default URL.
-        assert!(matches!(
-            parse_provider_input("https://openrouter.ai/api/v1"),
-            ProviderInput::Invalid
-        ));
-    }
-
-    #[test]
-    fn rejects_single_line_url_with_embedded_junk() {
-        // A URL can't contain a literal space — a key pasted on the same line as
-        // the URL is malformed (outside the documented two-line grammar) and must
-        // not be persisted as a broken endpoint that reports as configured.
-        assert!(matches!(
-            parse_provider_input("https://custom.example/v1 sk-local-123"),
-            ProviderInput::Invalid
-        ));
-        assert!(matches!(
-            parse_provider_input("https://custom.example/v1 extra"),
-            ProviderInput::Invalid
-        ));
-    }
-
-    #[test]
-    fn rejects_default_openrouter_url_with_unknown_key() {
-        // Default endpoint + a non-`sk-or-v1-` key is not a usable provider either.
-        assert!(matches!(
-            parse_provider_input("https://openrouter.ai/api/v1\nmy-random-key"),
-            ProviderInput::Invalid
-        ));
-    }
-
-    #[test]
-    fn rejects_unknown_input() {
-        assert!(matches!(
-            parse_provider_input("just some chat text"),
-            ProviderInput::Invalid
-        ));
     }
 }

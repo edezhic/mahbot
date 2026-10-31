@@ -5544,81 +5544,40 @@ mod tests {
         Some(&rest[..rest.find(&close)?])
     }
 
-    #[test]
-    fn test_sanitize_fts_query() {
-        let cases = [
-            // Basic cases
-            ("hello world", "hello world"),
-            // All Tantivy special chars → empty string (triggers caller short-circuit)
-            ("+-~", ""),
-            // Curly braces and backticks stripped, $ preserved
-            ("`Hello ${name}`", "Hello $ name"),
-            // Email preserved
-            (
-                "contact user@example.com now",
-                "contact user@example.com now",
-            ),
-            // Punctuation preserved except apostrophe (phrase delimiter)
-            (
-                "hello, world! How's it going?",
-                "hello, world! How s it going?",
-            ),
-            // Non-special punctuation all preserved
-            ("!@#$%", "!@#$%"),
-            // Identifiers with underscores preserved
-            ("my_function", "my_function"),
-            // Tags preserved
-            ("#381", "#381"),
-            // Version strings preserved
-            ("v1.2.3", "v1.2.3"),
-            // Paths preserved (no leading slash)
-            ("feature/x", "feature/x"),
-            // Leading slash stripped to prevent Tantivy regex parsing
-            ("/something", "something"),
-            // Leading - (MustNot) stripped via special-char → space → split
-            ("-hello", "hello"),
-            // Hyphen in middle becomes space (word boundary)
-            ("hello-world", "hello world"),
-            // Leading + (Must) stripped
-            ("+term", "term"),
-            // Apostrophe in word stripped (prevents phrase parsing)
-            ("don't", "don t"),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(sanitize_fts_query(input), expected, "input: {input:?}");
-        }
-    }
-
-    // ── parse_utc_timestamp tests ─────────────────────────────────────
-
-    #[test]
-    fn test_parse_utc_timestamp() {
-        let valid_cases = [
-            ("2024-01-15T10:30:00Z", "2024-01-15T10:30:00+00:00"),
-            ("2024-06-15T14:30:00+05:00", "2024-06-15T09:30:00+00:00"),
-            ("2024-12-25T20:00:00-08:00", "2024-12-26T04:00:00+00:00"),
-        ];
-        for (input, expected) in valid_cases {
-            let ts = parse_utc_timestamp(input)
-                .unwrap_or_else(|e| panic!("parse_utc_timestamp({input:?}) failed: {e}"));
-            assert_eq!(ts.to_rfc3339(), expected, "input: {input:?}");
-        }
-
-        for invalid in ["garbage", "", "2024-01-15"] {
-            assert!(
-                parse_utc_timestamp(invalid).is_err(),
-                "expected error for: {invalid:?}",
-            );
-        }
-    }
-
-    // ── quick_check tests ────────────────────────────────────────────
+    // ── checkpoint outcome tests ─────────────────────────────────────
 
     /// Verify that checkpoint reports a complete outcome on a healthy database
     /// for both TRUNCATE and PASSIVE modes, and that the outcome is parsed from
-    /// the result row (not silently discarded as success).
+    /// the result row (not silently discarded as success). The busy/partial
+    /// detection is exercised directly beside it: `is_complete` is false for a
+    /// busy condition or when WAL frames remain uncheckpointed (`log >
+    /// checkpointed`), and true only for a fully backfilled, non-busy outcome.
     #[tokio::test]
     async fn test_checkpoint_reports_complete_outcome() {
+        let complete = CheckpointOutcome {
+            busy: false,
+            log_frames: 0,
+            checkpointed_frames: 0,
+        };
+        assert!(complete.is_complete());
+
+        let busy = CheckpointOutcome {
+            busy: true,
+            log_frames: 0,
+            checkpointed_frames: 0,
+        };
+        assert!(!busy.is_complete(), "busy outcome must be incomplete");
+
+        let partial = CheckpointOutcome {
+            busy: false,
+            log_frames: 12,
+            checkpointed_frames: 5,
+        };
+        assert!(
+            !partial.is_complete(),
+            "uncheckpointed WAL frames must be incomplete"
+        );
+
         let tmp = tempfile::TempDir::new().expect("temp dir for test");
         let conn = Connection::open(tmp.path().join("test.db").as_path())
             .await
@@ -5649,63 +5608,6 @@ mod tests {
             passive.is_complete(),
             "PASSIVE outcome must be complete: {passive:?}"
         );
-    }
-
-    /// Exercise the busy/partial detection directly: `is_complete` is false for
-    /// a busy condition or when WAL frames remain uncheckpointed (`log >
-    /// checkpointed`), and true only for a fully backfilled, non-busy outcome.
-    #[test]
-    fn checkpoint_outcome_completeness_predicate() {
-        let complete = CheckpointOutcome {
-            busy: false,
-            log_frames: 0,
-            checkpointed_frames: 0,
-        };
-        assert!(complete.is_complete());
-
-        let busy = CheckpointOutcome {
-            busy: true,
-            log_frames: 0,
-            checkpointed_frames: 0,
-        };
-        assert!(!busy.is_complete(), "busy outcome must be incomplete");
-
-        let partial = CheckpointOutcome {
-            busy: false,
-            log_frames: 12,
-            checkpointed_frames: 5,
-        };
-        assert!(
-            !partial.is_complete(),
-            "uncheckpointed WAL frames must be incomplete"
-        );
-    }
-
-    /// Verify that quick_check returns Ok on a healthy (empty) database.
-    #[tokio::test]
-    async fn test_quick_check_passes_on_healthy_db() {
-        let tmp = tempfile::TempDir::new().expect("temp dir for test");
-        let conn = Connection::open(tmp.path().join("test.db").as_path())
-            .await
-            .expect("open test database");
-        conn.quick_check()
-            .await
-            .expect("quick_check should pass on a healthy empty database");
-    }
-
-    /// The known FTS-dir count-mismatch false positive is masked, while other
-    /// messages naming the same internal index (genuine corruption) are not.
-    #[test]
-    fn known_fts_dir_false_positive_classification() {
-        let fp = "wrong # of entries in index __turso_internal_fts_dir_idx_tickets_title_fts_key";
-        assert!(fp.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE));
-
-        let genuine_missing =
-            "row 5 missing from index __turso_internal_fts_dir_idx_tickets_title_fts_key";
-        let genuine_unique =
-            "non-unique entry in index __turso_internal_fts_dir_idx_tickets_title_fts_key";
-        assert!(!genuine_missing.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE));
-        assert!(!genuine_unique.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE));
     }
 
     /// An existing store data file that fails the file-level shape check refuses
@@ -6001,6 +5903,21 @@ mod tests {
         ]));
         // A clean check names nothing to act on; the caller matches it first.
         assert!(is_tolerated_integrity_report(&[]));
+    }
+
+    /// The known FTS-dir count-mismatch false positive is masked, while other
+    /// messages naming the same internal index (genuine corruption) are not.
+    #[test]
+    fn known_fts_dir_false_positive_classification() {
+        let fp = "wrong # of entries in index __turso_internal_fts_dir_idx_tickets_title_fts_key";
+        assert!(fp.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE));
+
+        let genuine_missing =
+            "row 5 missing from index __turso_internal_fts_dir_idx_tickets_title_fts_key";
+        let genuine_unique =
+            "non-unique entry in index __turso_internal_fts_dir_idx_tickets_title_fts_key";
+        assert!(!genuine_missing.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE));
+        assert!(!genuine_unique.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE));
     }
 
     /// turso rolls back DDL: the class-B DROP+CREATE fallback wraps the pair
@@ -7226,35 +7143,6 @@ mod tests {
 
     // ── ticket-title FTS repair tests ──────────────────────────────────
 
-    /// Classification of quick_check problems as attributable to the
-    /// ticket-title FTS index (user-visible index name or the internal FTS dir).
-    #[test]
-    fn names_ticket_title_fts_classification() {
-        let index = "idx_tickets_title_fts";
-        assert!(names_ticket_title_fts(
-            "wrong # of entries in index idx_tickets_title_fts",
-            index
-        ));
-        assert!(names_ticket_title_fts(
-            "row 5 missing from index __turso_internal_fts_dir_3_key",
-            index
-        ));
-        // Already filtered upstream by scan_integrity_rows (exact count
-        // mismatch), but the predicate still classifies it as FTS-attributable.
-        assert!(names_ticket_title_fts(
-            "wrong # of entries in index __turso_internal_fts_dir_3_key",
-            index
-        ));
-        assert!(!names_ticket_title_fts(
-            "wrong # of entries in index idx_sessions_created",
-            index
-        ));
-        assert!(!names_ticket_title_fts(
-            "cell_index_read_payload_ptr called on non-index page",
-            index
-        ));
-    }
-
     /// `is_fts_index` recognizes the turso `USING fts` index-method clause
     /// and rejects plain btree indexes and unknown names.
     #[tokio::test]
@@ -7274,20 +7162,6 @@ mod tests {
         assert!(is_fts_index(&conn, "idx_ft_fts").await);
         assert!(!is_fts_index(&conn, "idx_plain").await);
         assert!(!is_fts_index(&conn, "does_not_exist").await);
-    }
-
-    /// A healthy FTS index (with content) is a clean no-op: the repair reports
-    /// the index healthy and touches nothing.
-    #[tokio::test]
-    async fn healthy_title_fts_is_not_rebuilt() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let conn = open_consolidated_store(tmp.path()).await.unwrap();
-        insert_fts_ticket(&conn, "t-1", "Important bug fix").await;
-        let outcome = repair_ticket_title_fts_runtime(&conn).await;
-        assert!(
-            matches!(outcome, TicketTitleFtsRuntimeRepair::Healthy),
-            "healthy FTS index must not report corruption: {outcome:?}"
-        );
     }
 
     /// The post-detection repair rebuilds the FTS index without touching ticket

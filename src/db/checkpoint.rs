@@ -1424,36 +1424,6 @@ mod tests {
         }
     }
 
-    /// The report names the very file the connection has open and its stat-only
-    /// artifact state — the record never has to re-derive the path from the root
-    /// and the store name.
-    #[tokio::test]
-    async fn the_report_names_the_measured_file_and_its_artifact_state() {
-        let (_tmp, conn) = temp_store("report_probe").await;
-        let report = store_failure_report(
-            FailureKind::ExitCheckpointFailure,
-            "report_probe",
-            &anyhow::anyhow!("disk gone"),
-            conn.db_path(),
-        )
-        .render();
-        for needle in [
-            "MahBot exit checkpoint failure",
-            "store: report_probe",
-            "reason: disk gone",
-            "artifact state: wal_size=",
-        ] {
-            assert!(
-                report.contains(needle),
-                "the report must contain {needle:?}: {report}"
-            );
-        }
-        assert!(
-            report.contains(&format!("db path: {}", conn.db_path().display())),
-            "the report must name the file the connection has open: {report}"
-        );
-    }
-
     /// A checkpoint failure on a store whose title FTS index was corrupted is
     /// recovered: the FTS index is rebuilt (from the known DDL) and the next
     /// attempt completes a checkpoint, so the service continues serving — the

@@ -443,10 +443,25 @@ mod tests {
             .await
             .unwrap();
 
-        // 1. The guard itself: calling persist on the key is a no-op.
-        crate::config::persist_settled_string_field("wake_word_templates", "garbage")
+        // 1. The guard itself: calling persist on the key is a no-op — the DB row
+        // and the in-memory CONFIG alike.
+        crate::config::CONFIG.swap({
+            let mut enrolled = crate::config::ConfigData::STRUCT_FIELDS_DEFAULT;
+            assert!(enrolled.set_string_field("wake_word_templates", template_json));
+            enrolled
+        });
+        let guarded = crate::config::persist_settled_string_field("wake_word_templates", "garbage")
             .await
             .unwrap();
+        assert_eq!(
+            guarded.value, template_json,
+            "the guard reports the enrolled templates, not the refused value"
+        );
+        assert_eq!(
+            crate::config::CONFIG.wake_word_templates().as_deref(),
+            Some(template_json),
+            "the guard must not alter the in-memory CONFIG either"
+        );
         let saved = store.get_kv("wake_word_templates").await.unwrap();
         assert_eq!(
             saved.as_deref(),

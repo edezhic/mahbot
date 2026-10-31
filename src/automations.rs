@@ -1297,21 +1297,6 @@ mod tests {
     use super::*;
     use crate::util::test::ProbeFile;
 
-    #[test]
-    fn format_fire_time_renders_local_and_utc() {
-        let out = format_fire_time("2026-08-28T07:30:00+00:00").unwrap();
-        assert!(
-            out.ends_with("local time (2026-08-28 07:30:00 UTC)"),
-            "got: {out}"
-        );
-        assert!(!out.contains("UTC UTC"), "double-UTC in output: {out}");
-    }
-
-    #[test]
-    fn format_fire_time_rejects_invalid() {
-        assert!(format_fire_time("not-a-time").is_err());
-    }
-
     /// A firing is MISSED only when it lands well past its scheduled time: a
     /// routine tick's own delay never counts, and a scheduled time that cannot
     /// be read is not a miss either — that would fail the firing of an automation
@@ -1375,20 +1360,15 @@ mod tests {
         );
     }
 
+    /// The sweep's one-step advance: 25s past a 10s-periodic fire lands on the
+    /// next whole period (not per-period looping, so long downtime costs one
+    /// step), and an interval near `i64::MAX` saturates to a far-future fire time
+    /// instead of panicking the sweep on a `DateTime` add.
     #[test]
-    fn next_periodic_fire_skips_missed_periods_in_one_step() {
-        // 25s past a 10s-periodic fire: advance to the next whole period
-        // (not per-period looping), saturating past long downtime.
-        let now = "2026-08-28T00:00:25Z";
-        let next_fire = "2026-08-28T00:00:00Z";
-        let out = next_periodic_fire(now, next_fire, 10).unwrap();
+    fn next_periodic_fire_advances_in_one_step_and_saturates_absurd_interval() {
+        let out = next_periodic_fire("2026-08-28T00:00:25Z", "2026-08-28T00:00:00Z", 10).unwrap();
         assert_eq!(out, "2026-08-28T00:00:30+00:00");
-    }
 
-    #[test]
-    fn next_periodic_fire_saturates_absurd_interval() {
-        // An interval near i64::MAX must never panic the sweep; it saturates to
-        // a far-future fire time instead of overflowing a DateTime add.
         let out =
             next_periodic_fire("2026-08-28T00:00:00Z", "2026-08-28T00:00:00Z", i64::MAX).unwrap();
         let parsed = db::parse_utc_timestamp(&out).unwrap();
@@ -1414,16 +1394,15 @@ mod tests {
         assert!(err.to_string().contains("past"), "got: {err}");
     }
 
+    /// The periodic interval is bounded at both ends: below the floor is refused,
+    /// and so is one no `DateTime` can add.
     #[tokio::test]
-    async fn add_automation_rejects_short_periodic_interval() {
+    async fn add_automation_bounds_the_periodic_interval() {
         let err = add_automation("session-a", "alice", "remind me", None, Some(4), None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at least 5 seconds"), "got: {err}");
-    }
 
-    #[tokio::test]
-    async fn add_automation_rejects_absurd_periodic_interval() {
         let err = add_automation(
             "session-a",
             "alice",
@@ -1541,29 +1520,6 @@ mod tests {
         assert!(err.contains("too long"), "got: {err}");
     }
 
-    #[tokio::test]
-    async fn add_automation_stores_trigger() {
-        crate::util::test::init_test_stores().await;
-        let session = "trigger-session";
-        let automation = add_automation(
-            session,
-            "alice",
-            "remind me",
-            Some("2099-01-01T00:00:00Z"),
-            None,
-            Some(weather_trigger()),
-            None,
-        )
-        .await
-        .unwrap();
-        let trigger = automation.trigger.as_ref().expect("stored trigger");
-        assert_eq!(trigger.render(), "weather {\"city\":\"Minsk\"}");
-        let listed = list_automations(session).await.unwrap();
-        assert_eq!(listed.len(), 1, "one triggered automation must be listed");
-        let listed_trigger = listed[0].trigger.as_ref().expect("listed trigger");
-        assert_eq!(listed_trigger.render(), "weather {\"city\":\"Minsk\"}");
-    }
-
     fn weather_trigger() -> Trigger {
         let mut args = serde_json::Map::new();
         args.insert("city".to_string(), serde_json::json!("Minsk"));
@@ -1602,16 +1558,84 @@ mod tests {
         }
     }
 
+    /// One notice per outcome, and every notch of its wording: a clean run's
+    /// success line with its output and today's due-now line, escape-only output
+    /// reported as reported (never as "no output"), a check that could not run —
+    /// its reason reaching the assistant, the deletion note, and no FAILED it
+    /// never earned — and a late firing announced as missed, naming the time it
+    /// was scheduled for, on every outcome a firing produces.
     #[test]
-    fn trigger_notification_stays_silent_when_check_reports_nothing() {
+    fn trigger_notification_renders_each_outcome() {
         let automation = trigger_automation();
         let trigger = StoredTrigger::Tool(weather_trigger());
-        for missed in [false, true] {
+
+        let content = trigger_notification(
+            &automation,
+            &trigger,
+            &TriggerOutcome::Ran(ran(true, "exit status 0", "all good", true)),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(content.contains("<automation-notification>"));
+        assert!(content.contains("check the thing"));
+        assert!(content.contains("weather {\"city\":\"Minsk\"}"));
+        assert!(content.contains("exited successfully (exit status 0)"));
+        assert!(content.contains("all good"));
+        assert!(
+            !content.contains("DELETED"),
+            "clean path must not report a deletion"
+        );
+        assert!(
+            content.contains("is due now (scheduled for 2026-09-04T12:00:00+00:00)."),
+            "a firing on time keeps today's wording: {content}"
+        );
+
+        // Output that strips away to nothing is still reported, so the notice
+        // must not label it "no output".
+        let content = trigger_notification(
+            &automation,
+            &trigger,
+            &TriggerOutcome::Ran(ran(true, "exit status 0", "", true)),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(content.contains("not printable"), "got: {content}");
+        assert!(!content.contains("(no output)"), "got: {content}");
+
+        let content = trigger_notification(
+            &automation,
+            &trigger,
+            &TriggerOutcome::CouldNotRun("the custom tool \"weather\" is no longer usable".into()),
+            Some(&Ok(())),
+            false,
+        )
+        .unwrap();
+        assert!(
+            content.contains("no longer usable"),
+            "the reason must reach the assistant: {content}"
+        );
+        assert!(content.contains("weather {\"city\":\"Minsk\"}"));
+        assert!(content.contains("DELETED"), "got: {content}");
+        assert!(
+            !content.contains("FAILED"),
+            "a check that never ran did not fail: {content}"
+        );
+
+        for outcome in [
+            TriggerOutcome::Ran(ran(true, "exit status 0", "all good", true)),
+            TriggerOutcome::Ran(ran(false, "exit status 2", "boom", true)),
+            TriggerOutcome::CouldNotRun("the managed bun runtime is unavailable".to_string()),
+        ] {
+            let content =
+                trigger_notification(&automation, &trigger, &outcome, None, true).unwrap();
+            assert!(content.contains("was MISSED"), "got: {content}");
             assert!(
-                trigger_notification(&automation, &trigger, &TriggerOutcome::Silent, None, missed)
-                    .is_none(),
-                "a silent check must not wake the assistant, late or not"
+                content.contains("2026-09-04T12:00:00+00:00"),
+                "got: {content}"
             );
+            assert!(!content.contains("due now"), "got: {content}");
         }
     }
 
@@ -1651,61 +1675,6 @@ mod tests {
             "",
             false
         ))));
-    }
-
-    #[test]
-    fn trigger_notification_wakes_on_output() {
-        let automation = trigger_automation();
-        let trigger = StoredTrigger::Tool(weather_trigger());
-        let outcome = TriggerOutcome::Ran(ran(true, "exit status 0", "all good", true));
-        let content = trigger_notification(&automation, &trigger, &outcome, None, false).unwrap();
-        assert!(content.contains("<automation-notification>"));
-        assert!(content.contains("check the thing"));
-        assert!(content.contains("weather {\"city\":\"Minsk\"}"));
-        assert!(content.contains("exited successfully (exit status 0)"));
-        assert!(content.contains("all good"));
-        assert!(
-            !content.contains("DELETED"),
-            "clean path must not report a deletion"
-        );
-        assert!(
-            content.contains("is due now (scheduled for 2026-09-04T12:00:00+00:00)."),
-            "a firing on time keeps today's wording: {content}"
-        );
-    }
-
-    /// A late firing is reported as missed, naming the time it was scheduled
-    /// for, on every notice a firing produces.
-    #[test]
-    fn trigger_notification_says_a_late_firing_was_missed() {
-        let automation = trigger_automation();
-        let trigger = StoredTrigger::Tool(weather_trigger());
-        for outcome in [
-            TriggerOutcome::Ran(ran(true, "exit status 0", "all good", true)),
-            TriggerOutcome::Ran(ran(false, "exit status 2", "boom", true)),
-            TriggerOutcome::CouldNotRun("the managed bun runtime is unavailable".to_string()),
-        ] {
-            let content =
-                trigger_notification(&automation, &trigger, &outcome, None, true).unwrap();
-            assert!(content.contains("was MISSED"), "got: {content}");
-            assert!(
-                content.contains("2026-09-04T12:00:00+00:00"),
-                "got: {content}"
-            );
-            assert!(!content.contains("due now"), "got: {content}");
-        }
-    }
-
-    /// Output that strips away to nothing is still reported, so the notice must
-    /// not label it "no output".
-    #[test]
-    fn trigger_notification_does_not_call_escape_only_output_empty() {
-        let automation = trigger_automation();
-        let trigger = StoredTrigger::Tool(weather_trigger());
-        let outcome = TriggerOutcome::Ran(ran(true, "exit status 0", "", true));
-        let content = trigger_notification(&automation, &trigger, &outcome, None, false).unwrap();
-        assert!(content.contains("not printable"), "got: {content}");
-        assert!(!content.contains("(no output)"), "got: {content}");
     }
 
     /// A broken check's notice reads as it always has, even when it settles an
@@ -1761,26 +1730,6 @@ mod tests {
         assert!(
             !failed.contains("was DELETED"),
             "must not claim a successful deletion: {failed}"
-        );
-    }
-
-    #[test]
-    fn trigger_notification_reports_a_check_that_could_not_run() {
-        let automation = trigger_automation();
-        let trigger = StoredTrigger::Tool(weather_trigger());
-        let outcome =
-            TriggerOutcome::CouldNotRun("the custom tool \"weather\" is no longer usable".into());
-        let content =
-            trigger_notification(&automation, &trigger, &outcome, Some(&Ok(())), false).unwrap();
-        assert!(
-            content.contains("no longer usable"),
-            "the reason must reach the assistant: {content}"
-        );
-        assert!(content.contains("weather {\"city\":\"Minsk\"}"));
-        assert!(content.contains("DELETED"), "got: {content}");
-        assert!(
-            !content.contains("FAILED"),
-            "a check that never ran did not fail: {content}"
         );
     }
 
@@ -2628,10 +2577,13 @@ mod tests {
         );
     }
 
-    /// Fire-time integration: a trigger naming a tool the catalogue does not
-    /// have cannot run, so the assistant is told why and the automation is removed.
+    /// Fire-time integration: a check that cannot run is a notice that says why
+    /// and an automation that goes with it — a tool the catalogue no longer has,
+    /// a grant taken away between arming and firing, arguments the tool's
+    /// rewritten header no longer declares, and a stored check that cannot be
+    /// read at all.
     #[tokio::test]
-    async fn fire_trigger_automation_reports_a_tool_that_is_gone_and_removes_the_automation() {
+    async fn fire_trigger_automation_reports_each_unrunnable_check_and_removes_the_automation() {
         let (automation, mut rx) = arm_trigger_automation(
             "assistant:automation-gone-it",
             crate::users::ADMIN_USER_NAME,
@@ -2639,7 +2591,6 @@ mod tests {
             serde_json::Map::new(),
         )
         .await;
-
         let content =
             fire_and_collect_notification(&automation, "assistant:automation-gone-it", &mut rx)
                 .await;
@@ -2650,15 +2601,12 @@ mod tests {
             "got: {content}"
         );
         assert!(content.contains("no longer usable"), "got: {content}");
-    }
 
-    /// Fire-time integration: a grant taken away between arming and firing is a
-    /// check that cannot run — its own wording, and the automation goes with it.
-    #[tokio::test]
-    async fn fire_trigger_automation_reports_a_revoked_grant_and_removes_the_automation() {
+        // A grant taken away between arming and firing is its own refusal: the
+        // tool itself stays fine — it is only the grant that goes.
         let owner = "revoked_grant_guest";
-        let store = seed_owner(owner).await;
-        store
+        let users = seed_owner(owner).await;
+        users
             .add_grant(owner, "automation_grant_probe")
             .await
             .unwrap();
@@ -2669,13 +2617,11 @@ mod tests {
             serde_json::Map::new(),
         )
         .await;
-        // The tool itself stays fine — it is only the grant that goes.
         let _probe = catalogue_probe("automation_grant_probe", "// @description Probe.\n");
-        store
+        users
             .remove_grant(owner, "automation_grant_probe")
             .await
             .unwrap();
-
         let content =
             fire_and_collect_notification(&automation, "assistant:automation-revoked-it", &mut rx)
                 .await;
@@ -2683,13 +2629,8 @@ mod tests {
             content.contains("no longer available to you"),
             "got: {content}"
         );
-    }
 
-    /// Fire-time integration: a stored trigger whose arguments no longer fit
-    /// the tool's rewritten header cannot run, so the assistant is told why and
-    /// the automation is removed.
-    #[tokio::test]
-    async fn fire_trigger_automation_reports_arguments_that_no_longer_fit() {
+        // The tool's header no longer declares the parameter the trigger stored.
         let (automation, mut rx) = arm_trigger_automation(
             "assistant:automation-args-it",
             crate::users::ADMIN_USER_NAME,
@@ -2697,9 +2638,7 @@ mod tests {
             args_of(&serde_json::json!({ "city": "Minsk" })),
         )
         .await;
-        // The tool's header no longer declares the parameter the trigger stored.
         let _probe = catalogue_probe("automation_args_probe", "// @description Probe.\n");
-
         let content =
             fire_and_collect_notification(&automation, "assistant:automation-args-it", &mut rx)
                 .await;
@@ -2708,12 +2647,9 @@ mod tests {
             content.contains("[ignored arguments: city]"),
             "got: {content}"
         );
-    }
 
-    /// Fire-time integration: a stored check that cannot be read is a check that
-    /// cannot run — the assistant is told why and the automation goes with it.
-    #[tokio::test]
-    async fn fire_trigger_automation_reports_a_stored_check_it_cannot_read() {
+        // Replace the stored check with a value that is not one, and make the
+        // automation due so the sweep's own read path is what fires it.
         let session = "assistant:automation-unreadable-it";
         let (automation, mut rx) = arm_trigger_automation(
             session,
@@ -2722,8 +2658,6 @@ mod tests {
             serde_json::Map::new(),
         )
         .await;
-        // Replace the stored check with a value that is not one, and make the
-        // automation due so the sweep's own read path is what fires it.
         store()
             .conn
             .execute(

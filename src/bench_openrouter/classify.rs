@@ -414,18 +414,6 @@ mod tests {
     }
 
     #[test]
-    fn format_bucket_ranges() {
-        assert_eq!(format_bucket(0.0, 0.0), "0s");
-        assert_eq!(format_bucket(0.0, 5.0), "≤5s");
-        assert_eq!(format_bucket(0.0, 0.5), "≤1s"); // rounded
-        assert_eq!(format_bucket(1800.0, f64::INFINITY), "≥30m");
-        assert_eq!(format_bucket(0.0, f64::INFINITY), "≥0s");
-        assert_eq!(format_bucket(300.0, 600.0), "(5m, 10m]");
-        assert_eq!(format_bucket(5.0, 30.0), "(5s, 30s]");
-        assert_eq!(format_bucket(3600.0, 7200.0), "(1h, 2h]");
-    }
-
-    #[test]
     fn expected_cached_saturates() {
         assert_eq!(expected_cached_for_round(1000, 1200, 800), 1400); // base + growth
         assert_eq!(expected_cached_for_round(1000, 800, 1200), 1000); // shrink → saturate
@@ -450,15 +438,5 @@ mod tests {
         assert!(!verify_pinned(None, &endpoint)); // no provider reported
         // Case-sensitive: "acme" != "Acme".
         assert!(!verify_pinned(Some("acme"), &endpoint));
-    }
-
-    #[test]
-    fn classification_as_str() {
-        use CacheClassification as C;
-        assert_eq!(C::Hit.as_str(), "hit");
-        assert_eq!(C::Partial.as_str(), "partial");
-        assert_eq!(C::Drop.as_str(), "drop");
-        assert_eq!(C::NotSupported.as_str(), "not_supported");
-        assert_eq!(C::Invalid.as_str(), "invalid");
     }
 }

@@ -2090,77 +2090,43 @@ mod tests {
         );
     }
 
-    // ── Unit tests for CommitInfo::short_hash ────────────────────
-
-    #[test]
-    fn short_hash_cases() {
-        let cases = [
-            (
-                "long hash truncated to 7 chars",
-                "abc1234def5678",
-                "abc1234",
-            ),
-            ("short hash returned as-is", "abc12", "abc12"),
-            ("exactly 7 chars returned as-is", "abc1234", "abc1234"),
-        ];
-        for (name, hash, expected) in &cases {
-            let info = CommitInfo {
-                hash: hash.to_string(),
-                lines_added: 0,
-                lines_removed: 0,
-            };
-            assert_eq!(info.short_hash(), *expected, "{name}");
-        }
-    }
-
     // ── safe.directory resolver (CVE-2022-24765 ancestor walk) ───
 
+    /// One rule at every entry point it is asked from: the walk resolves the
+    /// `.git`-containing ancestor, whether it is asked from the repository root,
+    /// from a subdirectory below it, or from a directory whose `.git` is a
+    /// *file* (linked worktree / submodule marker — the walk uses `exists()`,
+    /// not `is_dir()`) — and reports no repository outside one.
     #[test]
-    fn resolve_git_top_level_repo_root() {
-        let (_dir, repo_path) = init_temp_repo();
-        assert_eq!(
-            resolve_git_top_level(&repo_path),
-            Some(crate::util::test::canonical_without_verbatim_prefix(
-                &repo_path
-            ))
-        );
-    }
-
-    #[test]
-    fn resolve_git_top_level_from_subdir() {
+    fn resolve_git_top_level_cases() {
         let (_dir, repo_path) = init_temp_repo();
         let subdir = repo_path.join("src");
         std::fs::create_dir(&subdir).expect("create subdir");
-        assert_eq!(
-            resolve_git_top_level(&subdir),
-            Some(crate::util::test::canonical_without_verbatim_prefix(
-                &repo_path
-            ))
-        );
-    }
+        let worktree = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(worktree.path().join(".git"), b"gitdir: /elsewhere")
+            .expect("write .git file");
+        let outside = tempfile::tempdir().expect("create temp dir");
 
-    #[test]
-    fn resolve_git_top_level_non_repo_is_none() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        assert_eq!(
-            resolve_git_top_level(dir.path()),
-            None,
-            "non-repo dir must resolve to None"
-        );
-    }
-
-    #[test]
-    fn resolve_git_top_level_accepts_git_file() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        // A `.git` *file* (linked worktree / submodule marker) is sufficient —
-        // the walk uses `exists()`, not `is_dir()`.
-        std::fs::write(dir.path().join(".git"), b"gitdir: /elsewhere").expect("write .git file");
-        assert_eq!(
-            resolve_git_top_level(dir.path()),
-            Some(crate::util::test::canonical_without_verbatim_prefix(
-                dir.path()
-            ))
-        );
+        let root = Some(crate::util::test::canonical_without_verbatim_prefix(
+            &repo_path,
+        ));
+        let as_worktree = Some(crate::util::test::canonical_without_verbatim_prefix(
+            worktree.path(),
+        ));
+        let cases: &[(&str, &Path, Option<&PathBuf>)] = &[
+            ("repository root", &repo_path, root.as_ref()),
+            ("subdirectory below it", &subdir, root.as_ref()),
+            (".git file marker", worktree.path(), as_worktree.as_ref()),
+            ("outside any repository", outside.path(), None),
+        ];
+        for (name, path, expected) in cases {
+            assert_eq!(
+                resolve_git_top_level(path).as_ref(),
+                *expected,
+                "case {name}: {}",
+                path.display()
+            );
+        }
     }
 
     // ── Safe.directory injection (dubious-ownership fix) ──────────
@@ -2230,13 +2196,6 @@ mod tests {
     // ── Integration tests for run_git_* functions ────────────────
 
     #[tokio::test]
-    async fn test_git_has_commits_true() {
-        let (_dir, repo_path) = init_temp_repo();
-        let has = git_has_commits(&repo_path).await;
-        assert!(has, "repo with initial commit should have commits");
-    }
-
-    #[tokio::test]
     async fn test_run_git_head_and_write_tree_fingerprint() {
         let (_dir, repo_path) = init_temp_repo();
         let head1 = run_git_head(&repo_path).await.expect("repo has commits");
@@ -2271,11 +2230,46 @@ mod tests {
         assert!(head.is_none(), "commit-less repo must not resolve HEAD");
     }
 
+    /// `git_has_commits` and `run_git_commit_message` both resolve against the
+    /// same HEAD: no commit → neither answers; one commit → both do; a named
+    /// hash reads that commit's message.
     #[tokio::test]
-    async fn test_run_git_current_branch_default() {
+    async fn test_git_has_commits_and_commit_message_read_through_head() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let empty = dir.path().to_path_buf();
+        let status = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&empty)
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        assert!(!git_has_commits(&empty).await, "no commits yet");
+        assert!(
+            run_git_commit_message(&empty, None).await.is_err(),
+            "a commit-less repo has no message to read"
+        );
+
         let (_dir, repo_path) = init_temp_repo();
-        let branch = run_git_current_branch(&repo_path).await.expect("branch");
-        assert!(!branch.is_empty(), "branch name should not be empty");
+        assert!(
+            git_has_commits(&repo_path).await,
+            "the fixture commits once"
+        );
+        assert_eq!(
+            run_git_commit_message(&repo_path, None)
+                .await
+                .expect("commit message without hash"),
+            "Initial commit"
+        );
+
+        commit_file(&repo_path, "test.txt", "Second commit");
+        let second = rev_parse(&repo_path, "HEAD");
+        assert_eq!(
+            run_git_commit_message(&repo_path, Some(&second))
+                .await
+                .expect("commit message with hash"),
+            "Second commit",
+            "a named hash reads that commit's subject"
+        );
     }
 
     #[tokio::test]
@@ -2360,109 +2354,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_git_worktree_snapshot_with_untracked() {
-        let (_dir, repo_path) = init_temp_repo();
-
-        // Create an untracked file — not staged, not tracked by git.
-        std::fs::write(
-            repo_path.join("new_file.rs"),
-            b"fn foo() {\n    bar();\n}\n",
-        )
-        .expect("write untracked file");
-
-        let snap = run_git_worktree_snapshot(&repo_path)
-            .await
-            .expect("worktree snapshot");
-        // The untracked file has 3 lines; unmodified tracked file contributes 0.
-        assert_eq!(
-            snap.stats.added, 3,
-            "should count lines from untracked file"
-        );
-        assert_eq!(snap.stats.removed, 0, "no removed lines");
-        assert_eq!(snap.stats.huge_binary_file_count, 0);
-        assert_eq!(
-            snap.changes,
-            vec![WorktreeChange {
-                path: "new_file.rs".into(),
-                old_path: None,
-                added: 3,
-                removed: 0,
-                untracked: Some(UntrackedKind::Text),
-            }]
-        );
-        assert_eq!(
-            snap.file_statuses.get("new_file.rs"),
-            Some(&GitFileStatus::Added)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_run_git_worktree_snapshot_counts_binary_untracked_as_huge() {
-        let (_dir, repo_path) = init_temp_repo();
-
-        // Create an untracked file containing a null byte (binary).
-        std::fs::write(repo_path.join("binary.bin"), b"line1\nline2\x00\n")
-            .expect("write binary file");
-
-        let snap = run_git_worktree_snapshot(&repo_path)
-            .await
-            .expect("worktree snapshot");
-        assert_eq!(
-            snap.stats.added, 0,
-            "binary untracked file should not be counted as added"
-        );
-        assert_eq!(snap.stats.removed, 0, "no removed lines");
-        assert_eq!(
-            snap.stats.huge_binary_file_count, 1,
-            "binary untracked file should be surfaced as huge/binary"
-        );
-        assert_eq!(
-            snap.changes,
-            vec![WorktreeChange {
-                path: "binary.bin".into(),
-                old_path: None,
-                added: 0,
-                removed: 0,
-                untracked: Some(UntrackedKind::Binary),
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_run_git_worktree_snapshot_counts_large_untracked_as_huge() {
-        let (_dir, repo_path) = init_temp_repo();
-
-        // Create an untracked file larger than MAX_UNTRACKED_SIZE (1 MiB).
-        let size = usize::try_from(MAX_UNTRACKED_SIZE).unwrap() + 1;
-        let mut content = Vec::with_capacity(size);
-        content.resize(size, b'a');
-        std::fs::write(repo_path.join("large.bin"), &content).expect("write large file");
-
-        let snap = run_git_worktree_snapshot(&repo_path)
-            .await
-            .expect("worktree snapshot");
-        assert_eq!(
-            snap.stats.added, 0,
-            "large untracked file should not be counted as added"
-        );
-        assert_eq!(snap.stats.removed, 0, "no removed lines");
-        assert_eq!(
-            snap.stats.huge_binary_file_count, 1,
-            "large untracked file should be surfaced as huge/binary"
-        );
-        assert_eq!(
-            snap.changes,
-            vec![WorktreeChange {
-                path: "large.bin".into(),
-                old_path: None,
-                added: 0,
-                removed: 0,
-                untracked: Some(UntrackedKind::TooLarge(u64::try_from(size).unwrap())),
-            }]
-        );
-    }
-
-    #[tokio::test]
     async fn test_run_git_worktree_snapshot_counts_untracked_directory_files() {
         let (_dir, repo_path) = init_temp_repo();
 
@@ -2512,6 +2403,75 @@ mod tests {
             !snap.changes.iter().any(|c| c.path == "new_dir/"),
             "the directory itself is never a change"
         );
+    }
+
+    /// Both ways an untracked file becomes "huge": a NUL byte (binary) and a
+    /// file over [`MAX_UNTRACKED_SIZE`]. Neither is line-counted, and both feed
+    /// `huge_binary_file_count`, which the churn measurement reads.
+    #[tokio::test]
+    async fn test_run_git_worktree_snapshot_marks_binary_and_oversized_untracked_files_huge() {
+        let (_dir, repo_path) = init_temp_repo();
+        std::fs::write(repo_path.join("binary.bin"), b"line1\nline2\x00\n")
+            .expect("write binary file");
+        let size = usize::try_from(MAX_UNTRACKED_SIZE).expect("cap fits usize") + 1;
+        std::fs::write(repo_path.join("large.bin"), vec![b'a'; size]).expect("write large file");
+
+        let snap = run_git_worktree_snapshot(&repo_path)
+            .await
+            .expect("worktree snapshot");
+        assert_eq!(snap.stats.added, 0, "neither file is line-counted");
+        assert_eq!(snap.stats.removed, 0, "no removed lines");
+        assert_eq!(
+            snap.stats.huge_binary_file_count, 2,
+            "both are surfaced as huge/binary"
+        );
+        assert_eq!(
+            snap.changes,
+            vec![
+                WorktreeChange {
+                    path: "binary.bin".into(),
+                    old_path: None,
+                    added: 0,
+                    removed: 0,
+                    untracked: Some(UntrackedKind::Binary),
+                },
+                WorktreeChange {
+                    path: "large.bin".into(),
+                    old_path: None,
+                    added: 0,
+                    removed: 0,
+                    untracked: Some(UntrackedKind::TooLarge(
+                        u64::try_from(size).expect("size fits u64")
+                    )),
+                },
+            ]
+        );
+    }
+
+    /// A subdirectory workspace still reads the whole repository and reports
+    /// repo-root-relative paths.
+    #[tokio::test]
+    async fn test_run_git_worktree_snapshot_resolves_root_relative_paths_from_subdir() {
+        let (_dir, repo_path) = init_temp_repo();
+        let sub = repo_path.join("sub");
+        std::fs::create_dir(&sub).expect("create subdir");
+        std::fs::write(sub.join("inside.txt"), b"one\ntwo\n").expect("write inside file");
+        std::fs::write(repo_path.join("at-root.txt"), b"root\n").expect("write root file");
+
+        let snap = run_git_worktree_snapshot(&sub)
+            .await
+            .expect("worktree snapshot");
+        let paths: Vec<&str> = snap.changes.iter().map(|c| c.path.as_str()).collect();
+        assert!(
+            paths.contains(&"sub/inside.txt"),
+            "a subdirectory workspace still reports repo-root-relative paths: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"at-root.txt"),
+            "the reading is repo-wide: {paths:?}"
+        );
+        assert_eq!(snap.stats.added, 3, "both files are counted");
+        assert_eq!(snap.repo_root, std::fs::canonicalize(&repo_path).unwrap());
     }
 
     #[expect(clippy::cast_possible_wrap)] // MAX_UNTRACKED_FILES_COUNTED is a small compile-time cap
@@ -2635,30 +2595,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_run_git_worktree_snapshot_resolves_root_relative_paths_from_subdir() {
-        let (_dir, repo_path) = init_temp_repo();
-        let sub = repo_path.join("sub");
-        std::fs::create_dir(&sub).expect("create subdir");
-        std::fs::write(sub.join("inside.txt"), b"one\ntwo\n").expect("write inside file");
-        std::fs::write(repo_path.join("at-root.txt"), b"root\n").expect("write root file");
-
-        let snap = run_git_worktree_snapshot(&sub)
-            .await
-            .expect("worktree snapshot");
-        let paths: Vec<&str> = snap.changes.iter().map(|c| c.path.as_str()).collect();
-        assert!(
-            paths.contains(&"sub/inside.txt"),
-            "a subdirectory workspace still reports repo-root-relative paths: {paths:?}"
-        );
-        assert!(
-            paths.contains(&"at-root.txt"),
-            "the reading is repo-wide: {paths:?}"
-        );
-        assert_eq!(snap.stats.added, 3, "both files are counted");
-        assert_eq!(snap.repo_root, std::fs::canonicalize(&repo_path).unwrap());
-    }
-
     #[test]
     fn parse_numstat_z_handles_normal_binary_and_rename_records() {
         let stdout = "3\t1\tfile.txt\0-\t-\timage.bin\0\
@@ -2678,96 +2614,6 @@ mod tests {
         assert_eq!(entries[2].old_path.as_deref(), Some("old.txt"));
         assert_eq!((entries[2].added, entries[2].removed), (2, 0));
     }
-
-    #[tokio::test]
-    async fn test_run_git_list_branches_single() {
-        let (_dir, repo_path) = init_temp_repo();
-        let out = run_git_command(&repo_path, &["branch", "--format=%(refname:short)"])
-            .await
-            .expect("list branches");
-        let branches: Vec<String> = out.lines().map(ToString::to_string).collect();
-        assert_eq!(branches.len(), 1, "single branch in new repo");
-    }
-
-    #[tokio::test]
-    async fn test_run_git_switch_and_create_branch() {
-        let (_dir, repo_path) = init_temp_repo();
-        // Note the default branch name before creating a new one
-        let default_branch = run_git_current_branch(&repo_path)
-            .await
-            .expect("current branch");
-
-        // Create and switch to a new branch
-        run_git_command(&repo_path, &["switch", "-c", "feature/test"])
-            .await
-            .expect("create branch");
-        // Verify we're on the new branch
-        let current = run_git_current_branch(&repo_path)
-            .await
-            .expect("current branch");
-        assert_eq!(current, "feature/test");
-        // Verify it appears in the branch list
-        let out = run_git_command(&repo_path, &["branch", "--format=%(refname:short)"])
-            .await
-            .expect("list branches");
-        let branches: Vec<String> = out.lines().map(ToString::to_string).collect();
-        assert!(branches.contains(&"feature/test".to_string()));
-        // Switch back to the default branch
-        run_git_command(&repo_path, &["switch", default_branch.as_str()])
-            .await
-            .expect("switch back");
-        let switched = run_git_current_branch(&repo_path)
-            .await
-            .expect("current branch");
-        assert_eq!(switched, default_branch, "should be back on default branch");
-    }
-
-    #[tokio::test]
-    async fn test_run_git_commit_message() {
-        let (_dir, repo_path) = init_temp_repo();
-
-        // Without hash — should return HEAD's message
-        let msg = run_git_commit_message(&repo_path, None)
-            .await
-            .expect("commit message without hash");
-        assert_eq!(msg, "Initial commit");
-
-        // Create a second commit
-        std::fs::write(repo_path.join("test.txt"), b"line1\nline2\n").expect("write test file");
-        let status = std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&repo_path)
-            .status()
-            .expect("git add");
-        assert!(status.success());
-        let status = std::process::Command::new("git")
-            .args(["commit", "-m", "Second commit"])
-            .current_dir(&repo_path)
-            .status()
-            .expect("git commit");
-        assert!(status.success());
-
-        // Get the second commit's hash
-        let output = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&repo_path)
-            .output()
-            .expect("git rev-parse");
-        let second_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        // With hash — should return that commit's message
-        let msg = run_git_commit_message(&repo_path, Some(&second_hash))
-            .await
-            .expect("commit message with hash");
-        assert_eq!(msg, "Second commit");
-
-        // Without hash should now return HEAD (second commit)
-        let msg = run_git_commit_message(&repo_path, None)
-            .await
-            .expect("commit message without hash");
-        assert_eq!(msg, "Second commit");
-    }
-
     // ── Push destination resolution and sync ─────────────────────
 
     /// Create a bare repository under `root` and register it as remote `name`
@@ -2896,50 +2742,6 @@ mod tests {
         assert_eq!(
             rev_parse(&origin, &format!("refs/heads/{branch}")),
             rev_parse(&repo_path, "HEAD")
-        );
-    }
-
-    /// A branch tracking a fetch-only upstream still pushes to the push-capable
-    /// remote and keeps its fetch-only tracking.
-    #[tokio::test]
-    async fn fetch_only_upstream_stays_tracked_while_pushing_to_origin() {
-        let (_dir, repo_path) = init_temp_repo();
-        let remotes = tempfile::tempdir().expect("remote dir");
-        add_bare_remote(remotes.path(), &repo_path, "upstream");
-        let branch = run_git_current_branch(&repo_path).await.expect("branch");
-        git_ok(&repo_path, &["push", "-u", "upstream", &branch]);
-        // Git's own way of making a remote fetch-only.
-        git_ok(
-            &repo_path,
-            &["remote", "set-url", "--push", "upstream", "no-push"],
-        );
-        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
-        git_ok(&repo_path, &["push", "origin", &branch]);
-        commit_file(&repo_path, "pushed.txt", "Only origin lacks this");
-
-        let state = remote_state(&repo_path).await;
-        let GitPushDestination::Target(target) = &state.push else {
-            panic!("expected a push target, got {:?}", state.push);
-        };
-        assert_eq!(target.remote, "origin");
-        assert_eq!(
-            target.publish,
-            Some(false),
-            "origin already carries the branch"
-        );
-        assert_eq!(target.commits, 1);
-
-        let report = run_git_sync(&repo_path).await.expect("sync");
-        assert!(report.not_pushed.is_none(), "origin accepts pushes");
-        assert_eq!(
-            tracked(&repo_path, &branch).await.as_deref(),
-            Some("upstream"),
-            "a fetch-only tracking is left alone"
-        );
-        assert_eq!(
-            rev_parse(&origin, &format!("refs/heads/{branch}")),
-            rev_parse(&repo_path, "HEAD"),
-            "origin received the commit"
         );
     }
 
@@ -3308,6 +3110,50 @@ mod tests {
         );
     }
 
+    /// A branch tracking a fetch-only upstream still pushes to the push-capable
+    /// remote and keeps its fetch-only tracking.
+    #[tokio::test]
+    async fn fetch_only_upstream_stays_tracked_while_pushing_to_origin() {
+        let (_dir, repo_path) = init_temp_repo();
+        let remotes = tempfile::tempdir().expect("remote dir");
+        add_bare_remote(remotes.path(), &repo_path, "upstream");
+        let branch = run_git_current_branch(&repo_path).await.expect("branch");
+        git_ok(&repo_path, &["push", "-u", "upstream", &branch]);
+        // Git's own way of making a remote fetch-only.
+        git_ok(
+            &repo_path,
+            &["remote", "set-url", "--push", "upstream", "no-push"],
+        );
+        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
+        git_ok(&repo_path, &["push", "origin", &branch]);
+        commit_file(&repo_path, "pushed.txt", "Only origin lacks this");
+
+        let state = remote_state(&repo_path).await;
+        let GitPushDestination::Target(target) = &state.push else {
+            panic!("expected a push target, got {:?}", state.push);
+        };
+        assert_eq!(target.remote, "origin");
+        assert_eq!(
+            target.publish,
+            Some(false),
+            "origin already carries the branch"
+        );
+        assert_eq!(target.commits, 1);
+
+        let report = run_git_sync(&repo_path).await.expect("sync");
+        assert!(report.not_pushed.is_none(), "origin accepts pushes");
+        assert_eq!(
+            tracked(&repo_path, &branch).await.as_deref(),
+            Some("upstream"),
+            "a fetch-only tracking is left alone"
+        );
+        assert_eq!(
+            rev_parse(&origin, &format!("refs/heads/{branch}")),
+            rev_parse(&repo_path, "HEAD"),
+            "origin received the commit"
+        );
+    }
+
     /// A branch whose tracking ref is gone (deleted remote branch, pruned or
     /// narrowed fetch) still resolves: the destination is asked directly, and the
     /// press republishes without overwriting the branch's tracking config.
@@ -3505,11 +3351,10 @@ mod tests {
         );
     }
 
-    // ── parse_new_files_from_porcelain — combined untracked + staged-as-new ──
+    // ── porcelain listings — new/untracked file paths ─────────────
 
     /// Shared porcelain test input with a mix of untracked (`??`), staged-as-new
-    /// (`A `), modified, and C-quoted special-character paths.  Used by both
-    /// `parse_new_files_from_porcelain` and `parse_untracked_from_porcelain` tests.
+    /// (`A `), modified, and C-quoted special-character paths.
     const PORCELAIN_INPUT: &str = "\
 ?? new_file.rs
 M  modified.rs
@@ -3525,135 +3370,76 @@ A  \"staged\\\"file.js\"
 ?? \"file\\\\backslash.rs\"
 ";
 
-    /// Verify that `parse_new_files_from_porcelain` correctly extracts untracked
-    /// and staged-as-new file paths from git porcelain output, including C-quoted
-    /// paths with special characters (tab, double-quote, non-ASCII).
+    /// The two listings over one mixed reading, and the entries both must
+    /// refuse. `parse_new_files_from_porcelain` takes untracked and
+    /// staged-as-new records; `parse_untracked_from_porcelain` takes `??` only,
+    /// so a staged file is not listed twice. Both unquote C-quoted paths and
+    /// both report nothing for a reading with no new file — where a record is
+    /// too short, does not unquote, or names a collapsed nested repository
+    /// rather than a file.
+    ///
+    /// The byte-level unstaged check still counts an entry no parser accepts —
+    /// see `has_unstaged_changes_cases`.
     #[test]
-    fn parse_new_files_from_porcelain_extracts_new_files() {
-        let porcelain = PORCELAIN_INPUT;
-
-        let files = parse_new_files_from_porcelain(porcelain);
-
-        assert_eq!(files.len(), 9);
-        assert!(files.contains(&"new_file.rs".to_string()));
-        assert!(files.contains(&"another_new.py".to_string()));
-        assert!(files.contains(&"staged_new.js".to_string()));
-        assert!(files.contains(&"dir/untracked.txt".to_string()));
-        assert!(files.contains(&"temp.log".to_string()));
-        assert!(files.contains(&"staged_then_modified.js".to_string()));
-        // C-quoted paths should be properly unquoted:
-        assert!(files.contains(&"file\tname.rs".to_string()));
-        assert!(files.contains(&"staged\"file.js".to_string()));
-        // Backslash in filename (\\) unquotes to single backslash:
-        assert!(files.contains(&"file\\backslash.rs".to_string()));
-        // These should be excluded:
-        assert!(!files.contains(&"modified.rs".to_string()));
-        assert!(!files.contains(&"working_tree_only.txt".to_string()));
-        assert!(!files.contains(&"working_tree_new.txt".to_string()));
-    }
-
-    /// Verify that porcelain parsing returns empty for both clean output
-    /// (no new/untracked files) and malformed/truncated lines.
-    #[test]
-    fn parse_new_files_from_porcelain_returns_empty() {
-        let porcelain = "\
-M  modified.rs
- M working_tree_only.txt
-D  deleted.rs
- A working_tree_new.txt
-";
-
-        let files = parse_new_files_from_porcelain(porcelain);
-        assert!(
-            files.is_empty(),
-            "Should be empty when no new/untracked files"
+    fn porcelain_listings_classify_and_skip_unusable_entries() {
+        assert_eq!(
+            parse_new_files_from_porcelain(PORCELAIN_INPUT),
+            [
+                "new_file.rs",
+                "another_new.py",
+                "staged_new.js",
+                "dir/untracked.txt",
+                "temp.log",
+                "staged_then_modified.js",
+                "file\tname.rs",
+                "staged\"file.js",
+                "file\\backslash.rs",
+            ],
+            "untracked (`??`) and staged-as-new (`A`) records, C-quotes unquoted"
+        );
+        assert_eq!(
+            parse_untracked_from_porcelain(PORCELAIN_INPUT),
+            [
+                "new_file.rs",
+                "another_new.py",
+                "dir/untracked.txt",
+                "temp.log",
+                "file\tname.rs",
+                "file\\backslash.rs",
+            ],
+            "`??` records only, so staged-as-new files are not listed twice"
         );
 
-        // Malformed/truncated lines that match the filter but are too short
-        // for path extraction should also produce empty results without panicking.
-        let short_lines = ["A", "A ", "?? ", "??"];
-        for &bad_line in &short_lines {
-            let files = parse_new_files_from_porcelain(bad_line);
+        // Readings that list nothing: only modified/deleted records, and lines
+        // too short to carry a path.
+        for porcelain in [
+            "M  modified.rs\n M working_tree_only.txt\nD  deleted.rs\n A working_tree_new.txt\n",
+            "A",
+            "A ",
+            "?? ",
+            "??",
+        ] {
             assert!(
-                files.is_empty(),
-                "Malformed line {bad_line:?} should produce empty result, got {files:?}"
+                parse_new_files_from_porcelain(porcelain).is_empty(),
+                "no new file in {porcelain:?}"
+            );
+            assert!(
+                parse_untracked_from_porcelain(porcelain).is_empty(),
+                "no untracked file in {porcelain:?}"
             );
         }
 
-        // Also test the ??-only variant with the same short lines.
-        for &bad_line in &short_lines {
-            let files = parse_untracked_from_porcelain(bad_line);
-            assert!(
-                files.is_empty(),
-                "Malformed line {bad_line:?} should produce empty result from ??-only parser, got {files:?}"
-            );
-        }
-    }
+        // A path that does not unquote is skipped by both listings.
+        let unusable = "?? \"broken\\q.rs\"\n?? good.rs\nA  \"also\\qbroken.rs\"\n";
+        assert_eq!(parse_untracked_from_porcelain(unusable), ["good.rs"]);
+        assert_eq!(parse_new_files_from_porcelain(unusable), ["good.rs"]);
 
-    /// A path that does not unquote is skipped by both listings — they report
-    /// real paths or nothing — while the byte-level unstaged check still counts
-    /// the entry (see `has_unstaged_changes_cases`).
-    #[test]
-    fn parse_porcelain_paths_skip_malformed_quoted_paths() {
-        let porcelain = "?? \"broken\\q.rs\"\n?? good.rs\nA  \"also\\qbroken.rs\"\n";
-
-        assert_eq!(parse_untracked_from_porcelain(porcelain), vec!["good.rs"]);
-        assert_eq!(parse_new_files_from_porcelain(porcelain), vec!["good.rs"]);
-    }
-
-    // ── parse_untracked_from_porcelain — ??-only untracked parsing ──
-
-    /// Verify that `parse_untracked_from_porcelain` catches only `?? ` (truly
-    /// untracked) entries and excludes `A ` (staged-as-new) files.
-    #[test]
-    fn parse_untracked_from_porcelain_returns_only_untracked() {
-        let porcelain = PORCELAIN_INPUT;
-
-        let files = parse_untracked_from_porcelain(porcelain);
-
-        // Should include only ??-prefixed entries (6 total)
-        assert_eq!(files.len(), 6);
-        assert!(files.contains(&"new_file.rs".to_string()));
-        assert!(files.contains(&"another_new.py".to_string()));
-        assert!(files.contains(&"dir/untracked.txt".to_string()));
-        assert!(files.contains(&"temp.log".to_string()));
-        // C-quoted paths should be properly unquoted:
-        assert!(files.contains(&"file\tname.rs".to_string()));
-        assert!(files.contains(&"file\\backslash.rs".to_string()));
-        // These should be excluded:
-        assert!(!files.contains(&"staged_new.js".to_string()));
-        assert!(!files.contains(&"staged_then_modified.js".to_string()));
-        assert!(!files.contains(&"modified.rs".to_string()));
-        assert!(!files.contains(&"working_tree_only.txt".to_string()));
-        assert!(!files.contains(&"working_tree_new.txt".to_string()));
-        assert!(!files.contains(&"staged\"file.js".to_string()));
-    }
-
-    /// Verify that `parse_untracked_from_porcelain` returns empty for output
-    /// containing only staged-as-new or modified files (no ?? entries).
-    #[test]
-    fn parse_untracked_from_porcelain_no_untracked() {
-        let porcelain = "\
-M  modified.rs
-A  staged_new.js
- M working_tree_only.txt
-AM staged_then_modified.js
- A working_tree_new.txt
-";
-
-        let files = parse_untracked_from_porcelain(porcelain);
-        assert!(
-            files.is_empty(),
-            "Should be empty when no `?? ` entries present"
+        // A collapsed nested repository is one `dir/` entry, not a file, and
+        // must not reach the manifest (or be counted as an omitted file).
+        assert_eq!(
+            parse_untracked_from_porcelain("?? nested/\n?? real.rs\n"),
+            ["real.rs"]
         );
-    }
-
-    /// A collapsed nested repository is one `dir/` entry, not a file; it must
-    /// not reach the manifest (or be counted as an omitted file).
-    #[test]
-    fn parse_untracked_from_porcelain_skips_collapsed_directories() {
-        let files = parse_untracked_from_porcelain("?? nested/\n?? real.rs\n");
-        assert_eq!(files, vec!["real.rs"]);
     }
 
     // ── parse_git_status_porcelain — per-file status map ─────────
@@ -3852,38 +3638,6 @@ AM staged_then_modified.js
         }
     }
 
-    /// A rename whose source git quotes (a space is enough) and whose
-    /// destination is plain: the sides are quoted independently, so the record
-    /// must still yield the destination.
-    #[tokio::test]
-    async fn git_status_rename_with_a_quoted_source_keys_its_destination() {
-        let (_dir, repo_path) = init_temp_repo();
-        // Pin the detection the fixture shape depends on, so an owner's global
-        // `status.renames = false` cannot turn this into `D ` + `A `.
-        run_git_command(&repo_path, &["config", "status.renames", "true"])
-            .await
-            .unwrap();
-        std::fs::write(repo_path.join("a b.txt"), b"moved\n").unwrap();
-        run_git_commit(&repo_path, "add").await.unwrap();
-        run_git_command(&repo_path, &["mv", "a b.txt", "plain.txt"])
-            .await
-            .unwrap();
-
-        let porcelain = run_git_status(&repo_path).await.unwrap();
-        assert!(
-            porcelain.starts_with("R  \"a b.txt\" -> plain.txt"),
-            "git's quoting is what this pins, got {porcelain:?}"
-        );
-
-        let map = parse_git_status_porcelain(&porcelain);
-        assert_eq!(
-            map.get("plain.txt"),
-            Some(&GitFileStatus::Modified),
-            "got {map:?}"
-        );
-        assert!(!map.contains_key("a b.txt"), "got {map:?}");
-    }
-
     /// A rename into a name that itself contains the ` -> ` delimiter: git quotes
     /// only the destination, so splitting at the quoted side's own delimiter
     /// would key a bogus path.
@@ -4014,25 +3768,32 @@ AM staged_then_modified.js
         );
     }
 
-    /// Discard a new untracked file — removes it from the working tree.
+    /// Untracked content is removed by a discard, in both target shapes: a new
+    /// file, and a directory that goes recursively.
     #[tokio::test]
-    async fn test_run_git_discard_new_file() {
+    async fn test_run_git_discard_untracked_file_and_directory() {
         let (_dir, repo_path) = init_temp_repo();
-
-        // Create a new untracked file.
         let new_path = repo_path.join("new_file.rs");
         std::fs::write(&new_path, b"fn new() {}").expect("write new file");
-        assert!(new_path.exists(), "new file should exist before discard");
+        let sub_dir = repo_path.join("subdir");
+        std::fs::create_dir(&sub_dir).expect("create subdir");
+        let sub_file = sub_dir.join("nested.rs");
+        std::fs::write(&sub_file, b"fn nested() {}").expect("write nested file");
 
-        // Discard the untracked file.
         run_git_discard(&repo_path, "new_file.rs", DiscardTarget::File)
             .await
             .expect("run_git_discard should succeed");
+        run_git_discard(&repo_path, "subdir", DiscardTarget::Directory)
+            .await
+            .expect("run_git_discard should succeed");
 
-        // File should be removed.
         assert!(
             !new_path.exists(),
             "new file should be removed after discard"
+        );
+        assert!(
+            !sub_dir.exists(),
+            "directory and its contents should be removed after discard"
         );
     }
 
@@ -4060,39 +3821,6 @@ AM staged_then_modified.js
             nested.exists(),
             "the same-named file under the workspace is untouched"
         );
-    }
-
-    /// Discard a directory with untracked content — recursively removes it.
-    #[tokio::test]
-    async fn test_run_git_discard_directory() {
-        let (_dir, repo_path) = init_temp_repo();
-
-        // Create a directory with an untracked file inside.
-        let sub_dir = repo_path.join("subdir");
-        std::fs::create_dir(&sub_dir).expect("create subdir");
-        let sub_file = sub_dir.join("nested.rs");
-        std::fs::write(&sub_file, b"fn nested() {}").expect("write nested file");
-        assert!(sub_file.exists(), "nested file should exist before discard");
-
-        // Discard the directory.
-        run_git_discard(&repo_path, "subdir", DiscardTarget::Directory)
-            .await
-            .expect("run_git_discard should succeed");
-
-        // Directory and its contents should be gone.
-        assert!(
-            !sub_dir.exists(),
-            "directory should be removed after discard"
-        );
-    }
-
-    /// Discard a clean file — succeeds as a no-op.
-    #[tokio::test]
-    async fn test_run_git_discard_clean_file() {
-        let (_dir, repo_path) = init_temp_repo();
-
-        let result = run_git_discard(&repo_path, "test.txt", DiscardTarget::File).await;
-        assert!(result.is_ok(), "discarding a clean file should succeed");
     }
 
     /// The untracked mode is pinned on the status readers and the discard

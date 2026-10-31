@@ -741,22 +741,12 @@ mod tests {
         );
     }
 
+    /// The tracker's per-session budget at every entry point: a first attempt is
+    /// allowed, recording it backs the retry off, cleanup forgets the session —
+    /// allowing a fresh start on the same tracker — and a daemon restart starts
+    /// from an empty tracker again.
     #[test]
-    fn test_dead_session_tracker_cleanup() {
-        let tracker = DeadSessionTracker::new();
-        let agent_id = "test_cleanup_engineer";
-
-        // Record an attempt — entry created, backoff blocks retry
-        tracker.record_attempt(agent_id);
-        assert!(!tracker.should_retry(agent_id));
-
-        // Cleanup removes the entry, allowing a fresh start
-        tracker.cleanup(agent_id);
-        assert!(tracker.should_retry(agent_id));
-    }
-
-    #[test]
-    fn test_dead_session_tracker_backoff_and_reset_on_restart() {
+    fn dead_session_tracker_backoff_cleanup_and_restart_reset() {
         let tracker = DeadSessionTracker::new();
         let agent_id = "test_backoff_engineer";
 
@@ -767,7 +757,12 @@ mod tests {
         // Immediately after recording, backoff prevents retry
         assert!(!tracker.should_retry(agent_id));
 
+        // Cleanup removes the entry, allowing a fresh start
+        tracker.cleanup(agent_id);
+        assert!(tracker.should_retry(agent_id));
+
         // Simulate daemon restart: create a new tracker (fresh state).
+        tracker.record_attempt(agent_id);
         let tracker2 = DeadSessionTracker::new();
         assert!(
             tracker2.should_retry(agent_id),

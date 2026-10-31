@@ -609,25 +609,48 @@ mod platform {
 mod tests {
     use super::*;
 
+    /// The two files that register the product with the system name the program
+    /// and the login word, and nothing a parser would misread: the escape each
+    /// format needs is applied to a path that needs every one of them.
     #[test]
-    fn the_plist_names_the_program_the_label_and_the_login_word() {
-        let text = plist_text(Path::new("/Applications/A & B/<mahbot>"));
-        assert!(text.contains(&format!("<string>{LABEL}</string>")));
-        assert!(text.contains("<string>/Applications/A &amp; B/&lt;mahbot&gt;</string>"));
-        assert!(text.contains(&format!("<string>{}</string>", crate::cli::LOGIN_START_ARG)));
+    fn the_platform_files_name_the_program_and_the_login_word() {
+        let plist = plist_text(Path::new("/Applications/A & B/<mahbot>"));
+        assert!(plist.contains(&format!("<string>{LABEL}</string>")));
+        assert!(plist.contains("<string>/Applications/A &amp; B/&lt;mahbot&gt;</string>"));
+        assert!(plist.contains(&format!("<string>{}</string>", crate::cli::LOGIN_START_ARG)));
+
+        let entry = desktop_entry_text(Path::new("/home/o/.local/bin/mahbot"), true);
+        assert!(entry.contains("Exec=\"/home/o/.local/bin/mahbot\" __login-start"));
+        assert!(entry.contains("X-GNOME-Autostart-enabled=true"));
+        assert!(!desktop_disabled(&entry));
+
+        // A literal `%` in the path is a field code unless it is doubled.
+        assert!(
+            desktop_entry_text(Path::new("/opt/100%/mahbot"), true)
+                .contains("Exec=\"/opt/100%%/mahbot\"")
+        );
+
+        // The Windows `Run` value's data is the program path quoted, because a
+        // profile name and `%LOCALAPPDATA%` can contain spaces, and the login
+        // word after it.
+        assert_eq!(
+            windows_command(Path::new(r"C:\Program Files\MahBot\mahbot.exe")),
+            r#""C:\Program Files\MahBot\mahbot.exe" __login-start"#
+        );
     }
 
+    /// A registration the owner disabled in the system's own settings — the
+    /// desktop entry's disable keys, launchd's override dump, and the
+    /// startup-approved record — reads as disabled, and a plain enable, a
+    /// comment or no record at all does not. Each platform's own spelling is
+    /// what the product has to read back, since nothing in the product may
+    /// override the owner's decision.
     #[test]
-    fn the_desktop_entry_points_at_the_program_and_reads_a_disable() {
-        let text = desktop_entry_text(Path::new("/home/o/.local/bin/mahbot"), true);
-        assert!(text.contains("Exec=\"/home/o/.local/bin/mahbot\" __login-start"));
-        assert!(text.contains("X-GNOME-Autostart-enabled=true"));
-        assert!(!desktop_disabled(&text));
-
-        let disabled = desktop_entry_text(Path::new("/opt/mahbot"), false);
+    fn a_startup_entry_the_owner_disabled_reads_as_disabled() {
+        let disabled_entry = desktop_entry_text(Path::new("/opt/mahbot"), false);
         // The desktop-agnostic disable key, not only GNOME's.
-        assert!(disabled.contains("Hidden=true"));
-        assert!(desktop_disabled(&disabled));
+        assert!(disabled_entry.contains("Hidden=true"));
+        assert!(desktop_disabled(&disabled_entry));
         assert!(desktop_disabled("[Desktop Entry]\nHidden=true\n"));
         assert!(desktop_disabled("X-GNOME-Autostart-enabled=false\n"));
         // A key file's spelling is free: case, spacing, and the numeric forms.
@@ -638,15 +661,6 @@ mod tests {
         assert!(!desktop_disabled("#Hidden=true\n"));
         assert!(!desktop_disabled("X-GNOME-Autostart-enabled=true\n"));
 
-        // A literal `%` in the path is a field code unless it is doubled.
-        assert!(
-            desktop_entry_text(Path::new("/opt/100%/mahbot"), true)
-                .contains("Exec=\"/opt/100%%/mahbot\"")
-        );
-    }
-
-    #[test]
-    fn a_launchctl_dump_reads_one_labels_override() {
         let dump = "\
 disabled services = {
 \t\"com.mahbot.autostart\" => disabled
@@ -656,22 +670,12 @@ disabled services = {
         assert!(launchctl_override_disabled(dump, "com.mahbot.autostart"));
         assert!(!launchctl_override_disabled(dump, "com.apple.other"));
         assert!(!launchctl_override_disabled(dump, "com.mahbot.absent"));
-    }
 
-    #[test]
-    fn the_windows_command_quotes_the_program_path() {
-        assert_eq!(
-            windows_command(Path::new(r"C:\Program Files\MahBot\mahbot.exe")),
-            r#""C:\Program Files\MahBot\mahbot.exe" __login-start"#
-        );
-    }
-
-    #[test]
-    fn the_startup_approved_record_reads_as_the_system_would() {
-        // The record this product writes is the enabled one.
+        // The record this product writes is the enabled one; the flag the system
+        // writes when the owner disables the entry there, and the one it stamps
+        // on a later change, both read as disabled. No record at all means
+        // enabled.
         assert!(!startup_approved_disabled(&STARTUP_APPROVED_ENABLED));
-        // The flag the system writes when the owner disables the entry there, and
-        // the one it stamps on a later change; no record at all means enabled.
         assert!(startup_approved_disabled(&[0x03]));
         assert!(startup_approved_disabled(&[0x07]));
         assert!(!startup_approved_disabled(&[]));

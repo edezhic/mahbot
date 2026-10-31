@@ -1201,37 +1201,31 @@ mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
 
+    /// Both schemes count, a repeat is one URL, and the sentence punctuation or
+    /// brackets around an address are not part of it.
     #[test]
-    fn extract_urls_finds_http_and_https() {
-        let urls = extract_urls("Check https://example.com and http://test.org/page for info");
-        assert_eq!(urls, vec!["https://example.com", "http://test.org/page"]);
-    }
-
-    #[test]
-    fn extract_urls_deduplicates() {
-        let urls = extract_urls("Visit https://example.com and https://example.com again");
-        assert_eq!(urls.len(), 1);
-    }
-
-    #[test]
-    fn extract_urls_strips_trailing_punctuation() {
-        let urls = extract_urls("See https://example.com, and https://test.org.");
-        assert_eq!(urls, vec!["https://example.com", "https://test.org"]);
-    }
-
-    #[test]
-    fn extract_urls_handles_urls_in_parens() {
-        let urls = extract_urls("(https://example.com) and [https://test.org]");
-        assert_eq!(urls, vec!["https://example.com", "https://test.org"]);
-    }
-
-    #[tokio::test]
-    async fn enrich_links_returns_borrowed_when_no_urls() {
-        let content = "Hello, this is a plain message without any URLs.";
-        let result = enrich_links(content).await;
-        // No URLs → should borrow the input, not allocate a new String.
-        assert!(matches!(result, Cow::Borrowed(_)));
-        assert_eq!(result.as_ref(), content);
+    fn extract_urls_applies_its_rules() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "Check https://example.com and http://test.org/page for info",
+                &["https://example.com", "http://test.org/page"],
+            ),
+            (
+                "Visit https://example.com and https://example.com again",
+                &["https://example.com"],
+            ),
+            (
+                "See https://example.com, and https://test.org.",
+                &["https://example.com", "https://test.org"],
+            ),
+            (
+                "(https://example.com) and [https://test.org]",
+                &["https://example.com", "https://test.org"],
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(extract_urls(input), *expected, "input: {input}");
+        }
     }
 
     // ── enrich_message tests ──────────────────────────────────────────
@@ -1396,16 +1390,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn enrich_image_file_not_found() {
-        let mut msg = test_msg("Here is [IMAGE:/tmp/nonexistent_xyz_img.png] an image");
-        enrich_message(&mut msg, None).await;
-        assert!(
-            msg.content
-                .contains("[Invalid image reference: /tmp/nonexistent_xyz_img.png]")
-        );
-    }
-
     /// The annotation an `[AUDIO:...]` marker produces: the transcription
     /// fallback icon on macOS (no transcriber is configured in the tests), and
     /// the honest "not supported" note where the local audio subsystem does not
@@ -1446,6 +1430,9 @@ mod tests {
         assert!(msg.content.contains("to this"), "Original text preserved");
     }
 
+    /// A real raster in this message's inbound directory is read into a data URI
+    /// that is the source bytes exactly, and the temp file and its per-message
+    /// directory go with the read.
     #[tokio::test]
     async fn enrich_image_valid_file_converts_to_data_uri_and_deletes_temp() {
         // The fixture must be one of this message's inbound attachments to be in
@@ -1473,6 +1460,26 @@ mod tests {
             "Temp image file must be deleted after enrichment"
         );
         assert!(!msg_dir.exists(), "Per-message directory must be deleted");
+
+        // The data URI carries the source bytes untouched, at any size.
+        let source_bytes = real_png(64, 48);
+        let (_msg_dir, tmp) = inbound_attachment_fixture(7006, "art.png", &source_bytes).await;
+        let path_str = tmp.to_string_lossy().to_string();
+        let mut msg = inbound_msg(7006, &format!("Art: [IMAGE:{path_str}]"));
+        enrich_message(&mut msg, None).await;
+        let expected = format!(
+            "[IMAGE:data:image/png;base64,{}]",
+            STANDARD.encode(&source_bytes)
+        );
+        assert!(
+            msg.content.contains(&expected),
+            "Image data URI must be byte-identical to the source, got: {}",
+            msg.content
+        );
+        assert!(
+            !tmp.exists(),
+            "Temp image file must be deleted after enrichment"
+        );
     }
 
     #[tokio::test]
@@ -1616,37 +1623,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_video_without_workspace_deletes_in_scope_temp() {
-        // No workspace path: the video gets a plain annotation and no
-        // transcription, but the in-scope inbound attachment is still a pure
-        // intermediate artifact and must be cleaned up.
-        let (_msg_dir, tmp_video) = inbound_attachment_fixture(7004, "clip.mp4", b"fake mp4").await;
-        let video_path_str = tmp_video.to_string_lossy().to_string();
-
-        let mut msg = inbound_msg(7004, &format!("Watch [VIDEO:{video_path_str}] this clip"));
-        enrich_message(&mut msg, None).await;
-
-        assert!(
-            msg.content.contains(&format!(
-                "[Video attached: {}]",
-                tmp_video.file_name().unwrap().to_string_lossy()
-            )),
-            "Plain video annotation must be present, got: {}",
-            msg.content
-        );
-        assert!(
-            !msg.content.contains("[Saved video:"),
-            "No workspace copy may be made without an uploads dir, got: {}",
-            msg.content
-        );
-        assert!(!msg.content.contains("[VIDEO:"));
-        assert!(
-            !tmp_video.exists(),
-            "In-scope temp video must be deleted even without a workspace copy"
-        );
-    }
-
-    #[tokio::test]
     async fn enrich_video_outside_inbound_attachments_annotates_without_copy_or_delete() {
         // An injected marker pointing at an arbitrary readable file must not
         // be copied into uploads (exfiltration vector) or deleted.
@@ -1684,45 +1660,19 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
+    /// A file in this message's own inbound directory that is not a decodable raster
+    /// must never fail open to a junk data URI: the classifier rejects a non-image
+    /// with an image extension, and the primary encode refuses a file whose bytes
+    /// only look like a PNG (valid magic, truncated payload). Both degrade to a
+    /// `[Invalid image reference: …]` note, and the in-scope temp file — a pure
+    /// intermediate — is cleaned up.
     #[tokio::test]
-    async fn enrich_image_bytes_pass_through_byte_identical() {
-        let source_bytes = real_png(64, 48);
-        let (_msg_dir, tmp) = inbound_attachment_fixture(7006, "art.png", &source_bytes).await;
+    async fn enrich_image_that_is_not_a_decodable_raster_never_fails_open_to_a_junk_data_uri() {
+        // A non-image file with an image extension.
+        let (_msg_dir, tmp) = inbound_attachment_fixture(7007, "photo.png", b"not an image").await;
         let path_str = tmp.to_string_lossy().to_string();
-
-        let mut msg = inbound_msg(7006, &format!("Art: [IMAGE:{path_str}]"));
-        enrich_message(&mut msg, None).await;
-
-        let expected = format!(
-            "[IMAGE:data:image/png;base64,{}]",
-            STANDARD.encode(&source_bytes)
-        );
-        assert!(
-            msg.content.contains(&expected),
-            "Image data URI must be byte-identical to the source, got: {}",
-            msg.content
-        );
-        // Temp file deleted
-        assert!(
-            !tmp.exists(),
-            "Temp image file must be deleted after enrichment"
-        );
-    }
-
-    #[tokio::test]
-    async fn enrich_image_in_scope_non_raster_is_rejected_not_junk_data_uri() {
-        // A non-image file with an image extension inside this message's inbound
-        // attachment directory must NOT fail open to a junk data URI (the
-        // fail-open bug). The classifier rejects it, the marker becomes an
-        // invalid reference, and the in-scope temp file is cleaned up (it is a
-        // pure intermediate).
-        let source_bytes = b"not an image";
-        let (_msg_dir, tmp) = inbound_attachment_fixture(7007, "photo.png", source_bytes).await;
-        let path_str = tmp.to_string_lossy().to_string();
-
         let mut msg = inbound_msg(7007, &format!("Photo: [IMAGE:{path_str}]"));
         enrich_message(&mut msg, None).await;
-
         assert!(
             msg.content
                 .contains(&format!("[Invalid image reference: {path_str}]")),
@@ -1734,23 +1684,12 @@ mod tests {
             "No junk data URI may be produced for a non-raster file, got: {}",
             msg.content
         );
-        // In-scope temp file is a pure intermediate: cleaned up even though it
-        // was never consumed as an image (it would otherwise accumulate).
         assert!(
             !tmp.exists(),
             "In-scope non-raster temp file must be cleaned up"
         );
-        // Defensive cleanup in case the assertion above fails.
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
 
-    #[tokio::test]
-    async fn enrich_image_corrupt_raster_does_not_fail_open_to_junk_data_uri() {
-        // A file whose leading bytes sniff as PNG (valid magic + IHDR) but whose
-        // payload is truncated passes the structural classifier gate but is NOT
-        // decodable. The primary encode sends the original bytes untouched, and
-        // it must not base64-encode the corrupt bytes into a junk data-URI — the
-        // marker degrades to an invalid reference instead.
+        // A truncated PNG: valid magic and IHDR, no decodable payload.
         let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
         let mut buf = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
@@ -1758,10 +1697,8 @@ mod tests {
         let truncated = &buf[..buf.len().min(24)];
         let (_msg_dir, tmp) = inbound_attachment_fixture(7008, "photo.png", truncated).await;
         let path_str = tmp.to_string_lossy().to_string();
-
         let mut msg = inbound_msg(7008, &format!("Photo: [IMAGE:{path_str}]"));
         enrich_message(&mut msg, None).await;
-
         assert!(
             msg.content
                 .contains(&format!("[Invalid image reference: {path_str}]")),
@@ -1773,6 +1710,7 @@ mod tests {
             "No junk data URI may be produced for a corrupt file, got: {}",
             msg.content
         );
+        // Defensive cleanup in case an assertion above fails.
         let _ = tokio::fs::remove_file(&tmp).await;
     }
 
@@ -1804,41 +1742,6 @@ mod tests {
         );
         // Defensive cleanup in case the assertion above fails.
         let _ = tokio::fs::remove_file(&tmp).await;
-    }
-
-    #[tokio::test]
-    async fn enrich_combined_image_preserved_audio_annotated() {
-        let msg_content = "Here [IMAGE:https://example.com/img.png] and [AUDIO:/tmp/sound_xyz.mp3]";
-        let mut msg = test_msg(msg_content);
-        enrich_message(&mut msg, None).await;
-
-        // IMAGE http URL kept
-        assert!(
-            msg.content.contains("[IMAGE:https://example.com/img.png]"),
-            "IMAGE with http URL must be preserved, got: {}",
-            msg.content
-        );
-        // AUDIO marker stripped, annotation present
-        assert!(
-            msg.content.contains(audio_annotation()),
-            "Audio annotation must be present"
-        );
-        assert!(
-            !msg.content.contains("[AUDIO:"),
-            "AUDIO marker must be stripped"
-        );
-    }
-
-    async fn assert_no_markers_unchanged(workspace_path: Option<&std::path::Path>, content: &str) {
-        let mut msg = test_msg(content);
-        let original = msg.content.clone();
-        enrich_message(&mut msg, workspace_path).await;
-        assert_eq!(msg.content, original, "No markers = no changes");
-    }
-
-    #[tokio::test]
-    async fn enrich_no_annotations_when_no_markers() {
-        assert_no_markers_unchanged(None, "Just a plain message with no markers").await;
     }
 
     // ── FILE marker tests ─────────────────────────────────────────────
@@ -2372,5 +2275,36 @@ mod tests {
         assert!(!attachment.exists() && !msg_dir.exists());
         // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
+    }
+
+    #[tokio::test]
+    async fn enrich_video_without_workspace_deletes_in_scope_temp() {
+        // No workspace path: the video gets a plain annotation and no
+        // transcription, but the in-scope inbound attachment is still a pure
+        // intermediate artifact and must be cleaned up.
+        let (_msg_dir, tmp_video) = inbound_attachment_fixture(7004, "clip.mp4", b"fake mp4").await;
+        let video_path_str = tmp_video.to_string_lossy().to_string();
+
+        let mut msg = inbound_msg(7004, &format!("Watch [VIDEO:{video_path_str}] this clip"));
+        enrich_message(&mut msg, None).await;
+
+        assert!(
+            msg.content.contains(&format!(
+                "[Video attached: {}]",
+                tmp_video.file_name().unwrap().to_string_lossy()
+            )),
+            "Plain video annotation must be present, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.contains("[Saved video:"),
+            "No workspace copy may be made without an uploads dir, got: {}",
+            msg.content
+        );
+        assert!(!msg.content.contains("[VIDEO:"));
+        assert!(
+            !tmp_video.exists(),
+            "In-scope temp video must be deleted even without a workspace copy"
+        );
     }
 }

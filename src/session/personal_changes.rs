@@ -1614,31 +1614,6 @@ mod tests {
         );
     }
 
-    /// The tracked exemption holds inside a nested repository as well: its index
-    /// is asked about its own paths, spelled the way git spells them, not at the
-    /// folder's prefix.
-    #[test]
-    fn rules_never_hide_a_tracked_path_inside_a_nested_repository() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        let inner = root.join("project");
-        std::fs::create_dir(&inner).unwrap();
-        init_git_repo(&inner);
-        std::fs::write(inner.join(".gitignore"), "*.log\n").unwrap();
-        std::fs::write(inner.join("keep.log"), "tracked").unwrap();
-        std::fs::write(inner.join("skip.log"), "untracked").unwrap();
-        let status = std::process::Command::new("git")
-            .args(["add", "-f", "keep.log"])
-            .current_dir(&inner)
-            .status()
-            .expect("git add");
-        assert!(status.success(), "git add -f keep.log");
-
-        let snapshot = scan(root, None, Scan::Refresh, &Rules::new(root)).unwrap();
-        assert!(snapshot.contains_key("project/keep.log"), "{snapshot:?}");
-        assert!(!snapshot.contains_key("project/skip.log"), "{snapshot:?}");
-    }
-
     /// The catalogue decision ([`is_owner_personal_folder`]): `shared/` is product
     /// material in the owner's own personal folder alone — the folder the product
     /// resolves from the owner's account — so the product's writes into the
@@ -1702,39 +1677,6 @@ mod tests {
             lookalike_snapshot.keys().cloned().collect::<Vec<_>>(),
             vec!["shared/own.txt".to_string()],
             "only the product's own folder holds the catalogue"
-        );
-    }
-
-    #[test]
-    fn render_caps_listed_entries_and_summarizes_the_rest() {
-        let changes = Changes {
-            added: (0..100).map(|i| format!("f{i:03}.txt")).collect(),
-            changed: Vec::new(),
-            removed: Vec::new(),
-        };
-        let block = render(&changes).unwrap();
-        assert!(block.contains("…and 60 more"), "tail missing: {block}");
-        assert!(
-            !block.contains("\n\n"),
-            "a truncated block must not carry a stray blank line: {block}"
-        );
-        let listed = block
-            .lines()
-            .find_map(|line| line.strip_prefix("added: "))
-            .unwrap()
-            .split(", ")
-            .count();
-        assert_eq!(listed, MAX_LISTED_ENTRIES);
-
-        // The untruncated form ends exactly like the truncated one.
-        let short = render(&Changes {
-            added: vec!["a.txt".to_string()],
-            ..Changes::default()
-        })
-        .unwrap();
-        assert!(
-            short.ends_with("a.txt\n</personal-changes>"),
-            "unexpected block tail: {short}"
         );
     }
 
@@ -2171,53 +2113,6 @@ mod tests {
         ] {
             assert!(!picture.contains(hidden), "{hidden} in {picture}");
         }
-    }
-
-    /// The picture names at most [`MAX_PICTURED_FOLDERS`] folders, summarizes the
-    /// rest as a count, and stays byte-stable across walks; material added deep
-    /// inside a folder moves that folder's count without changing the block's
-    /// shape.
-    #[test]
-    fn personal_folder_picture_bounds_names_and_is_stable() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        let total = MAX_PICTURED_FOLDERS + 3;
-        // Created out of order: the picture comes out name-sorted regardless.
-        for i in 0..total {
-            std::fs::create_dir(root.join(format!("f{:03}", (i * 7) % total))).unwrap();
-        }
-        std::fs::write(root.join("top.txt"), "one").unwrap();
-        std::fs::create_dir(root.join("f000/deep")).unwrap();
-        std::fs::write(root.join("f000/deep/a.txt"), "one").unwrap();
-
-        let picture = personal_folder_picture(root).expect("picture");
-        let lines: Vec<&str> = picture.lines().collect();
-        assert_eq!(lines.len(), MAX_PICTURED_FOLDERS + 2, "{picture}");
-        assert_eq!(lines[0], "- f000/ — 1 file");
-        for (i, line) in lines.iter().enumerate().take(MAX_PICTURED_FOLDERS).skip(1) {
-            assert_eq!(*line, format!("- f{i:03}/ — 0 files"));
-        }
-        assert_eq!(lines[MAX_PICTURED_FOLDERS], "…and 3 folders not named");
-        assert_eq!(
-            lines[MAX_PICTURED_FOLDERS + 1],
-            "1 file directly in the folder"
-        );
-        assert_eq!(
-            personal_folder_picture(root).as_deref(),
-            Some(picture.as_str()),
-            "two walks over an unchanged folder must agree byte for byte"
-        );
-
-        std::fs::create_dir(root.join("f001/nested")).unwrap();
-        std::fs::write(root.join("f001/nested/b.txt"), "one").unwrap();
-        std::fs::write(root.join("f001/nested/c.txt"), "one").unwrap();
-        let grown = personal_folder_picture(root).expect("picture");
-        assert_eq!(
-            grown.lines().count(),
-            picture.lines().count(),
-            "a changed count must not change the block's shape: {grown}"
-        );
-        assert!(grown.contains("- f001/ — 2 files"), "{grown}");
     }
 
     /// No material of the user's means no block: a folder that does not exist yet

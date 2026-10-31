@@ -2228,8 +2228,16 @@ mod tests {
         );
     }
 
+    /// A pinned role always resolves to the account's own personal workspace —
+    /// whose folder is that account's folder under the userspaces root — and
+    /// re-pins from a project or another user's personal workspace; non-pinned
+    /// roles pass through, and a pinned role with no user has no personal
+    /// identity to pin to.
     #[test]
-    fn effective_workspace_pins_assistant_to_personal() {
+    fn enforce_personal_pinning_repins_pinned_roles_and_refuses_empty_user() {
+        // The resolution itself: the personal workspace keeps the account's
+        // name and folder, an already-personal one passes through, and an empty
+        // user disables pinning.
         let project = Workspace {
             name: "ws1".to_string(),
             ..Default::default()
@@ -2241,18 +2249,19 @@ mod tests {
             "the personal workspace must use the userspaces path, got: {}",
             personal.path
         );
-        // Non-pinned roles keep the managed workspace; already-personal passes through.
-        let kept = effective_workspace_for_role(Role::Engineer, project.clone(), "alice");
-        assert_eq!(kept.name, "ws1");
-        let already = effective_workspace_for_role(Role::Assistant, personal.clone(), "alice");
-        assert_eq!(already.name, "personal:alice");
-        // An empty user_name disables pinning — the workspace passes through.
-        let unpinned = effective_workspace_for_role(Role::Assistant, project, "");
-        assert_eq!(unpinned.name, "ws1");
-    }
+        assert_eq!(
+            effective_workspace_for_role(Role::Engineer, project.clone(), "alice").name,
+            "ws1"
+        );
+        assert_eq!(
+            effective_workspace_for_role(Role::Assistant, personal, "alice").name,
+            "personal:alice"
+        );
+        assert_eq!(
+            effective_workspace_for_role(Role::Assistant, project, "").name,
+            "ws1"
+        );
 
-    #[test]
-    fn enforce_personal_pinning_repins_pinned_roles_and_refuses_empty_user() {
         // Pinned roles in a non-personal workspace re-pin to the user's personal.
         assert_eq!(
             enforce_personal_pinning(Role::Assistant, "proj-ws", "alice"),

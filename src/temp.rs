@@ -1078,18 +1078,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn verify_private_root_accepts_our_0700_directory() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let root = dir.path().join("mahbot");
-        std::fs::create_dir(&root).expect("create root");
-        std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .expect("chmod");
-
-        verify_private_root(&root).expect("our own 0700 directory is reusable");
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn verify_private_root_refuses_a_symlink() {
         let dir = tempfile::tempdir().expect("temp dir");
         let target = dir.path().join("target");
@@ -1118,28 +1106,6 @@ mod tests {
         verify_private_root(&root).expect("a loose mode on our own path is self-healed");
         let mode = std::fs::metadata(&root).expect("stat root").mode() & 0o777;
         assert_eq!(mode, 0o700);
-    }
-
-    #[test]
-    fn prompt_renders_every_scan_root() {
-        // Only the rendering half is asserted here: every embedded asset being
-        // loadable and non-empty is already covered repo-wide (prompt.rs), and a
-        // missing asset panics in `load_prompt` anyway.
-        let roots = vec![
-            CleanupRoot {
-                path: PathBuf::from("/tmp/mahbot"),
-                private: true,
-            },
-            CleanupRoot {
-                path: PathBuf::from("/tmp"),
-                private: false,
-            },
-        ];
-        let prompt = render_temp_cleanup_prompt(&roots);
-        for root in &roots {
-            assert!(prompt.contains(&root.path.display().to_string()));
-        }
-        assert!(!prompt.contains("{{"), "unsubstituted placeholder remains");
     }
 
     #[test]

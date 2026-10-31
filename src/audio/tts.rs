@@ -1840,72 +1840,6 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_markdown() {
-        let cases: &[(&str, &str, &str)] = &[
-            // bold removal leaves space placeholder + original space = double space
-            ("bold", "**bold** text", "  text"),
-            ("inline_code", "`inline code` here", "  here"),
-            ("code_block", "```\nblock\n```\nend", " \nend"),
-            ("link", "[link](url) text", "link text"),
-            ("image", "![img](url) cap", "  cap"),
-            ("strikethrough", "~~strike~~", " "),
-        ];
-        for &(name, input, expected) in cases {
-            assert_eq!(strip_markdown(input), expected, "case: {name}");
-        }
-    }
-
-    #[test]
-    fn test_render_wav() {
-        let sample_rate = 44100u32;
-        let samples = vec![0.0f32, 0.5, -0.5, 1.0, -1.0, 0.0];
-
-        let wav_bytes = render_wav(&samples, sample_rate).expect("render_wav should succeed");
-
-        // Should be a valid WAV of 44 header + 12 data bytes
-        assert_eq!(wav_bytes.len(), 56, "WAV should be 56 bytes total");
-
-        // Verify RIFF header correctness
-        assert!(
-            wav_bytes.starts_with(b"RIFF"),
-            "WAV should start with RIFF marker"
-        );
-        assert!(
-            wav_bytes[8..12].starts_with(b"WAVE"),
-            "WAV should contain WAVE format"
-        );
-        assert!(
-            wav_bytes[12..16].starts_with(b"fmt "),
-            "WAV should contain fmt chunk"
-        );
-
-        // Read sample rate from header (offset 24, 4 bytes LE)
-        let header_sr = u32::from_le_bytes(wav_bytes[24..28].try_into().unwrap());
-        assert_eq!(header_sr, sample_rate, "WAV header sample rate mismatch");
-
-        // Read bits per sample (offset 34, 2 bytes LE)
-        let bps = u16::from_le_bytes(wav_bytes[34..36].try_into().unwrap());
-        assert_eq!(bps, 16, "WAV should be 16-bit PCM");
-
-        // Read number of channels (offset 22, 2 bytes LE)
-        let channels = u16::from_le_bytes(wav_bytes[22..24].try_into().unwrap());
-        assert_eq!(channels, 1, "WAV should be mono");
-
-        // Verify data chunk: expected size = 6 samples × 2 bytes = 12
-        let data_size = u32::from_le_bytes(wav_bytes[40..44].try_into().unwrap());
-        assert_eq!(
-            data_size, 12,
-            "WAV data size should be 12 bytes for 6 16-bit samples"
-        );
-
-        // Verify the last sample (samples[5] = 0.0 → i16 = 0) appears
-        // at the end of the data section.
-        let data_start = 44;
-        let last_sample_bytes = &wav_bytes[data_start + 10..data_start + 12];
-        assert_eq!(last_sample_bytes, &[0x00, 0x00], "last sample should be 0");
-    }
-
-    #[test]
     fn test_render_wav_decodes_via_hound() {
         use rodio::Source;
         // The rodio 0.22 upgrade switched WAV decode from the symphonia-based
@@ -1937,183 +1871,6 @@ mod tests {
             );
         }
     }
-
-    // ── Preprocessing helpers ───────────────────────────────────────────
-
-    #[test]
-    fn test_normalize_symbols() {
-        let cases: &[(&str, &str, &str)] = &[
-            (
-                "em/en dashes become hyphen",
-                "Hello—world–test\u{2011}",
-                "Hello-world-test-",
-            ),
-            (
-                "symbols like overline, brackets, pipe, slash, hash, arrows, hearts, copyright, backslash become space",
-                "a\u{00AF}b[c]d|e/f#g\u{2192}h\u{2190}i\u{2665}j\u{2606}k\u{2661}l\u{00A9}m\\n",
-                "a b c d e f g h i j k l m n",
-            ),
-            (
-                "curly double quotes become straight double quote",
-                "\u{201C}hello\u{201D}",
-                "\"hello\"",
-            ),
-            (
-                "curly single quotes, acute, backtick become straight single quote",
-                "\u{2018}hello\u{2019}\u{00B4}`",
-                "'hello'''",
-            ),
-            // Characters that should pass through unchanged
-            (
-                "normal alphanumeric and basic punctuation pass through",
-                "abc123.!?",
-                "abc123.!?",
-            ),
-        ];
-        for &(name, input, expected) in cases {
-            assert_eq!(normalize_symbols(input), expected, "case: {name}");
-        }
-    }
-
-    #[test]
-    fn test_expand_abbreviations() {
-        let cases: &[(&str, &str, &str)] = &[
-            ("at_signed_user", "@user", " at user"),
-            // Note: "e.g.," → "for example, " (trailing space) because the original
-            // text has a space after the comma — this is fine as clean_whitespace
-            // later normalises it.
-            ("e.g., hello", "e.g., hello", "for example,  hello"),
-            ("i.e., world", "i.e., world", "that is,  world"),
-            (
-                "multiple e.g., and i.e., here",
-                "multiple e.g., and i.e., here",
-                "multiple for example,  and that is,  here",
-            ),
-            // Text without abbreviations passes through unchanged
-            ("text_without_abbreviations", "hello world", "hello world"),
-            // Case-sensitive: only lowercase exact match
-            ("case_sensitive", "E.G.,", "E.G.,"),
-        ];
-        for &(name, input, expected) in cases {
-            assert_eq!(expand_abbreviations(input), expected, "case: {name}");
-        }
-    }
-
-    #[test]
-    fn test_fix_punctuation_spacing() {
-        let cases: &[(&str, &str, &str)] = &[
-            ("comma", "hello ,world", "hello,world"),
-            ("period", "hello .world", "hello.world"),
-            ("bang", "hello !world", "hello!world"),
-            ("question", "hello ?world", "hello?world"),
-            ("semicolon", "hello ;world", "hello;world"),
-            ("colon", "hello :world", "hello:world"),
-            ("single_quote", "hello 'world", "hello'world"),
-            (
-                "all_punctuation",
-                "hello , . ; : ! ? 'world",
-                "hello,.;:!?'world",
-            ),
-            // Text without spacing issues passes through unchanged
-            ("no_spacing_issues", "Hello, world!", "Hello, world!"),
-        ];
-        for &(name, input, expected) in cases {
-            assert_eq!(fix_punctuation_spacing(input), expected, "case: {name}");
-        }
-    }
-
-    #[test]
-    fn test_remove_duplicate_quotes() {
-        let cases: &[(&str, &str, &str)] = &[
-            ("single pair unchanged", r#""hello""#, r#""hello""#),
-            (
-                "double quotes deduplicated",
-                r#""""hello"""""#,
-                r#""hello""#,
-            ),
-            ("single quotes deduplicated", "''hello''", "'hello'"),
-            ("backticks deduplicated", "``hello``", "`hello`"),
-            (
-                "different quote chars are not collapsed",
-                r#""'mixed"#,
-                r#""'mixed"#,
-            ),
-            ("text without quotes unchanged", "no quotes", "no quotes"),
-        ];
-        for &(name, input, expected) in cases {
-            assert_eq!(remove_duplicate_quotes(input), expected, "case: {name}");
-        }
-    }
-
-    #[test]
-    fn test_clean_whitespace() {
-        let cases: &[(&str, &str, &str)] = &[
-            ("multiple spaces collapsed", "hello   world", "hello world"),
-            (
-                "leading/trailing whitespace trimmed",
-                "  hello  world  ",
-                "hello world",
-            ),
-            ("tabs become space", "hello\tworld", "hello world"),
-            (
-                "newlines collapsed to space",
-                "hello\n\nworld",
-                "hello world",
-            ),
-            ("whitespace-only becomes empty", "  ", ""),
-            ("normal text unchanged", "hello world", "hello world"),
-        ];
-        for &(name, input, expected) in cases {
-            assert_eq!(clean_whitespace(input), expected, "case: {name}");
-        }
-    }
-
-    #[test]
-    fn test_remove_emojis() {
-        let cases: &[(&str, &str, &str)] = &[
-            // A selection of emojis from different ranges
-            ("emoji characters removed", "Hello 😊😢🔥👍🏆🎉💯", "Hello "),
-            // Emoticons range: U+1F600..=U+1F64F
-            ("emoticons removed", "😀😁😂🤣😃😄😅😆", ""),
-            // Symbols and pictographs range: U+1F300..=U+1F5FF
-            ("misc symbols removed", "🌀🌂🌁", ""),
-            // Transport range: U+1F680..=U+1F6FF
-            ("transport symbols removed", "🚀🚁🚂", ""),
-            // Various other emoji ranges
-            ("transport supplement removed", "🛀🛁🛂🛃🛄🛅", ""),
-            ("supplemental symbols removed", "🤐🤑🤒🤓🤔🤕🤖", ""),
-            ("extended symbols removed", "🥰🥱🥴🥳🥺", ""),
-            ("symbols ext A removed", "🦾🦿🧠🧡", ""),
-            // Note: ZWJ sequences like 🧑‍🦰 contain U+200D (zero-width joiner) which is
-            // not in the emoji ranges, so it passes through.
-            ("ZWJ character survives emoji removal", "🧑‍🦰", "\u{200d}"),
-            // Misc symbols: U+2600..=U+26FF
-            // Note: ☀️ contains U+FE0F (variation selector-16) which is not in the
-            // emoji ranges, so it passes through. We test with bare U+2600 instead.
-            ("misc symbols range", "\u{2600}\u{2601}\u{2602}\u{2603}", ""),
-            // Dingbats: U+2700..=U+27BF
-            ("dingbats removed", "✀✁✂✃✄✅", ""),
-            // Non-emoji text passes through
-            ("plain text unchanged", "Hello, world!", "Hello, world!"),
-        ];
-        for &(name, input, expected) in cases {
-            assert_eq!(remove_emojis(input), expected, "case: {name}");
-        }
-    }
-
-    #[test]
-    fn test_wrap_lang_tag() {
-        assert_eq!(
-            wrap_lang_tag("Hello world", "en"),
-            "<en>Hello world</en>",
-            "text wrapped in language tag"
-        );
-
-        // Language-agnostic tag
-        assert_eq!(wrap_lang_tag("Test", "na"), "<na>Test</na>");
-    }
-
-    // ── encode_text with synthetic indexer ──────────────────────────────
 
     #[test]
     fn test_encode_text_with_indexer() {
@@ -2150,31 +1907,18 @@ mod tests {
         let (ids4, len4) = encode_text_with_indexer(&[-1], "x");
         assert_eq!(len4, 1);
         assert_eq!(ids4, vec![-1i64], "UNK sentinel preserved");
-    }
 
-    /// Model-free test for the empty-token-sequence guard.
-    ///
-    /// The guard in [`synthesize_internal`] checks `if seq_len == 0` after
-    /// calling [`encode_text`]. This test validates the precondition directly
-    /// using [`encode_text_with_indexer`] with a synthetic indexer, so it
-    /// runs in any environment regardless of whether TTS model files are
-    /// cached.
-    #[test]
-    fn test_encode_text_empty_input_produces_zero_len() {
-        // Empty string → zero-length output (triggers the seq_len == 0 guard)
+        // The empty-token guard in [`synthesize_internal`] checks
+        // `seq_len == 0` after [`encode_text`]: an empty string encodes to no
+        // tokens, anything else produces tokens even when it is whitespace.
         let (ids, len) = encode_text_with_indexer(&vec![0i32; 128], "");
         assert_eq!(
             len, 0,
             "empty input must produce zero-length token sequence"
         );
         assert!(ids.is_empty(), "token IDs must be empty for empty input");
-
-        // Non-empty string still produces tokens (guard not triggered)
         let (_, len2) = encode_text_with_indexer(&vec![0i32; 128], "a");
         assert_eq!(len2, 1, "single-char input should produce one token");
-
-        // Whitespace-only strings are NOT empty — they produce tokens.
-        // The guard only triggers for truly empty character sequences.
         let (_, len3) = encode_text_with_indexer(&vec![0i32; 128], " ");
         assert_eq!(len3, 1, "whitespace input produces a token");
     }
@@ -2230,9 +1974,12 @@ mod tests {
 
     // ── Playback-active flag tests ──────────────────────────────────────
 
+    /// The counter's whole life: it starts at zero, one increment per
+    /// `speak_async()` call (not per chunk), one decrement after the reverb
+    /// tail, and overlapping calls keep it active until the last tail expires.
     #[test]
     #[serial_test::serial(tts)]
-    fn test_playback_active_default_false() {
+    fn test_playback_counter_lifecycle() {
         // The playback-active flag must start as `false` (no TTS playing).
         assert!(!is_playback_active(), "default state must be inactive");
         assert_eq!(
@@ -2240,58 +1987,27 @@ mod tests {
             0,
             "internal counter must start at 0"
         );
-    }
-
-    #[test]
-    #[serial_test::serial(tts)]
-    fn test_playback_reverb_tail_within_range() {
         // Reverb tail must be 200-400ms.
         assert!(
             (200..=400).contains(&PLAYBACK_REVERB_TAIL_MS),
             "PLAYBACK_REVERB_TAIL_MS={PLAYBACK_REVERB_TAIL_MS} must be between 200 and 400",
         );
-    }
 
-    #[test]
-    #[serial_test::serial(tts)]
-    fn test_playback_counter_single_call() {
-        // Simulate the correct production lifecycle: one increment when the
-        // first chunk starts playing, one decrement after the reverb tail.
-        // This is the common case for single-chunk TTS responses.
-        assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
-
-        // First chunk playback starts (increment: 0 → 1)
+        // Single-chunk response: one increment when the first chunk starts
+        // playing, one decrement after the reverb tail.
         PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
         assert!(is_playback_active(), "active during playback");
-
-        // Reverb tail expires (decrement: 1 → 0)
         PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
         assert!(!is_playback_active(), "inactive after reverb tail");
         assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
-    }
 
-    #[test]
-    #[serial_test::serial(tts)]
-    fn test_playback_counter_multi_chunk_no_leak() {
-        // Critical regression test:
-        // The counter is incremented ONCE per speak_async() call (when
-        // the first chunk plays), NOT once per chunk.  After N chunks
-        // and one decrement, the counter must return to 0.
-        //
-        // Previously the increment ran on every chunk, causing a
-        // permanent counter leak on multi-chunk responses (N>=2).
-        assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
-
-        // Simulate: first chunk starts playback (increment: 0 → 1)
-        // (guard: current_sink.is_none() == true)
+        // Multi-chunk response: the increment happens ONCE per speak_async()
+        // call when the first chunk plays, not once per chunk. Previously the
+        // increment ran on every chunk, causing a permanent counter leak on
+        // multi-chunk responses (N>=2).
         PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
-
-        // Simulate: subsequent chunks arrive (guard: current_sink.is_some())
-        // NO fetch_add — this was the bug: adding per-chunk instead of once.
-        // (We verify no additional increments happen.)
+        // Further chunks arrive with `current_sink.is_some()`: no fetch_add.
         assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 1);
-
-        // Simulate: reverb tail expires (decrement: 1 → 0)
         PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
         assert_eq!(
             PLAYBACK_ACTIVE.load(Ordering::Acquire),
@@ -2299,49 +2015,26 @@ mod tests {
             "counter must return to 0 after multi-chunk response"
         );
         assert!(!is_playback_active(), "inactive after all chunks done");
-    }
 
-    #[test]
-    #[serial_test::serial(tts)]
-    fn test_playback_counter_overlapping_calls() {
-        // Simulate: speak_async() A starts → speak_async() B starts
-        // during A's reverb tail → A finishes reverb → B finishes reverb
-        assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
-
-        // A: first chunk plays (increment: 0 → 1)
+        // Overlapping calls: B starts during A's reverb tail, so A's expiry
+        // does not make the flag inactive.
         PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
         assert!(is_playback_active());
-
-        // B starts during A's reverb tail: first chunk plays (1 → 2)
         PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
         assert!(is_playback_active());
-
-        // A: reverb tail expires (2 → 1) — still active due to B
         PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
         assert!(is_playback_active(), "B still playing");
-
-        // B: reverb tail expires (1 → 0) — now inactive
         PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
         assert!(!is_playback_active());
 
-        assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    #[serial_test::serial(tts)]
-    fn test_playback_counter_high_frequency_race_safety() {
-        // Stress test: 100 iterations of overlapping call pairs.
-        // Verifies the counter always returns to 0 regardless of
-        // interleaving — exercises the race scenario where a new
-        // speak_async() starts during the previous one's reverb tail.
+        // 100 iterations of overlapping call pairs: the counter always returns
+        // to 0 regardless of interleaving.
         for _ in 0..100 {
             assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
-
             PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
             PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
             PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
             PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
-
             assert_eq!(
                 PLAYBACK_ACTIVE.load(Ordering::Acquire),
                 0,

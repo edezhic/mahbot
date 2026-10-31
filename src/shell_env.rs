@@ -1067,22 +1067,29 @@ mod tests {
         );
     }
 
+    /// Whatever a startup file prints around the dump — a warning before it, a
+    /// background job's line after it — is tolerated, while bytes written
+    /// *between* two entries fail the read: they glue to the next entry's name,
+    /// which no environment variable's name could carry, so the read must fail
+    /// rather than hand over a mangled set. A dump that is not framed by both
+    /// markers, or that holds no entry at all, is no dump either.
     #[test]
-    fn parse_dump_ignores_output_around_the_dump() {
+    fn parse_dump_tolerates_surrounding_output_and_refuses_a_corrupt_one() {
         let nonce = "feedfacefeedface";
-        let mut bytes = Vec::new();
+        let mut surrounded = Vec::new();
         // A startup file's own output before the dump.
-        bytes.extend_from_slice(b"nvm: warning\n");
-        bytes.extend_from_slice(start_marker(nonce).as_bytes());
-        bytes.extend_from_slice(b"NAME=value");
-        bytes.push(0);
-        bytes.extend_from_slice(b"OTHER=x");
-        bytes.push(0);
-        bytes.extend_from_slice(end_marker(nonce).as_bytes());
+        surrounded.extend_from_slice(b"nvm: warning\n");
+        surrounded.extend_from_slice(start_marker(nonce).as_bytes());
+        surrounded.extend_from_slice(b"NAME=value");
+        surrounded.push(0);
+        surrounded.extend_from_slice(b"OTHER=x");
+        surrounded.push(0);
+        surrounded.extend_from_slice(end_marker(nonce).as_bytes());
         // A background job's line after the dump — a complete dump is complete.
-        bytes.extend_from_slice(b"stray noise\n");
+        surrounded.extend_from_slice(b"stray noise\n");
 
-        let vars = parse_dump(&bytes, nonce).expect("stray output around the dump is tolerated");
+        let vars =
+            parse_dump(&surrounded, nonce).expect("stray output around the dump is tolerated");
         assert_eq!(
             vars,
             vec![
@@ -1090,51 +1097,37 @@ mod tests {
                 (OsString::from("OTHER"), OsString::from("x")),
             ]
         );
-    }
 
-    #[test]
-    fn parse_dump_refuses_an_interleaved_write() {
-        let nonce = "deadbeefdeadbeef";
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(start_marker(nonce).as_bytes());
-        bytes.extend_from_slice(b"NAME=value");
-        bytes.push(0);
-        // Another holder of the pipe writing between two entries: its bytes glue
-        // to the next entry's name, which no environment variable's name could
-        // carry — the read must fail rather than hand over a mangled set.
-        bytes.extend_from_slice(b"stray noise\n");
-        bytes.extend_from_slice(b"OTHER=x");
-        bytes.push(0);
-        bytes.extend_from_slice(end_marker(nonce).as_bytes());
-
+        // Another holder of the pipe writing between two entries.
+        let mut interleaved = Vec::new();
+        interleaved.extend_from_slice(start_marker(nonce).as_bytes());
+        interleaved.extend_from_slice(b"NAME=value");
+        interleaved.push(0);
+        interleaved.extend_from_slice(b"stray noise\n");
+        interleaved.extend_from_slice(b"OTHER=x");
+        interleaved.push(0);
+        interleaved.extend_from_slice(end_marker(nonce).as_bytes());
         assert!(matches!(
-            parse_dump(&bytes, nonce),
+            parse_dump(&interleaved, nonce),
             Err(ReadFailure::NoDump(_))
         ));
-    }
 
-    #[test]
-    fn parse_dump_requires_markers_and_entries() {
-        let nonce = "cafebabecafebabe";
-        // No marker at all.
-        assert!(matches!(
-            parse_dump(b"just some output\n", nonce),
-            Err(ReadFailure::NoDump(_))
-        ));
-        // Start marker, one entry, no end marker.
+        // No marker at all; a start marker with no end marker; both markers with
+        // nothing between them.
         let mut unterminated = Vec::new();
         unterminated.extend_from_slice(start_marker(nonce).as_bytes());
         unterminated.extend_from_slice(b"NAME=value\0");
-        assert!(matches!(
-            parse_dump(&unterminated, nonce),
-            Err(ReadFailure::NoDump(_))
-        ));
-        // Both markers, but nothing between them.
         let empty = format!("{}{}", start_marker(nonce), end_marker(nonce));
-        assert!(matches!(
-            parse_dump(empty.as_bytes(), nonce),
-            Err(ReadFailure::NoDump(_))
-        ));
+        for bytes in [
+            b"just some output\n".as_slice(),
+            unterminated.as_slice(),
+            empty.as_bytes(),
+        ] {
+            assert!(matches!(
+                parse_dump(bytes, nonce),
+                Err(ReadFailure::NoDump(_))
+            ));
+        }
     }
 
     /// The read through a real shell, bounded by the timeout it is given.
@@ -1166,8 +1159,10 @@ mod tests {
         );
     }
 
+    /// A shell that prints nothing has no dump, and a shell this reader has no
+    /// recipe for is refused outright — both without waiting for the timeout.
     #[tokio::test]
-    async fn read_with_shell_reports_no_dump_when_the_shell_is_silent() {
+    async fn read_with_shell_refuses_a_silent_or_unknown_shell() {
         let failure = read_with_shell(
             Path::new("/bin/sh"),
             ":",
@@ -1179,6 +1174,18 @@ mod tests {
         .err()
         .expect("a silent shell has no dump");
         assert!(matches!(failure, ReadFailure::NoDump(_)), "{failure}");
+
+        let failure = read_with_shell(
+            Path::new("/bin/pwsh"),
+            ":",
+            "0123456789abcdef",
+            None,
+            Duration::from_secs(10),
+        )
+        .await
+        .err()
+        .expect("an unknown shell is refused");
+        assert_eq!(failure, ReadFailure::UnknownShell("pwsh".to_string()));
     }
 
     #[tokio::test]
@@ -1194,21 +1201,6 @@ mod tests {
         .err()
         .expect("a hanging shell times out");
         assert_eq!(failure, ReadFailure::Timeout);
-    }
-
-    #[tokio::test]
-    async fn read_with_shell_refuses_an_unknown_shell() {
-        let failure = read_with_shell(
-            Path::new("/bin/pwsh"),
-            ":",
-            "0123456789abcdef",
-            None,
-            Duration::from_secs(10),
-        )
-        .await
-        .err()
-        .expect("an unknown shell is refused");
-        assert_eq!(failure, ReadFailure::UnknownShell("pwsh".to_string()));
     }
 }
 

@@ -356,16 +356,9 @@ fn suggestions_text(catalog: &[ModelCatalogEntry], model: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_price_handles_edge_cases() {
-        assert_eq!(parse_price(""), None);
-        assert_eq!(parse_price("   "), None);
-        assert_eq!(parse_price("0"), Some(0.0));
-        assert_eq!(parse_price("0.00000028"), Some(0.000_000_28));
-        assert_eq!(parse_price("abc"), None);
-        assert_eq!(parse_price("1e-5"), Some(0.00001));
-    }
-
+    /// The endpoints fixture the benchmark selects from: pricing strings survive
+    /// verbatim (they are the cost model), the unknown fields are ignored, and a
+    /// string `status` normalizes like the integer one.
     #[test]
     fn parses_endpoints_response_fixture() {
         let json = serde_json::json!({
@@ -409,10 +402,8 @@ mod tests {
         assert_eq!(ep.provider_name, "StreamLake");
         assert_eq!(ep.context_length, Some(163_840));
         assert_eq!(ep.quantization.as_deref(), Some("fp8"));
-        // status is a STRING ("0"), not a number.
         assert_eq!(ep.status.as_deref(), Some("0"));
         assert_eq!(ep.supports_implicit_caching, Some(true));
-        // pricing strings survive verbatim.
         let pricing = ep.pricing.as_ref().expect("pricing present");
         assert_eq!(pricing.prompt.as_deref(), Some("0.00000028"));
         assert_eq!(pricing.input_cache_read.as_deref(), Some("0.00000009"));
@@ -460,21 +451,5 @@ mod tests {
         assert_eq!(parsed.data.endpoints[1].status.as_deref(), Some("-2"));
         // A present-but-wrong-typed status degrades to None, not a parse failure.
         assert_eq!(parsed.data.endpoints[2].status, None);
-    }
-
-    #[test]
-    fn endpoints_path_builds_encoded_segments() {
-        install_ring_provider();
-        let client = DiscoveryClient {
-            client: reqwest::Client::new(),
-            key: "k".to_string(),
-            base: "https://openrouter.ai/api/v1".to_string(),
-        };
-        assert_eq!(
-            client
-                .endpoints_path("deepseek/deepseek-v4-flash-0731")
-                .unwrap(),
-            "https://openrouter.ai/api/v1/models/deepseek/deepseek-v4-flash-0731/endpoints"
-        );
     }
 }

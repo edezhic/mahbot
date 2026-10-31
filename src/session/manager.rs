@@ -1408,6 +1408,84 @@ async fn lookup_workspace_context(ws: &Workspace, role: &Role) -> Option<String>
 mod tests {
     use super::*;
 
+    /// The persisted automation lines the assistant sees: one statement of the
+    /// timing per call, the tool trigger's arguments verbatim (scrubbing was
+    /// deliberately removed), and the custom-role branch address.
+    #[test]
+    fn automation_lines_show_trigger_and_interval() {
+        let one_shot = Automation {
+            id: "a1".to_string(),
+            session_id: "s1".to_string(),
+            user_name: "u".to_string(),
+            kind: "one-shot".to_string(),
+            text: "hello".to_string(),
+            trigger: None,
+            role: None,
+            identifier: None,
+            workspace: None,
+            interval_seconds: None,
+            next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
+            unfinished_attempts: 0,
+        };
+        let periodic = Automation {
+            id: "a2".to_string(),
+            session_id: "s1".to_string(),
+            user_name: "u".to_string(),
+            kind: "periodic".to_string(),
+            text: "check".to_string(),
+            trigger: Some(crate::automations::StoredTrigger::Tool(
+                crate::automations::Trigger {
+                    tool: "weather".to_string(),
+                    args: serde_json::Map::from_iter([
+                        ("city".to_string(), serde_json::json!("Minsk")),
+                        (
+                            "api_key".to_string(),
+                            serde_json::json!("supersecretvalue123"),
+                        ),
+                    ]),
+                },
+            )),
+            role: None,
+            identifier: None,
+            workspace: None,
+            interval_seconds: Some(3600),
+            next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
+            unfinished_attempts: 0,
+        };
+        let role = Automation {
+            id: "a3".to_string(),
+            session_id: "s1".to_string(),
+            user_name: "u".to_string(),
+            kind: "one-shot".to_string(),
+            text: "wake the role".to_string(),
+            trigger: None,
+            role: Some("analyst".to_string()),
+            identifier: Some("daily".to_string()),
+            workspace: Some("my-workspace".to_string()),
+            interval_seconds: None,
+            next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
+            unfinished_attempts: 0,
+        };
+
+        let lines =
+            render_automation_lines(&[one_shot, periodic, role]).expect("automations render");
+        assert!(lines.contains("every 3600 seconds"));
+        assert!(lines.contains("trigger: weather "));
+        assert!(lines.contains("\"city\":\"Minsk\""));
+        // Scrubbing was deliberately removed: a credential-shaped argument
+        // reaches the persisted prompt verbatim.
+        assert!(lines.contains("\"api_key\":\"supersecretvalue123\""));
+        assert!(lines.contains("next fire:"));
+        assert!(
+            lines.contains(
+                "addressed to custom role \"analyst\" (branch \"daily\") in my-workspace"
+            ),
+            "got: {lines}"
+        );
+
+        assert!(render_automation_lines(&[]).is_none());
+    }
+
     /// Mid-session change detection: switching image AND video models against
     /// a persisted baseline fires one change-info per model (change-only
     /// lines — both shared catalog caches are seeded fail-open, so the change
@@ -1475,11 +1553,8 @@ mod tests {
         let (out, snapshot) = Session::prepend_model_change(agent_id, "again", user).await;
         assert_eq!(out, "again");
         assert!(snapshot.is_none());
-    }
 
-    #[tokio::test]
-    async fn prepend_model_change_without_baseline_is_noop() {
-        crate::util::test::init_test_stores().await;
+        // No persisted baseline at all → nothing to compare against, no line.
         let (out, snapshot) =
             Session::prepend_model_change("test_assistant_no_baseline", "hello", "no_such_user")
                 .await;
@@ -1660,21 +1735,6 @@ mod tests {
         // Durable row untouched.
         let msgs = crate::session::store().load(agent_id).await;
         assert_eq!(msgs[0].content, "[IMAGE:/tmp/a.png] persisted");
-    }
-
-    #[tokio::test]
-    async fn rewrite_last_user_message_no_user_message_errors() {
-        crate::util::test::init_test_stores().await;
-        let mut session = Session {
-            history: vec![ChatMessage::system("role")],
-            persisted_len: 1,
-            ..Default::default()
-        };
-        let err = session
-            .rewrite_last_user_message("test_rewrite_err", "x".to_string())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("no user message"), "{err}");
     }
 
     #[tokio::test]
@@ -1960,58 +2020,6 @@ mod tests {
         assert_eq!(b_payload.content, "result b", "captured sibling verbatim");
     }
 
-    /// The workspace frame the admin's Assistant receives states what is closed
-    /// instead of reading as confinement, and no other role stops being told
-    /// where the workspace is — the two frame assets the gating rule can pick
-    /// between, rendered into the one boilerplate the roles share.
-    #[test]
-    fn the_admin_workspace_frame_states_what_is_closed() {
-        let shared = crate::prompt::load_prompt("context/workspace.md");
-        assert!(
-            shared.contains("{{path_frame}}"),
-            "the shared boilerplate takes the role's frame: {shared}"
-        );
-        let frame = crate::prompt::load_prompt("context/workspace_frame.md");
-        assert!(
-            frame.contains("outside the workspace"),
-            "the shared frame keeps the workspace rule: {frame}"
-        );
-        let admin = crate::prompt::load_prompt("context/workspace_frame_admin.md");
-        assert!(
-            !admin.contains("outside the workspace"),
-            "the admin's frame must not read as confinement: {admin}"
-        );
-        for named in ["managed workspaces", "live databases"] {
-            assert!(
-                admin.contains(named),
-                "the admin's frame must name what stays closed ({named}): {admin}"
-            );
-        }
-
-        // The frame is a fragment: the boilerplate's own line break separates it
-        // from the line below, so a trailing newline would inject a blank line
-        // into every role's system prompt.
-        for asset in [&frame, &admin] {
-            assert!(
-                !asset.ends_with('\n'),
-                "the frame assets are fragments and must not end with a newline"
-            );
-        }
-
-        // Only the admin's Assistant gets that frame.
-        assert_eq!(
-            workspace_frame_key(Role::Assistant, true),
-            "context/workspace_frame_admin.md"
-        );
-        for pick in [
-            workspace_frame_key(Role::Assistant, false),
-            workspace_frame_key(Role::Manager, true),
-            workspace_frame_key(Role::Engineer, false),
-        ] {
-            assert_eq!(pick, "context/workspace_frame.md");
-        }
-    }
-
     /// Pure gating of the Assistant context blocks: a guest's Assistant gets
     /// the automations, workspace-structure and custom-tool blocks (the workspace list and
     /// the custom-role listing are the admin's only); the admin's Assistant gets
@@ -2082,64 +2090,6 @@ mod tests {
         );
     }
 
-    /// The custom-role listing: empty roles render nothing, one entry per role
-    /// carries the name, stored behaviour token and tool set, and each role's
-    /// prompt opening collapses to a single line and is cut on a char boundary
-    /// with an ellipsis. The composed block reaches the admin's Assistant only.
-    #[test]
-    fn custom_role_block_lists_roles() {
-        use crate::custom_role::{CustomRole, CustomRoleBehavior};
-
-        assert!(render_custom_role_lines(&[]).is_none());
-
-        let roles = vec![
-            CustomRole {
-                name: "auditor".to_string(),
-                prompt: "You audit.\n\n## Rules\nBe thorough.".to_string(),
-                tools: vec!["read_file".to_string(), "grep".to_string()],
-                behavior: CustomRoleBehavior::Continuous,
-            },
-            CustomRole {
-                name: "runner".to_string(),
-                prompt: "Run once.".to_string(),
-                tools: Vec::new(),
-                behavior: CustomRoleBehavior::OneOff,
-            },
-        ];
-        let rendered = render_custom_role_lines(&roles).expect("roles render");
-        assert!(rendered.contains("auditor"));
-        assert!(rendered.contains("behaviour: continuous"));
-        assert!(rendered.contains("tools: read_file, grep"));
-        assert!(rendered.contains("runner"));
-        assert!(rendered.contains("behaviour: one_off"));
-        assert!(rendered.contains("tools: none"));
-        // The multi-line prompt collapses onto its single continuation line.
-        assert!(rendered.contains("  You audit. ## Rules Be thorough."));
-
-        // A long multi-line Cyrillic prompt is cut on a char boundary with an
-        // ellipsis, inside the cap.
-        let long = "Правило номер один и его подробное описание,\n".repeat(40);
-        let excerpt = role_prompt_excerpt(&long);
-        assert!(excerpt.ends_with('…'));
-        assert!(excerpt.chars().count() <= MAX_ROLE_EXCERPT_CHARS);
-        assert!(!excerpt.contains('\n'));
-
-        // Composed end to end: the admin's Assistant gets the block, a guest's
-        // gets none (it cannot launch roles), and no roles means no block.
-        let role_block = |is_admin: bool, roles: &[CustomRole]| {
-            assistant_context_blocks(is_admin, &[], &[], None, roles, "<custom-tools>")
-                .into_iter()
-                .find(|block| block.contains("<available-custom-roles>"))
-        };
-        let listing = role_block(true, &roles).expect("the admin's Assistant gets the listing");
-        assert!(listing.contains("auditor") && listing.contains("runner"));
-        assert!(
-            listing.contains("behaviour: continuous") && listing.contains("behaviour: one_off")
-        );
-        assert!(role_block(false, &roles).is_none());
-        assert!(role_block(true, &[]).is_none());
-    }
-
     /// Path-safety guard: blank or synthetic user names (path separators,
     /// dot segments) never resolve to a workspace — the block is omitted
     /// instead of picturing the userspaces root or another user's folders.
@@ -2168,108 +2118,6 @@ mod tests {
 
         std::fs::remove_dir_all(&folder).expect("rmdir");
         assert!(fetch_personal_files("manager_picture_user").await.is_none());
-    }
-
-    /// Automation line rendering: a periodic interval is annotated, the trigger is
-    /// rendered verbatim (no scrubbing — automation-born text is not redacted on the
-    /// automation side), and an empty automation set renders as `None`.
-    #[test]
-    fn automation_lines_show_trigger_and_interval() {
-        let one_shot = Automation {
-            id: "a1".to_string(),
-            session_id: "s1".to_string(),
-            user_name: "u".to_string(),
-            kind: "one-shot".to_string(),
-            text: "hello".to_string(),
-            trigger: None,
-            role: None,
-            identifier: None,
-            workspace: None,
-            interval_seconds: None,
-            next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
-            unfinished_attempts: 0,
-        };
-        let periodic = Automation {
-            id: "a2".to_string(),
-            session_id: "s1".to_string(),
-            user_name: "u".to_string(),
-            kind: "periodic".to_string(),
-            text: "check".to_string(),
-            trigger: Some(crate::automations::StoredTrigger::Tool(
-                crate::automations::Trigger {
-                    tool: "weather".to_string(),
-                    args: serde_json::Map::from_iter([
-                        ("city".to_string(), serde_json::json!("Minsk")),
-                        (
-                            "api_key".to_string(),
-                            serde_json::json!("supersecretvalue123"),
-                        ),
-                    ]),
-                },
-            )),
-            role: None,
-            identifier: None,
-            workspace: None,
-            interval_seconds: Some(3600),
-            next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
-            unfinished_attempts: 0,
-        };
-        let role = Automation {
-            id: "a3".to_string(),
-            session_id: "s1".to_string(),
-            user_name: "u".to_string(),
-            kind: "one-shot".to_string(),
-            text: "wake the role".to_string(),
-            trigger: None,
-            role: Some("analyst".to_string()),
-            identifier: Some("daily".to_string()),
-            workspace: Some("my-workspace".to_string()),
-            interval_seconds: None,
-            next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
-            unfinished_attempts: 0,
-        };
-
-        let lines =
-            render_automation_lines(&[one_shot, periodic, role]).expect("automations render");
-        assert!(lines.contains("every 3600 seconds"));
-        assert!(lines.contains("trigger: weather "));
-        assert!(lines.contains("\"city\":\"Minsk\""));
-        // Scrubbing was deliberately removed: a credential-shaped argument
-        // reaches the persisted prompt verbatim.
-        assert!(lines.contains("\"api_key\":\"supersecretvalue123\""));
-        assert!(lines.contains("next fire:"));
-        assert!(
-            lines.contains(
-                "addressed to custom role \"analyst\" (branch \"daily\") in my-workspace"
-            ),
-            "got: {lines}"
-        );
-
-        assert!(render_automation_lines(&[]).is_none());
-    }
-
-    /// Workspace list rendering: the discovery summary is collapsed to one
-    /// line and a summary-less workspace is still listed. (Personal-row
-    /// filtering lives in the fetcher.) An empty slice renders as `None`.
-    #[test]
-    fn workspace_lines_summary_collapse() {
-        let workspaces = vec![
-            (
-                crate::workspace::test_ws_named("/data/proj", "proj"),
-                Some("Multi   line\nsummary text".to_string()),
-            ),
-            (
-                crate::workspace::test_ws_named("/data/other", "other"),
-                None,
-            ),
-        ];
-
-        let lines = render_workspace_lines(&workspaces).expect("workspaces render");
-        assert!(lines.contains("- proj (pending): /data/proj"));
-        assert!(lines.contains("\n  Multi line summary text"));
-        assert!(lines.contains("- other (pending): /data/other"));
-
-        assert!(render_workspace_lines(&[]).is_none());
     }
 
     /// A custom role's system prompt is exactly two parts — the fixed

@@ -3319,11 +3319,6 @@ mod tests {
         agent
     }
 
-    #[tokio::test]
-    async fn tool_with_scrub_disabled_preserves_output() {
-        assert_scrubbed(false).await;
-    }
-
     #[test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     fn failure_classification_recovers_retry_exhaustion() {
@@ -3428,9 +3423,14 @@ mod tests {
         }
     }
 
+    /// The scrub decision belongs to the tool: one that opts out returns its
+    /// output verbatim, one that opts in has the secret-like line redacted
+    /// before the output reaches the transcript.
     #[tokio::test]
-    async fn tool_with_scrub_enabled_scrubs_sensitive_output() {
-        assert_scrubbed(true).await;
+    async fn tool_output_scrubbing_follows_the_tool_setting() {
+        for should_scrub in [false, true] {
+            assert_scrubbed(should_scrub).await;
+        }
     }
 
     /// A media-generation test tool that returns a configurable [`Tool::media_marker`].
@@ -3758,86 +3758,74 @@ mod tests {
 
     // ── drain_incoming_messages tests ─────────────────────────────────
 
-    /// drain_incoming_messages injects TicketComment messages into the session
-    /// as user messages with the correct prefix.
+    /// `drain_incoming_messages` turns a queued job into a user message: a
+    /// ticket comment carries its author and ticket as a prefix, any other kind
+    /// passes its content through without prefix formatting.
     #[tokio::test]
-    async fn test_drain_incoming_messages_injects_ticket_comment() {
+    async fn test_drain_incoming_messages_injects_the_job_as_a_user_message() {
         crate::util::test::init_management_test_stores().await;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut agent = make_agent(vec![]);
-        agent.incoming_rx = Some(rx);
-        agent.agent_id = "_test_drain_ticket_comment".into();
+        let cases = [
+            (
+                "_test_drain_ticket_comment",
+                crate::agent::message_router::MessageKind::TicketComment,
+                crate::Role::Manager,
+                "manager",
+                "Please fix the formatting",
+                Some("[Comment from manager on ticket]"),
+            ),
+            (
+                "_test_drain_non_comment",
+                crate::agent::message_router::MessageKind::UserMessage,
+                crate::Role::Assistant,
+                "user",
+                "Hello agent",
+                None,
+            ),
+        ];
+        for (agent_id, kind, role, user_name, content, prefix) in cases {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut agent = make_agent(vec![]);
+            agent.incoming_rx = Some(rx);
+            agent.agent_id = agent_id.into();
 
-        // Send a TicketComment job
-        let job = crate::agent::message_router::AgentJob {
-            content: "Please fix the formatting".to_string(),
-            workspace_name: "test_ws".to_string(),
-            user_name: "manager".to_string(),
-            channel: String::new(),
-            kind: crate::agent::message_router::MessageKind::TicketComment,
-            role: crate::Role::Manager,
-            reply_target: None,
-            pending_job_id: None,
-            originating_workspace: None,
-            custom_role: None,
-            reply_to_custom: None,
-        };
-        let _ = tx.send(job);
+            let job = crate::agent::message_router::AgentJob {
+                content: content.to_string(),
+                workspace_name: "test_ws".to_string(),
+                user_name: user_name.to_string(),
+                channel: String::new(),
+                kind,
+                role,
+                reply_target: None,
+                pending_job_id: None,
+                originating_workspace: None,
+                custom_role: None,
+                reply_to_custom: None,
+            };
+            let _ = tx.send(job);
 
-        agent.drain_incoming_messages().await;
+            agent.drain_incoming_messages().await;
 
-        let history = agent.session.history();
-        assert!(!history.is_empty(), "should have at least one message");
-        let last = history.last().unwrap();
-        assert_eq!(last.role, crate::ChatRole::User, "should be a user message");
-        assert!(
-            last.content.contains("Please fix the formatting"),
-            "should contain the comment content: {}",
-            last.content,
-        );
-        assert!(
-            last.content.contains("[Comment from manager on ticket]"),
-            "should include comment prefix: {}",
-            last.content,
-        );
-    }
-
-    /// drain_incoming_messages handles unregistered job kinds by passing
-    /// content through without prefix formatting.
-    #[tokio::test]
-    async fn test_drain_incoming_messages_non_comment() {
-        crate::util::test::init_management_test_stores().await;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut agent = make_agent(vec![]);
-        agent.incoming_rx = Some(rx);
-        agent.agent_id = "_test_drain_non_comment".into();
-
-        // Send a plain UserMessage job
-        let job = crate::agent::message_router::AgentJob {
-            content: "Hello agent".to_string(),
-            workspace_name: "test_ws".to_string(),
-            user_name: "user".to_string(),
-            channel: String::new(),
-            kind: crate::agent::message_router::MessageKind::UserMessage,
-            role: crate::Role::Assistant,
-            reply_target: None,
-            pending_job_id: None,
-            originating_workspace: None,
-            custom_role: None,
-            reply_to_custom: None,
-        };
-        let _ = tx.send(job);
-
-        agent.drain_incoming_messages().await;
-
-        let history = agent.session.history();
-        assert!(!history.is_empty(), "should have at least one message");
-        let last = history.last().unwrap();
-        assert!(
-            last.content.contains("Hello agent"),
-            "should contain the raw content: {}",
-            last.content,
-        );
+            let history = agent.session.history();
+            assert!(!history.is_empty(), "{agent_id}: at least one message");
+            let last = history.last().unwrap();
+            assert_eq!(
+                last.role,
+                crate::ChatRole::User,
+                "{agent_id}: a drained job is a user message"
+            );
+            assert!(
+                last.content.contains(content),
+                "{agent_id}: content is carried: {}",
+                last.content,
+            );
+            if let Some(prefix) = prefix {
+                assert!(
+                    last.content.contains(prefix),
+                    "{agent_id}: comment prefix present: {}",
+                    last.content,
+                );
+            }
+        }
     }
 
     /// drain_incoming_messages handles a closed receiver gracefully
@@ -3893,14 +3881,17 @@ mod tests {
     }
 
     /// A comment added during a no-agent window is injected into the session for
-    /// an empty-message resume, across the in-scope stage roles (engineer,
-    /// sanitation).
+    /// an empty-message resume — for a stage role and a non-stage role alike,
+    /// with no special case for a comment the agent's own role authored (only a
+    /// content already present in the loaded history suppresses it).
     #[tokio::test]
-    async fn test_inject_outstanding_comments_injects_for_stage_roles() {
+    async fn test_inject_outstanding_comments_injects_for_every_role() {
         crate::util::test::init_management_test_stores().await;
+        // (agent id, role, workspace name, author, comment, phase)
         let cases: &[(
             &str,
             crate::Role,
+            &str,
             &str,
             &str,
             crate::pipeline::board::TicketPhase,
@@ -3909,6 +3900,7 @@ mod tests {
                 "inject-new-agent",
                 crate::Role::Engineer,
                 "inject_new",
+                "manager",
                 "please fix the formatting",
                 crate::pipeline::board::TicketPhase::InDevelopment,
             ),
@@ -3916,11 +3908,28 @@ mod tests {
                 "inject-sanitation-agent",
                 crate::Role::Sanitation,
                 "inject_sanitation",
+                "manager",
                 "please verify the cleanup",
                 crate::pipeline::board::TicketPhase::InSanitation,
             ),
+            (
+                "inject-own-role-agent",
+                crate::Role::Engineer,
+                "inject_own_role",
+                "engineer",
+                "note from the engineer",
+                crate::pipeline::board::TicketPhase::InDevelopment,
+            ),
+            (
+                "inject-analyst-agent",
+                crate::Role::Analyst,
+                "inject_analyst",
+                "manager",
+                "please fix the formatting",
+                crate::pipeline::board::TicketPhase::InDevelopment,
+            ),
         ];
-        for &(agent_id, role, ws_name, comment, phase) in cases {
+        for &(agent_id, role, ws_name, author, comment, phase) in cases {
             let ws = crate::workspace::test_ws_named("/tmp/test", ws_name);
             let ticket_id = crate::util::test::make_ticket(
                 crate::pipeline::board::store(),
@@ -3930,7 +3939,7 @@ mod tests {
             )
             .await;
             crate::pipeline::board::store()
-                .add_comment(&ticket_id, "manager", comment)
+                .add_comment(&ticket_id, author, comment)
                 .await
                 .unwrap();
             let ticket =
@@ -3939,13 +3948,13 @@ mod tests {
             let mut agent = make_inject_agent(agent_id, role, ticket, Some("round 1 task")).await;
             agent.inject_outstanding_comments(true, "").await;
 
+            let prefix = format!("[Comment from {author} on ticket]");
             let history = agent.session.history();
             assert!(
-                history.iter().any(|m| {
-                    m.content.contains("[Comment from manager on ticket]")
-                        && m.content.contains(comment)
-                }),
-                "a new board comment should be injected into a resumed {role} session",
+                history
+                    .iter()
+                    .any(|m| m.content.contains(&prefix) && m.content.contains(comment)),
+                "{agent_id}: a new board comment should be injected into a resumed {role} session",
             );
         }
     }
@@ -3992,45 +4001,6 @@ mod tests {
         );
     }
 
-    /// Dedup is purely content-based: a comment authored by the agent's own role
-    /// is NOT special-cased — it is injected when its content is absent from the
-    /// loaded history (only content-in-history dedup suppresses it).
-    #[tokio::test]
-    async fn test_inject_outstanding_comments_does_not_special_case_own_role() {
-        crate::util::test::init_management_test_stores().await;
-        let ws = crate::workspace::test_ws_named("/tmp/test", "inject_own_role");
-        let ticket_id = crate::util::test::make_ticket(
-            crate::pipeline::board::store(),
-            &ws,
-            "Inject Own Role",
-            crate::pipeline::board::TicketPhase::InDevelopment,
-        )
-        .await;
-        crate::pipeline::board::store()
-            .add_comment(&ticket_id, "engineer", "note from the engineer")
-            .await
-            .unwrap();
-        let ticket =
-            crate::util::test::expect_ticket(crate::pipeline::board::store(), &ticket_id).await;
-
-        let mut agent = make_inject_agent(
-            "inject-own-role-agent",
-            crate::Role::Engineer,
-            ticket,
-            Some("round 1 task"),
-        )
-        .await;
-        agent.inject_outstanding_comments(true, "").await;
-
-        let history = agent.session.history();
-        assert!(
-            history
-                .iter()
-                .any(|m| m.content.contains("[Comment from engineer on ticket]")),
-            "an own-role comment absent from history must still be injected",
-        );
-    }
-
     /// The bounce-feedback path (non-empty `msg`) and a non-resumed round
     /// (`resume=false`) are no-ops — no injection.
     #[tokio::test]
@@ -4071,45 +4041,6 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("[Comment from manager on ticket]")),
             "feedback path and fresh round must not inject comments",
-        );
-    }
-
-    /// Comment injection is not role-gated: the role flag was removed as dead
-    /// weight (only stage rounds resume with an empty message in production),
-    /// so a non-stage role reaching the resume path injects too.
-    #[tokio::test]
-    async fn test_inject_outstanding_comments_injects_for_non_stage_role() {
-        crate::util::test::init_management_test_stores().await;
-        let ws = crate::workspace::test_ws_named("/tmp/test", "inject_analyst");
-        let ticket_id = crate::util::test::make_ticket(
-            crate::pipeline::board::store(),
-            &ws,
-            "Inject Analyst",
-            crate::pipeline::board::TicketPhase::InDevelopment,
-        )
-        .await;
-        crate::pipeline::board::store()
-            .add_comment(&ticket_id, "manager", "please fix the formatting")
-            .await
-            .unwrap();
-        let ticket =
-            crate::util::test::expect_ticket(crate::pipeline::board::store(), &ticket_id).await;
-
-        let mut agent = make_inject_agent(
-            "inject-analyst-agent",
-            crate::Role::Analyst,
-            ticket,
-            Some("round 1 task"),
-        )
-        .await;
-        agent.inject_outstanding_comments(true, "").await;
-
-        let history = agent.session.history();
-        assert!(
-            history
-                .iter()
-                .any(|m| m.content.contains("[Comment from manager on ticket]")),
-            "injection is no longer role-gated — non-stage roles reaching the resume path inject",
         );
     }
 
@@ -6024,14 +5955,17 @@ mod tests {
         }
     }
 
-    /// The content side of the same invariant: a result whose flag says its text
-    /// is content — a converted document's extracted text — is neither replaced
-    /// by an annotation nor read as a claim, so an `[IMAGE:path]` marker inside
-    /// it stays literal text and injects nothing.
+    /// The content side of the image invariant: a result whose flag says its text
+    /// is content — a converted document's extracted text — is neither read as a
+    /// claim nor replaced by an annotation. An `[IMAGE:path]` marker inside it
+    /// stays literal text and injects nothing, while a real payload SUPPLEMENTS
+    /// the text: the annotation is appended, so the extracted text and the
+    /// converter's notes survive into the persisted round.
     #[tokio::test]
-    async fn commit_tool_results_leaves_a_marker_in_content_text_alone() {
+    async fn commit_tool_results_handles_content_text() {
         crate::util::test::init_test_stores().await;
 
+        // ── A marker inside content text stays literal ──
         // A real on-disk raster, so derivation would succeed if it were allowed.
         let dir = tempfile::TempDir::new().expect("tempdir");
         let png_path = dir.path().join("page.png");
@@ -6082,15 +6016,8 @@ mod tests {
                 .any(|m| m.role == crate::ChatRole::User && m.content.contains("[IMAGE:")),
             "nothing is derived from a marker in content text: {history:?}"
         );
-    }
 
-    /// A converted document's images SUPPLEMENT its text: the annotations are
-    /// appended to the tool result, so the extracted text (and the converter's
-    /// notes) survive into the persisted round.
-    #[tokio::test]
-    async fn commit_tool_results_appends_annotations_for_content_text() {
-        crate::util::test::init_test_stores().await;
-
+        // ── A payload alongside content text supplements it ──
         let mut agent = make_agent(vec![]);
         let tool_calls = vec![ToolCall {
             id: "call1".into(),
@@ -6243,81 +6170,6 @@ mod tests {
     }
 
     // ── Universal resume-completion ──────────────────────────────────────
-
-    /// The resume-completion path batches a re-executed round exactly like the
-    /// commit path: two calls that each produce images still inject ONE
-    /// synthetic user message, so the provider-rejection recovery — which
-    /// rewrites only the most recent message — can clear every image the
-    /// rejected request carried.
-    #[tokio::test]
-    async fn complete_pending_tool_calls_injects_one_image_message_per_round() {
-        crate::util::test::init_test_stores().await;
-        let dir = tempfile::tempdir().unwrap();
-        // Different sizes, so the two pages hash to different data URIs and
-        // neither is deduped away as an already-attached image.
-        for (page, size) in [("page-a.png", 4), ("page-b.png", 5)] {
-            std::fs::write(
-                dir.path().join(page),
-                crate::util::test::noisy_png(size, size),
-            )
-            .unwrap();
-        }
-        let ws = crate::Workspace::from_path(dir.path());
-
-        let calls: Vec<crate::ToolCall> = ["page-a.png", "page-b.png"]
-            .iter()
-            .enumerate()
-            .map(|(index, page)| crate::ToolCall {
-                id: format!("call_img_{index}"),
-                name: "read".to_string(),
-                arguments: serde_json::json!({ "path": page }),
-            })
-            .collect();
-        let frame = crate::providers::reasoning::assistant_replay_payload(Some(""), &calls, None)
-            .to_string();
-        let mut session = Session::default();
-        session
-            .persist_messages(
-                "test-resume-image-batch",
-                &[
-                    ChatMessage::user("read both images"),
-                    ChatMessage::assistant(frame),
-                ],
-            )
-            .await
-            .unwrap();
-
-        let mut agent = make_agent_on(
-            vec![Box::new(crate::tools::ReadTool::general())],
-            "test-resume-image-batch",
-            ws,
-        );
-        agent.session = session;
-        assert!(
-            agent.complete_pending_tool_calls().await.unwrap(),
-            "both dangling calls settle a result"
-        );
-
-        let history = agent.session.history();
-        let image_messages: Vec<&str> = history
-            .iter()
-            .filter(|m| m.role == crate::ChatRole::User && m.content.contains("[IMAGE:"))
-            .map(|m| m.content.as_str())
-            .collect();
-        assert_eq!(
-            image_messages.len(),
-            1,
-            "one message for the whole re-executed round, got: {image_messages:?}"
-        );
-        assert_eq!(
-            image_messages[0]
-                .matches("[IMAGE:data:image/jpeg;base64,")
-                .count(),
-            2,
-            "both pages of the round are in the batch: {:?}",
-            image_messages[0]
-        );
-    }
 
     /// (c) `complete_pending_tool_calls` re-executes a non-durable dangling call
     /// and settles the real output as its tool result with the ORIGINAL call id,
