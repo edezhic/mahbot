@@ -1,20 +1,20 @@
 //! Process start-up: the store bring-up sequence ([`open_stores`]), the
 //! retirement of the removed text-embedding model files
 //! ([`remove_retired_embedding_model_files`]) and the diagnostics emitted before
-//! the tracing layer exists. Diagnostics are written
-//! to stderr immediately (carrying a local-time timestamp for update.log
-//! forensics) and buffered for replay into the logs store once tracing is live,
+//! the tracing layer exists. Diagnostics are written to stderr immediately (carrying a
+//! local-time timestamp, so a line kept in `daemon.log` or `update.log` is
+//! time-attributable) and buffered for replay into the logs store once tracing is live,
 //! so they appear in the GUI boot log.
 //!
-//! That stderr leg is best-effort, not a delivery guarantee: a launch the
-//! platform gave no standard streams prints into nothing, while one started from a
-//! console inherits its handles and prints there. A store that is not usable
-//! refuses the start before either store is opened, and what makes such a failure
-//! recoverable is the storage root's durable failure record
-//! (`<root>/error.log`): every store bring-up failure — the refusal, the
-//! locked-store case, and any other error — is appended there, once per condition
-//! however often the launch repeats (see [`failure_record::record`]), which is why
-//! [`record_startup_failure`] exists for the start-up steps outside this module.
+//! That stderr leg is best-effort, not a delivery guarantee: a launch detached from its
+//! terminal has its stderr in [`crate::detach`]'s `daemon.log` under the storage root, a
+//! launch the platform gave no standard streams prints into nothing, and the update
+//! hand-off's stderr is `update.log`. A store that is not usable refuses the start before
+//! either store is opened, and what makes such a failure recoverable is the storage
+//! root's durable failure record (`<root>/error.log`): every store bring-up failure — the
+//! refusal, the locked-store case, and any other error — is appended there, once per
+//! condition however often the launch repeats (see [`failure_record::record`]), which is
+//! why [`record_startup_failure`] exists for the start-up steps outside this module.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -29,8 +29,8 @@ static TRACING_INITIALIZED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Write a diagnostic line to stderr with a local-time timestamp prefix, so
-/// lines captured in update.log (the replacement daemon's stderr) are
-/// time-attributable during incident review.
+/// lines captured in `daemon.log` (a detached launch's own output) or `update.log`
+/// (the replacement daemon's stderr) are time-attributable during incident review.
 ///
 /// The daemon's single stderr funnel: boot diagnostics, the failure record's
 /// stderr fallback, the log-store warnings and the panic hook all reach stderr
@@ -58,12 +58,12 @@ pub(crate) fn mark_tracing_initialized() {
 }
 
 /// Drop the pre-tracing buffer without replaying it. Called when
-/// `init_tracing` fails. The messages went to a best-effort channel that a launch
-/// given no standard streams loses (stderr, see the module header), so dropping
-/// the buffer loses nothing that was not already lost — only the (failed)
-/// logs-store replay is skipped. The failure itself is not left to that channel: the step
-/// that failed it records the durable `error.log` block like any other bring-up
-/// failure.
+/// `init_tracing` fails. The messages went to a best-effort channel — stderr, which is
+/// `daemon.log` for a detached launch and nothing at all for one the platform gave no
+/// standard streams (see the module header) — so dropping the buffer loses nothing that
+/// was not already lost; only the (failed) logs-store replay is skipped. The failure
+/// itself is not left to that channel: the step that failed it records the durable
+/// `error.log` block like any other bring-up failure.
 pub(crate) fn clear_boot_diagnostics() {
     PRE_TRACING_DIAGNOSTICS.lock().unwrap_poison().clear();
 }

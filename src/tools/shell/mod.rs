@@ -381,7 +381,8 @@ pub(crate) fn apply_agent_env(cmd: &mut tokio::process::Command) {
 /// so that [`std`](std::process::Command) takes its non-forking start: it forks for a
 /// bare program name whenever the command sets `PATH` (it must — the search belongs to
 /// the child), and a forked child of this process makes macOS print a line about memory
-/// tooling to the terminal the daemon was started from, once per command started.
+/// tooling to the daemon's own stderr, once per command started — the terminal the launch
+/// came from, or `daemon.log` once it detached from one.
 /// `argv[0]` keeps the bare name, so the program sees exactly what
 /// `Command::new(program)` would have handed it; environment, directory, streams,
 /// process group and exit status stay the caller's. Only `Command::new` can name a
@@ -400,10 +401,10 @@ pub(crate) fn apply_agent_env(cmd: &mut tokio::process::Command) {
 /// search with its own extension rules. The command carries `CREATE_NO_WINDOW` on
 /// Windows, like every spawn in this tree ([`tree`]).
 ///
-/// The two starts that need a session of their own are deliberately not served here
-/// ([`crate::shell_env`], [`crate::gui::shell`]): `std` has no session control, so no
-/// naming can spare them the fork — a hand-written start call could, and is not
-/// attempted.
+/// The starts that need a session of their own are deliberately not served here
+/// ([`crate::shell_env`], [`crate::gui::shell`], the Telegram Bot API helper, the update
+/// replacement): `std` has no session control, so no naming can spare them the fork — a
+/// hand-written start call could, and is not attempted.
 #[must_use]
 pub(crate) fn program_command(
     program: &str,
@@ -693,7 +694,7 @@ fn build_program_command(program: &Path, args: &[String], cwd: &Path) -> tokio::
 
 /// The one product-owned command: `extra` variables over the reduced
 /// [`internal_env_pairs`] environment, and end-of-file on stdin, so a program that
-/// decides to ask a question never reads the daemon's terminal.
+/// decides to ask a question never reads the daemon's own standard input.
 ///
 /// Contained as an agent's command is ([`program_command_with`]): the child leads
 /// its own process group on Unix, and on Windows a [`RunOwner::Agent`] run gets the

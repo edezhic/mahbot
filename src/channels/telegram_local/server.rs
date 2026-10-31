@@ -431,6 +431,21 @@ async fn spawn(port: u16) -> Result<(u32, u64), String> {
     let mut command = tokio::process::Command::new(binary);
     #[cfg(target_os = "windows")]
     command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    // A session of its own on unix, so a hangup aimed at the service's session cannot
+    // reach the helper either — the service itself is detached from the terminal it was
+    // started from (see `detach`), and anything that outlives it must not hang off it.
+    //
+    // SAFETY: `setsid` is async-signal-safe and is the only thing run between the fork and
+    // the exec; the child is freshly forked, so it is not a group leader.
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     command
         // Everything it writes stays under its own root, including whatever a
         // relative path would resolve against: the product's working directory is

@@ -161,6 +161,10 @@ pub(crate) mod audio_cli;
 pub(crate) mod onnx;
 
 // ── Lifecycle and platform support ───────────────────────────────────────
+// Handing the terminal back: a launch started from one is detached from it before
+// anything else the daemon does, and what it would have printed goes to `daemon.log`
+// in the storage root.
+pub mod detach;
 // How the process comes up: one ordering for every store open, the sweep of the
 // retired model-cache files, plus the failure line before tracing exists.
 pub mod boot;

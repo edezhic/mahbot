@@ -5,15 +5,18 @@
 //! The module tree is the library's; this file owns the wiring the library
 //! cannot do for itself — bootstrap, background-task spawn, the message
 //! pipeline, the shutdown drain — and the Telegram command surface. The work
-//! itself stays in the library. Built for the GUI subsystem so a Windows
-//! launch never puts a console window on the screen: the platform gives such a
-//! process no console of its own. How a shell treats it turns on the form of
-//! launch — at an interactive prompt it does not wait for such a program and
-//! does not hand its exit code back, while from a command file it waits. A
-//! launch with no console loses this file's own prints — accepted, never fatal:
-//! they go through `mahbot::util::print_stdout` / `print_stderr`, where the
-//! policy lives. Conditional so the binary's own test harness stays a console
-//! program and `cargo test --bins` output stays visible.
+//! itself stays in the library. A Unix launch started from a terminal is
+//! detached from it before anything else the daemon does: the prompt comes back,
+//! the service keeps running in a session of its own, and what it would have
+//! printed lands in `<storage root>/daemon.log` (`mahbot::detach`). Built for the
+//! GUI subsystem so a Windows launch never puts a console window on the screen:
+//! the platform gives such a process no console of its own. How a shell treats
+//! it turns on the form of launch — at an interactive prompt it does not wait for
+//! such a program and does not hand its exit code back, while from a command
+//! file it waits. A Windows launch with no console loses this file's own prints —
+//! accepted, never fatal: they go through `mahbot::util::print_stdout` /
+//! `print_stderr`, where the policy lives. Conditional so the binary's own test
+//! harness stays a console program and `cargo test --bins` output stays visible.
 #![warn(clippy::pedantic)]
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
@@ -880,6 +883,31 @@ fn main() -> Result<()> {
         EntryPoint::Daemon => (false, false),
     };
 
+    // ── The daemon ──
+    //
+    // From the first instructions of the daemon's own start-up (as early as the launch
+    // can tell it is one, which is after the command word is read): a hangup or a
+    // suspending signal must never end the service, and the window this closes is the one
+    // before the signal task exists.
+    mahbot::shutdown::install_ignored_signals();
+
+    // Resolve the storage root before anything else: it is a pure environment read
+    // (`mahbot::config::default_config_dir`), the detach below names the log file in it,
+    // the instance lock is acquired under it before Iced starts, and the pre-boot steps
+    // are recorded against it. The process-global root is not set yet, and a note that
+    // only ever reached a terminal is lost with it — the durable record in
+    // `<root>/error.log` is what keeps such a step recoverable.
+    let storage_root = mahbot::config::default_config_dir()
+        .map_err(|e| mahbot::boot::record_startup_failure("config::default_config_dir", e))?;
+
+    // Started from a terminal, the service is detached from it here: the prompt comes back,
+    // the service keeps running in a session of its own with none of the shell's streams,
+    // and everything it prints lands in `<root>/daemon.log` (`mahbot::detach`). Only that
+    // service goes on from here, and the launch that started it has printed its one line by
+    // then. A launch the terminal did not start — a pipe, a supervisor, the login
+    // registration, the update hand-off — carries on in the foreground exactly as before.
+    mahbot::detach::detach_from_terminal(&storage_root)?;
+
     // The platform's own exemption from slowing this process down because its window is
     // not visible, asked for here — before anything else the daemon does, so it holds for
     // the whole life of the service rather than from the moment the dashboard appears.
@@ -893,15 +921,6 @@ fn main() -> Result<()> {
     // exists; `shutdown` names the three sources.
     mahbot::shutdown::install_stop_request_sources();
 
-    // Resolve the storage root before the temp root: it is a pure environment read
-    // (`mahbot::config::default_config_dir`), resolved before config init so the
-    // instance lock below can be acquired before Iced starts, and the two pre-boot
-    // steps below are recorded against it. The process-global root is not set yet,
-    // and on a launch with no console a stderr-only note is lost — the durable
-    // record in `<root>/error.log` is what keeps them recoverable.
-    let storage_root = mahbot::config::default_config_dir()
-        .map_err(|e| mahbot::boot::record_startup_failure("config::default_config_dir", e))?;
-
     // Consolidate ALL instance temp files under one private root
     // (`/tmp/mahbot`, mode 0700; `<user temp>\mahbot` on Windows) and pin the
     // platform's temp variables to it — BEFORE any temp use (config, logs,
@@ -910,7 +929,9 @@ fn main() -> Result<()> {
     // dispatches above and a refused unknown first word must NOT create the root
     // (they exit before this point).
     mahbot::temp::init_temp_root().map_err(|e| {
-        mahbot::boot::record_launch_failure(&storage_root, "temp::init_temp_root", e)
+        let e = mahbot::boot::record_launch_failure(&storage_root, "temp::init_temp_root", e);
+        mahbot::detach::report_failure(&e);
+        e
     })?;
 
     // Acquire the instance lock before Iced runtime starts.
@@ -925,28 +946,41 @@ fn main() -> Result<()> {
     // pre-boot step, so the process-global root is not set yet), with its text passed through
     // unchanged — the shell tool recognises a stale self-update binary by it
     // (`self_update::second_instance_refusal`). A refusal leaves a Windows launch the platform
-    // gave no console and no standard streams (the double-click case) silent: no window, no
-    // text, exit code 1 — the filed block is what such a launch leaves behind, and the runner's
-    // own-image step reads that same text off the pipe it wired.
+    // gave no console and no standard streams (the double-click case) silent — only the filed
+    // block remains, and the runner's own-image step reads that same text off the pipe it wired
+    // — while a Unix launch started from a terminal has a launcher waiting on its word, and
+    // says the refusal there.
     if let Err(refusal) = mahbot::self_update::acquire_lock(&storage_root) {
         // A login start is not a second launch: the system asked for the product
         // and one is already up, so this exits quietly — no window raised, no
         // failure filed, exit 0. A location that could not be taken for any other
         // reason is a real failure of the launch and is filed like one.
         if login_start && mahbot::self_update::is_instance_refusal(&refusal) {
+            mahbot::detach::report_already_running();
             return Ok(());
         }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if !mahbot::self_update::is_handoff() && mahbot::db::ipc::request_window_show(&storage_root)
         {
+            // The copy that is up was reached and its window raised: the launch did what it
+            // came to do, and the terminal is told so — not that a service just started.
+            mahbot::detach::report_already_running();
             return Ok(());
         }
-        return Err(mahbot::boot::record_launch_failure(
+        let refusal = mahbot::boot::record_launch_failure(
             &storage_root,
             "self_update::acquire_lock",
             refusal,
-        ));
+        );
+        // Where no window can be raised this refusal is the launch's whole answer, and the
+        // waiting terminal is where it is said; the filed block stays the durable half.
+        mahbot::detach::report_failure(&refusal);
+        return Err(refusal);
     }
+
+    // The location is this process's: the service is up, and the launch that is waiting on
+    // its word prints the notice and gives the terminal back.
+    mahbot::detach::report_running();
 
     // Read persisted window state (sync, before Iced runtime starts).
     let window_state = mahbot::gui::read_window_state();

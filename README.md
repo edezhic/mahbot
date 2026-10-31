@@ -29,7 +29,9 @@ On Windows (PowerShell):
 irm https://raw.githubusercontent.com/edezhic/mahbot/main/install.ps1 | iex
 ```
 
-This script will install the latest release and start it for you. Further updates will be installed & restarted automatically, with graceful pause&resume and very little downtime for your agents. After the install mahbot asks you to provide one of:
+This script will install the latest release and start it for you, and hand your terminal
+back while the product keeps running: anything it prints while starting lands in
+`~/.mahbot/daemon.log`. Further updates will be installed & restarted automatically, with graceful pause&resume and very little downtime for your agents. After the install mahbot asks you to provide one of:
 - OpenRouter API key, or
 - a custom OpenAI-compatible endpoint
 

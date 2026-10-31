@@ -692,8 +692,9 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// A windowed launch may also have been given no standard streams at all (its parent
 /// passed none): the library discards a write to an absent handle itself
 /// (`std::io::stdio`'s `handle_ebadf`), so that case is a lost notice, never a fatal
-/// one — while a windowed launch started from a console inherits its handles and
-/// prints there like any other process. `print_stderr` is also the panic hook's
+/// one — while a Unix launch detached from its terminal writes to `daemon.log` under the
+/// storage root (`crate::detach`), and the update hand-off's own stderr is `update.log`.
+/// `print_stderr` is also the panic hook's
 /// writer and what everything printed before tracing exists goes through
 /// (`boot::timestamped_stderr`), where a panic would abort instead of unwinding.
 #[doc(hidden)]

@@ -46,6 +46,11 @@
 //! consumer. The CLI subcommands and a launch the instance lock turns away reach none of the
 //! closing path either, having exited before the runtime exists. A new exit path that drops the
 //! runtime without firing the token belongs on this list.
+//!
+//! Two signals are not stop requests at all and never end the daemon: a hangup, and the catchable
+//! suspending signals ([`install_ignored_signals`] takes them out of play from the daemon's first
+//! instructions, and [`wait_for_shutdown_signal`] drops a hangup ever after). An uncatchable stop
+//! (`SIGKILL`, `SIGSTOP`) is nobody's to refuse and stays as the platform has it.
 
 use crate::util::UnwrapPoison;
 use std::sync::{Mutex, OnceLock};
@@ -375,7 +380,10 @@ fn stop_for_session_end(label: &'static str) {
 /// and tool groups complete. Background loops break on the drain flag.
 /// The signal streams stay alive (never dropped) so a SECOND signal during
 /// the drain maps to [`force_cancel`] — abort the drain, checkpoint, exit.
-/// SIGHUP is explicitly ignored so the daemon survives terminal/SSH disconnects.
+/// SIGHUP is explicitly ignored so the daemon survives terminal/SSH disconnects —
+/// [`install_ignored_signals`] already covered the window before this task exists, and
+/// the catchable suspending signals it ignores stay ignored (a service has nothing to
+/// stop for).
 ///
 /// Windows: the same protocol, fed by the console control handler installed by
 /// `install_console_stop_handler` (each event arrives on a fresh OS thread, so
@@ -449,6 +457,40 @@ pub async fn wait_for_shutdown_signal() -> anyhow::Result<Option<&'static str>> 
 }
 
 // ── Stop-request sources ──────────────────────────────────────────────────
+
+/// Unix: take the terminal's own signals out of play for the daemon's whole life, from
+/// its first instructions — the hangup, and every suspending signal a process can refuse
+/// (Ctrl+Z's `SIGTSTP`, `SIGTTIN`, `SIGTTOU`; an uncatchable stop is not a process's to
+/// refuse, and is not claimed here).
+///
+/// The disposition is a *caught* handler that does nothing, not `SIG_IGN`: an ignored
+/// signal stays ignored across `exec`, while a caught one is reset to the default by it —
+/// so the agent shells, the browser, the Telegram helper and the command-line subcommands
+/// keep the behaviour they have. This covers the window before [`wait_for_shutdown_signal`]
+/// exists, which is where a hangup used to end the daemon; once that task is up it drops a
+/// hangup as well. `SIGINT`/`SIGTERM` stay default here: a plain kill still stops the
+/// service, and the drain is what it starts.
+///
+/// A no-op where the platform has no such signals.
+pub fn install_ignored_signals() {
+    #[cfg(unix)]
+    {
+        /// Do nothing, for a signal the daemon must survive: the handler's existence is
+        /// the point, so it must never allocate or lock.
+        extern "C" fn ignore(_signal: libc::c_int) {}
+
+        use std::sync::Once;
+        static INSTALLED: Once = Once::new();
+        INSTALLED.call_once(|| {
+            // SAFETY: `signal` is async-signal-safe and the handler only returns.
+            unsafe {
+                for kind in [libc::SIGHUP, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU] {
+                    libc::signal(kind, ignore as *const () as libc::sighandler_t);
+                }
+            }
+        });
+    }
+}
 
 /// Subscribe the process to every stop request the platform can deliver, before boot and before
 /// the interface exists: the two Windows sources below and the quit source, the only one of the
@@ -1394,10 +1436,10 @@ pub(crate) fn contain_panics<T>(f: impl FnOnce() -> T) -> std::thread::Result<T>
 }
 
 /// Install a global panic hook that prints a timestamped marker line before
-/// the default panic report, so panics captured in update.log (the replacement
-/// daemon's stderr) are time-attributable. The default hook (message +
-/// backtrace) still runs — except for a panic contained by [`contain_panics`],
-/// which is reported through the caller's own result instead.
+/// the default panic report, so panics captured in `daemon.log` (a detached launch's own
+/// output) or `update.log` (the replacement daemon's stderr) are time-attributable. The
+/// default hook (message + backtrace) still runs — except for a panic contained by
+/// [`contain_panics`], which is reported through the caller's own result instead.
 pub fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

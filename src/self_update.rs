@@ -97,7 +97,7 @@
 //!
 //! ## macOS Gatekeeper safety
 //!
-//! `posix_spawn` triggers async Gatekeeper code-signing validation; deleting the
+//! Spawning a binary triggers async Gatekeeper code-signing validation; deleting the
 //! spawn target during validation produces empty stderr (SIGKILL by
 //! `syspolicyd`). The spawn target is always the working file the update left in
 //! place — never a temp root — and the temp roots are removed before the lock
@@ -2223,7 +2223,7 @@ async fn finalize_source_tree_update(
 ///    location the new file was placed at.
 /// 4. Release the instance lock so the child can acquire it.
 /// 5. Spawn the new instance, marked as the update hand-off ([`HANDOFF_ENV`] —
-///    see [`acquire_lock`]). On macOS, posix_spawn triggers asynchronous
+///    see [`acquire_lock`]). On macOS, the spawn triggers asynchronous
 ///    Gatekeeper code signature validation. The spawn target is never a temp
 ///    root (see step 3), so the cleanup cannot race the validation.
 /// 6. `exit(0)`.
@@ -2631,8 +2631,9 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
 /// daemon through one) would be refused by the replacement, and the service would
 /// not come back.
 ///
-/// On Unix: null stdin/stdout, stderr → update.log. On Windows: the same, plus
-/// `CREATE_NO_WINDOW`.
+/// On Unix: null stdin/stdout, stderr → update.log, and a session of its own (`setsid`),
+/// so a hangup aimed at the session the replaced instance ran in cannot reach the
+/// replacement. On Windows: the same streams, plus `CREATE_NO_WINDOW`.
 ///
 /// `CREATE_NO_WINDOW` is inert on this product's replacement instance: the binary
 /// is built windowed (its crate root declares `windows_subsystem = "windows"`), so
@@ -2709,6 +2710,25 @@ fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // A session of its own, so a hangup aimed at the session of the instance this
+        // replaces cannot reach the replacement — the same reason the Telegram helper has
+        // one. Its stderr still goes to update.log, which the redirection below pins.
+        //
+        // SAFETY: `setsid` is async-signal-safe and is the only thing run between the fork
+        // and the exec; the child is freshly forked, so it is not a group leader.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     cmd.stderr(Stdio::from(update_log));

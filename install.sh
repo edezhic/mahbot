@@ -480,6 +480,9 @@ fi
 # ── 7. Start the product ──────────────────────────────────────────────────
 
 # The trap cannot clean up after an `exec` — it replaces this shell, and no trap
-# runs then — so the temporary directory goes now.
+# runs then — so the temporary directory goes now. The product itself hands this
+# terminal back before it becomes the service (its own log is
+# `$HOME/.mahbot/daemon.log`), so this ends with the prompt returned and the
+# service running beside it.
 cleanup
 exec "$DEST"
