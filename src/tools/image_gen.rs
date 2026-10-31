@@ -1,10 +1,16 @@
 //! The `image_gen` tool: text-to-image and image-to-image through OpenRouter's
 //! dedicated Image API, walking the account's model picker and returning the
-//! file path the reply can embed.
+//! file paths the reply can embed.
+//!
+//! One call carries one prompt shared by up to [`MAX_GENERATIONS`] generations,
+//! each with its own reference images, aspect ratio and size. The generations are
+//! dispatched together — a batch is bounded by its slowest picture — and each one
+//! stands on its own: a generation that produced nothing costs its siblings
+//! nothing.
 //!
 //! Not the media catalog itself (`tools::media_catalog`) and not image
-//! analysis — this tool resolves a model, sends one request and downloads the
-//! result.
+//! analysis — this tool resolves a model, sends one request per generation and
+//! downloads the result.
 
 use crate::retry::RETRY_AFTER_MAX_MS;
 use crate::tools::media_catalog::image::{ImageModelInfo, resolve_image_model};
@@ -13,15 +19,20 @@ use crate::util::http::{bearer_auth_header, read_error_body};
 use crate::{Tool, Workspace};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures_util::future::join_all;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// The most pictures one call may ask for — a current limit, not a setting. The schema
+/// and the refusals read it; the tool's description states it as a word.
+const MAX_GENERATIONS: usize = 10;
+
 /// Tool for generating images via OpenRouter's dedicated Image API.
 ///
 /// Supports text-to-image and image-to-image generation. Accepts multiple
-/// reference images on input. Returns the path to the generated file so the
-/// agent can embed it as `[IMAGE:path]` in its reply.
+/// reference images per generation. Returns the paths to the generated files so the
+/// agent can embed them as `[IMAGE:path]` in its reply.
 ///
 /// One attempt walks the image models the account's picker offers: its own model
 /// first, exactly as it was always tried, then each other model once, in picker
@@ -51,42 +62,62 @@ impl Tool for ImageGenTool {
             &json!({
                 "prompt": {
                     "type": "string",
-                    "description": "Text description of the image to generate"
+                    "description": "Text description of the picture to generate"
                 },
-                "images": {
+                "generations": {
                     "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Paths to reference images for image-to-image generation (local paths are accepted only from the workspace uploads dir — received attachments — or the generated dir — previously generated images)"
-                },
-                "aspect_ratio": {
-                    "type": "string",
-                    "description": "Aspect ratio (e.g. 16:9, 1:1, 4:3)"
-                },
-                "size": {
-                    "type": "string",
-                    "description": "Image size — a tier (e.g. 1K, 2K) or explicit pixels (e.g. 1024x1024); a model that cannot express the value is not sent the request"
+                    "minItems": 1,
+                    "maxItems": MAX_GENERATIONS,
+                    "description": "The pictures to generate — one entry each",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "images": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Paths to this generation's reference images for image-to-image generation (local paths are accepted only from the workspace uploads dir — received attachments — or the generated dir — previously generated images); none makes it text-to-image"
+                            },
+                            "aspect_ratio": {
+                                "type": "string",
+                                "description": "This generation's aspect ratio (e.g. 16:9, 1:1, 4:3); unset keeps the default, or the first reference's own ratio"
+                            },
+                            "size": {
+                                "type": "string",
+                                "description": "This generation's size — a tier (e.g. 1K, 2K) or explicit pixels (e.g. 1024x1024); a model that cannot express the value is not sent the request. Unset keeps the model's own default"
+                            }
+                        }
+                    }
                 }
             }),
-            &["prompt"],
+            &["prompt", "generations"],
         )
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
-        let generated = self.generate(ws, &args, &HttpSender).await?;
-        Ok(self.result_text(&generated))
+        self.answer(&self.batch(ws, &args, &HttpSender).await?)
     }
 
-    /// The generated picture travels with the tool's own result: the walk decided
-    /// which model produced it, and the note naming that model has to reach the
-    /// assistant — which receives the image's annotation IN PLACE of the tool's own
-    /// text once the picture is attached, so the note rides on the payload.
     async fn execute_with_payloads(
         &self,
         ws: &Workspace,
         args: serde_json::Value,
     ) -> anyhow::Result<super::ToolOutput> {
-        let generated = self.generate(ws, &args, &HttpSender).await?;
-        Ok(self.output(&generated).await)
+        self.output(ws, &args, &HttpSender).await
+    }
+
+    /// A command-line call is one generation built from the command line's own flags,
+    /// and it reads the single-picture answer it always read: the marker with the
+    /// picture's note, and on failure that generation's own wording — no position.
+    async fn execute_answer(
+        &self,
+        ws: &Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<super::ToolAnswer> {
+        let outcomes = self.batch(ws, &args, &HttpSender).await?;
+        Ok(super::ToolAnswer {
+            text: self.lone_answer(&outcomes)?,
+            partial: false,
+        })
     }
 }
 
@@ -99,40 +130,295 @@ struct Generated {
 }
 
 impl Generated {
-    /// The payload that carries the picture into the conversation as a native
-    /// image, the note riding on its annotation. `None` when the saved file cannot
-    /// be re-encoded into one (fail-open, e.g. an SVG): the marker then stays in the
-    /// tool result's own text, and the note with it.
+    /// The payload that carries the picture into the conversation as a native image.
+    /// `None` when the saved file cannot be re-encoded into one (fail-open, e.g. an
+    /// SVG): the report's own marker then stays the only way to the picture.
     async fn payload(&self) -> Option<super::ImagePayload> {
         let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&self.path)
             .await
             .ok()?;
-        let mut payload = super::ImagePayload::from_compressed_meta(
+        Some(super::ImagePayload::from_compressed_meta(
             &self.path,
             meta,
             None,
             super::ImagePayloadSource::Generated,
-        );
-        payload.note.clone_from(&self.note);
-        Some(payload)
+        ))
     }
 }
 
+/// What one generation of a call came to.
+enum Produced {
+    /// The picture on disk.
+    Picture(Generated),
+    /// Nothing was produced: the one-line reason every report carries, and — for a call
+    /// that asked for a single picture — the wording such a call has always failed
+    /// with, longer when the walk named every model it visited.
+    Failed { short: String, full: Option<String> },
+}
+
+impl Produced {
+    /// A generation that produced nothing, its one-line reason standing as the whole
+    /// wording too.
+    fn failed(reason: impl Into<String>) -> Self {
+        Self::Failed {
+            short: reason.into(),
+            full: None,
+        }
+    }
+}
+
+/// The one outcome a generation cannot own: global shutdown cut it, and a call carrying
+/// one keeps nothing it produced.
+struct Aborted;
+
+/// One generation of a call, prepared before anything is sent: everything the walk
+/// needs, holding its own references, aspect ratio and size.
+struct Prepared {
+    plan: WalkPlan,
+    aspect_ratio: Option<String>,
+    size_arg: Option<String>,
+    references: Vec<crate::util::ReferenceImage>,
+}
+
+/// What every generation of a call sends through: the prompt they share, the account's
+/// own model, the endpoint and credentials — and whether the call asked for a single
+/// picture, whose failure is the call's whole wording.
+#[derive(Clone, Copy)]
+struct Call<'a> {
+    prompt: &'a str,
+    own_model: &'a str,
+    url: &'a str,
+    auth: &'a str,
+    sender: &'a dyn ImageSender,
+    lone: bool,
+}
+
 impl ImageGenTool {
-    /// Generate one picture: the account's own image model first, then every other
-    /// image model its picker offers, until one serves the request.
-    async fn generate(
+    /// Every picture of the call travels with the tool's own result, and the report
+    /// naming them — plus a failed generation's own line — has to reach the assistant:
+    /// the report is CONTENT, so the pictures' annotations are appended after it
+    /// instead of standing in for it.
+    async fn output(
         &self,
         ws: &Workspace,
         args: &serde_json::Value,
         sender: &dyn ImageSender,
-    ) -> anyhow::Result<Generated> {
+    ) -> anyhow::Result<super::ToolOutput> {
+        let outcomes = self.batch(ws, args, sender).await?;
+        Ok(super::ToolOutput {
+            text: self.answer(&outcomes)?,
+            image_payloads: self.payloads(&outcomes).await,
+            text_is_content: true,
+        })
+    }
+
+    /// The call's answer: the report of what each generation came to, or — when
+    /// nothing at all was produced — the failure naming every position.
+    fn answer(&self, outcomes: &[Produced]) -> anyhow::Result<String> {
+        if !outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Produced::Picture(_)))
+        {
+            anyhow::bail!("{}", Self::failure(outcomes));
+        }
+        Ok(self.report(outcomes))
+    }
+
+    /// The report the assistant reads: one line per generation, in position order —
+    /// a produced picture's marker with the walk's note, or why that generation
+    /// produced nothing. Compact on purpose: each line is cut to its share of what a
+    /// tool result may return, so ten lines never become a wall of text and never lose
+    /// a middle generation to truncation.
+    fn report(&self, outcomes: &[Produced]) -> String {
+        let line_bytes = line_bytes(outcomes.len(), 0, WALK_MESSAGE_BYTES);
+        outcomes
+            .iter()
+            .enumerate()
+            .map(|(index, outcome)| {
+                crate::util::cut_bytes(&self.line(index + 1, outcome), line_bytes)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The whole-call failure — nothing at all was produced — naming each position
+    /// with its own reason. A lone generation has the room to itself and keeps the full
+    /// wording a single-picture call always reported, which already opens the failure;
+    /// siblings share the room and say only what their walk ended with.
+    fn failure(outcomes: &[Produced]) -> String {
+        if let [Produced::Failed { short, full }] = outcomes {
+            let wording = full.as_deref().unwrap_or(short);
+            return crate::util::cut_bytes(
+                &format!("1. {wording}"),
+                line_bytes(1, 0, WALK_MESSAGE_BYTES),
+            );
+        }
+        let header = "Image generation failed: no picture was produced.";
+        let line_bytes = line_bytes(outcomes.len(), header.len(), WALK_MESSAGE_BYTES);
+        let mut out = String::from(header);
+        for (index, outcome) in outcomes.iter().enumerate() {
+            if let Produced::Failed { short, .. } = outcome {
+                out.push('\n');
+                out.push_str(&crate::util::cut_bytes(
+                    &format!("{}. {short}", index + 1).replace('\n', " "),
+                    line_bytes,
+                ));
+            }
+        }
+        out
+    }
+
+    /// One generation's report line, by position — always exactly one line, whatever
+    /// the provider's own wording carries.
+    fn line(&self, position: usize, outcome: &Produced) -> String {
+        let line = match outcome {
+            Produced::Picture(generated) => {
+                let marker = self.format_media_result(&generated.path);
+                match &generated.note {
+                    Some(note) => format!("{position}. {marker} {note}"),
+                    None => format!("{position}. {marker}"),
+                }
+            }
+            Produced::Failed { short, .. } => format!("{position}. failed — {short}"),
+        };
+        line.replace('\n', " ")
+    }
+
+    /// The pictures as native-image payloads, in position order — each attached on its
+    /// own, exactly as a single picture is.
+    async fn payloads(&self, outcomes: &[Produced]) -> Vec<super::ImagePayload> {
+        let mut payloads = Vec::new();
+        for outcome in outcomes {
+            if let Produced::Picture(generated) = outcome
+                && let Some(payload) = generated.payload().await
+            {
+                payloads.push(payload);
+            }
+        }
+        payloads
+    }
+
+    /// The answer a lone generation's call has always given — what the command line
+    /// reads, since it always asks for one picture: the marker with the note, or that
+    /// generation's own failure wording, never a position prefix.
+    fn lone_answer(&self, outcomes: &[Produced]) -> anyhow::Result<String> {
+        match outcomes {
+            [Produced::Picture(generated)] => Ok(self.result_text(generated)),
+            [Produced::Failed { short, full }] => {
+                anyhow::bail!("{}", full.as_deref().unwrap_or(short))
+            }
+            _ => self.answer(outcomes),
+        }
+    }
+
+    /// The tool result text for one picture: the delivery marker, then the note naming
+    /// the model that produced the picture when it was not the account's own.
+    fn result_text(&self, generated: &Generated) -> String {
+        let marker = self.format_media_result(&generated.path);
+        match &generated.note {
+            Some(note) => format!("{marker}\n{note}"),
+            None => marker,
+        }
+    }
+}
+
+impl ImageGenTool {
+    /// Run one whole call: every generation prepared first — the call fails before a
+    /// single picture is requested when one of them is unusable — then dispatched
+    /// together, so the batch is bounded by its slowest generation.
+    async fn batch(
+        &self,
+        ws: &Workspace,
+        args: &serde_json::Value,
+        sender: &dyn ImageSender,
+    ) -> anyhow::Result<Vec<Produced>> {
         let prompt = super::get_str(args, "prompt")?;
+        let entries = generations_arg(args)?;
         let user_name = crate::agent::tool_user_name();
         let own_model = crate::users::resolve_image_gen_model(&user_name).await;
-        let aspect_ratio_arg = super::get_opt_str(args, "aspect_ratio");
-        let size_arg = super::get_opt_str(args, "size");
-        let images: Vec<String> = super::get_str_array(args, "images")?;
+        // The other models the account could have picked: the list exactly as
+        // configured — a default the picker never showed was never offered to the
+        // account, so it is not a candidate (see [`plan_walk`]).
+        let picker = crate::config::CONFIG.image_gen_models_raw();
+        // The command line builds a batch of one from its own flags and reads the
+        // single-picture wording it always read, so its refusals name no position.
+        let positioned = !crate::agent::tool_command_line();
+
+        let mut prepared = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            let position = index + 1;
+            if !entry.is_object() {
+                anyhow::bail!(
+                    "usage: generation {position} of \"generations\" must be an object carrying \
+                     its own `images`, `aspect_ratio` and `size` — all generations share the \
+                     call's `prompt`"
+                );
+            }
+            match self.prepare(ws, entry, &own_model, &picker).await {
+                Ok(generation) => prepared.push(generation),
+                Err(e) if positioned => {
+                    return Err(anyhow::anyhow!("generation {position}: {e}"));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Image generation always targets OpenRouter — a custom chat endpoint never
+        // serves image models. A key the product does not hold is a failure of
+        // preparing the request, not a refusal any model could fix, so nothing is
+        // walked.
+        let api_base = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);
+        let images_url = format!("{api_base}/images");
+        let auth = bearer_auth_header().ok_or_else(|| {
+            anyhow::anyhow!("Image generation: provider API key is not configured")
+        })?;
+        let call = Call {
+            prompt,
+            own_model: &own_model,
+            url: &images_url,
+            auth: &auth,
+            sender,
+            // Only a lone generation's call reads the full walk wording, so only then
+            // is it composed.
+            lone: prepared.len() == 1,
+        };
+
+        // Every generation is dispatched together, and one that panics mid-flight is
+        // that generation's own line rather than the batch's (see
+        // `tools::caught_round` and `tools::internal_fault`).
+        let outcomes: Vec<Result<Produced, Aborted>> =
+            join_all(prepared.into_iter().map(|generation| async move {
+                let produced = run_generation(ws, generation, &call);
+                match crate::tools::caught_round("an image generation", produced).await {
+                    Ok(outcome) => outcome,
+                    Err(panic) => Ok(Produced::failed(
+                        crate::tools::internal_fault(&panic).to_string(),
+                    )),
+                }
+            }))
+            .await;
+
+        // A generation the shutdown cut keeps nothing, so neither does the call — as a
+        // lone generation always did.
+        if outcomes.iter().any(Result::is_err) {
+            anyhow::bail!("{SHUTDOWN_ABORTED}");
+        }
+        Ok(outcomes.into_iter().filter_map(Result::ok).collect())
+    }
+
+    /// Prepare one generation before anything is sent: its references confined, its
+    /// walk planned, its reference material checked and loaded — exactly the checks a
+    /// single-picture call runs, in the same order.
+    async fn prepare(
+        &self,
+        ws: &Workspace,
+        entry: &serde_json::Value,
+        own_model: &str,
+        picker: &[String],
+    ) -> anyhow::Result<Prepared> {
+        let aspect_ratio_arg = super::get_opt_str(entry, "aspect_ratio");
+        let size_arg = super::get_opt_str(entry, "size");
+        let images: Vec<String> = super::get_str_array(entry, "images")?;
 
         // Confine every reference before any other filesystem or provider access:
         // a refused path is never stat'ed or read, and the plan below cannot
@@ -144,13 +430,7 @@ impl ImageGenTool {
         }
 
         // What the walk will do, decided before any reference is loaded.
-        let plan = plan_walk(
-            &own_model,
-            reference_paths.len(),
-            size_arg,
-            &crate::config::CONFIG.image_gen_models_raw(),
-        )
-        .await?;
+        let plan = plan_walk(own_model, reference_paths.len(), size_arg, picker).await?;
 
         // Combined-size pre-flight before loading any file: the per-image ceilings
         // don't bound the total, and a pathological multi-reference request must be
@@ -167,114 +447,181 @@ impl ImageGenTool {
             );
         }
 
-        let resolved_aspect_ratio =
+        let aspect_ratio =
             request_aspect_ratio(aspect_ratio_arg, &reference_paths, plan.catalog_reached);
-
-        // Image generation always targets OpenRouter — a custom
-        // chat endpoint never serves image models.
-        let api_base = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);
-        let images_url = format!("{api_base}/images");
-        // A key the product does not hold is a failure of preparing the request,
-        // not a refusal any model could fix, so nothing is walked.
-        let auth = bearer_auth_header().ok_or_else(|| {
-            anyhow::anyhow!("Image generation: provider API key is not configured")
-        })?;
-
-        let mut walk = ImageWalk {
-            request: RequestMaterial {
-                prompt,
-                aspect_ratio: resolved_aspect_ratio,
-                size_arg,
-                references: &mut references,
-            },
-            own_model: &own_model,
-            url: &images_url,
-            auth: &auth,
-            sender,
-            trail: Vec::new(),
-            stopped: None,
-        };
-
-        // The walk is raced against global shutdown so a long generation cannot
-        // block process teardown.
-        let shutdown = crate::shutdown::shutdown_token();
-        let walked = tokio::select! {
-            () = shutdown.cancelled() => {
-                anyhow::bail!("{SHUTDOWN_ABORTED}");
-            }
-            walked = walk.run(plan.own_step, plan.candidates) => walked?,
-        };
-
-        let Walked::Served {
-            model: served_by,
-            response,
-        } = walked
-        else {
-            // Nothing served the request: the failure names what was tried and what
-            // each model answered.
-            anyhow::bail!("{}", walk.failure_message());
-        };
-
-        let (b64_json, media_type) = match extract_response_image(&response) {
-            Ok(x) => x,
-            Err(err) => {
-                // A 2xx body carrying a provider error (or no image data)
-                // means the attempt completed and was billed — never walked to
-                // another model, never retried.
-                anyhow::bail!("Image generation response error: {err}");
-            }
-        };
-
-        let bytes = match STANDARD.decode(b64_json.as_bytes()) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                // Provider returned malformed base64 — a response-processing
-                // failure, and a billed one: never walked to another model.
-                anyhow::bail!("Failed to decode base64 image data from response: {e}");
-            }
-        };
-
-        let output_path = super::save_generated_file(
-            ws,
-            &bytes,
-            "image",
-            extension_for_media_type(media_type.as_deref()),
-        )
-        .await?;
-
-        // The record the walk leaves behind: which model produced the picture, so a
-        // fallback stays diagnosable afterwards.
-        tracing::info!(
-            model = %served_by,
-            own_model = %own_model,
-            "Image generation produced a picture"
-        );
-
-        Ok(Generated {
-            path: output_path,
-            note: walk.fallback_note(&served_by),
+        Ok(Prepared {
+            plan,
+            aspect_ratio,
+            size_arg: size_arg.map(String::from),
+            references,
         })
     }
+}
 
-    /// One generated picture as the tool's own result: the marker text, and the picture
-    /// as a payload whose annotation the assistant reads in place of that text.
-    async fn output(&self, generated: &Generated) -> super::ToolOutput {
-        super::ToolOutput {
-            text: self.result_text(generated),
-            image_payloads: generated.payload().await.into_iter().collect(),
-            text_is_content: false,
-        }
+/// The call's generations, read and bounded before anything is spent: the list is
+/// required, non-empty, and never longer than [`MAX_GENERATIONS`].
+fn generations_arg(args: &serde_json::Value) -> anyhow::Result<&[serde_json::Value]> {
+    let Some(serde_json::Value::Array(entries)) = args.get("generations") else {
+        anyhow::bail!(
+            "usage: missing required argument \"generations\" (expected an array) — hint: pass a \
+             list of 1 to {MAX_GENERATIONS} generations, e.g. \
+             \"generations\": [{{\"images\": [\"uploads/a.png\"]}}, {{}}] — each carries its own \
+             images, aspect ratio and size, and the call's prompt is shared"
+        );
+    };
+    if entries.is_empty() {
+        anyhow::bail!("usage: \"generations\" is empty — ask for at least one picture");
     }
+    if entries.len() > MAX_GENERATIONS {
+        anyhow::bail!(
+            "usage: \"generations\" asks for {} pictures, at most {MAX_GENERATIONS} are produced per \
+             call — split the batch",
+            entries.len()
+        );
+    }
+    Ok(entries)
+}
 
-    /// The tool result text: the delivery marker, then the note naming the model
-    /// that produced the picture when it was not the account's own.
-    fn result_text(&self, generated: &Generated) -> String {
-        let marker = self.format_media_result(&generated.path);
-        match &generated.note {
-            Some(note) => format!("{marker}\n{note}"),
-            None => marker,
-        }
+/// What a credential scrub can add to a composed line, kept back so the cut lands
+/// inside the budget rather than past it: every scrubbed value grows by a few bytes,
+/// and the scrub runs after the text is built (see `Agent::failure_outcome`).
+const SCRUB_SLACK_BYTES: usize = 64;
+
+/// The room one line of the tool's own text has — a walk's failure, a call's batch
+/// report: what a tool result may return, less anything fixed around the lines, the
+/// newline each line takes and the scrub's growth, shared out over the lines and capped
+/// when the line has a cap. Counted in bytes, so a multi-byte name or answer cannot eat
+/// a neighbour's room.
+fn line_bytes(lines: usize, fixed: usize, cap: usize) -> usize {
+    let lines = lines.max(1);
+    let share = WALK_MESSAGE_BYTES
+        .saturating_sub(fixed)
+        .saturating_sub(SCRUB_SLACK_BYTES)
+        .saturating_sub(lines)
+        / lines;
+    share.min(cap)
+}
+
+/// A provider's own words before they enter the report — a failed generation's reason,
+/// or the fallback note: credentials scrubbed, since the report is not scrubbed on every
+/// path, and media markers broken, since the agent appends every `[IMAGE:…]` a
+/// successful tool result carries to the reply — a file this tool never produced would
+/// otherwise be handed to the user.
+fn provider_words(text: &str) -> String {
+    let text = crate::util::scrub_credentials(text);
+    if !crate::util::has_media_marker(&text, crate::util::MediaMarkerKind::Image) {
+        return text;
     }
+    crate::util::MEDIA_MARKER_RE
+        .replace_all(&text, |caps: &regex::Captures<'_>| {
+            format!("[{}]", &caps["kind"])
+        })
+        .into_owned()
+}
+
+/// Run one prepared generation to its picture, or to why it produced nothing: its
+/// own walk, its own references, its own request. A failure of any step — the walk,
+/// the response, the file — is this generation's own line; only global shutdown is the
+/// call's, and it is reported apart.
+async fn run_generation(
+    ws: &Workspace,
+    prepared: Prepared,
+    call: &Call<'_>,
+) -> Result<Produced, Aborted> {
+    let Call {
+        prompt,
+        own_model,
+        url,
+        auth,
+        sender,
+        lone,
+    } = *call;
+    let Prepared {
+        plan,
+        aspect_ratio,
+        size_arg,
+        mut references,
+    } = prepared;
+    let mut walk = ImageWalk {
+        request: RequestMaterial {
+            prompt,
+            aspect_ratio,
+            size_arg: size_arg.as_deref(),
+            references: &mut references,
+        },
+        own_model,
+        url,
+        auth,
+        sender,
+        trail: Vec::new(),
+        stopped: None,
+    };
+
+    // The walk is raced against global shutdown so a long generation cannot block
+    // process teardown.
+    let shutdown = crate::shutdown::shutdown_token();
+    let walked = tokio::select! {
+        () = shutdown.cancelled() => return Err(Aborted),
+        walked = walk.run(plan.own_step, plan.candidates) => walked,
+    };
+    let served = match walked {
+        Ok(served) => served,
+        Err(WalkHalt::Aborted) => return Err(Aborted),
+        Err(WalkHalt::Failed(reason)) => return Ok(Produced::failed(reason)),
+    };
+    let Walked::Served {
+        model: served_by,
+        response,
+    } = served
+    else {
+        // Nothing served the request: the report gets what the walk ended with, and a
+        // lone generation's call its full failure text.
+        return Ok(Produced::Failed {
+            short: walk.short_failure(),
+            full: lone.then(|| walk.failure_message()),
+        });
+    };
+
+    let path = match save_response(ws, &response).await {
+        Ok(path) => path,
+        Err(e) => return Ok(Produced::failed(e.to_string())),
+    };
+    // The record the walk leaves behind: which model produced the picture, so a
+    // fallback stays diagnosable afterwards.
+    tracing::info!(
+        model = %served_by,
+        own_model = %own_model,
+        "Image generation produced a picture"
+    );
+    Ok(Produced::Picture(Generated {
+        path,
+        note: walk.fallback_note(&served_by),
+    }))
+}
+
+/// Turn one served response into the file the reply embeds. Every failure here is a
+/// response-processing failure, and a billed one: never walked to another model,
+/// never retried.
+async fn save_response(ws: &Workspace, response: &serde_json::Value) -> anyhow::Result<PathBuf> {
+    let (b64_json, media_type) = match extract_response_image(response) {
+        Ok(x) => x,
+        Err(err) => anyhow::bail!("Image generation response error: {err}"),
+    };
+    let bytes = match STANDARD.decode(b64_json.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            // Provider returned malformed base64 — a response-processing failure, and
+            // a billed one: never walked to another model.
+            anyhow::bail!("Failed to decode base64 image data from response: {e}");
+        }
+    };
+    super::save_generated_file(
+        ws,
+        &bytes,
+        "image",
+        extension_for_media_type(media_type.as_deref()),
+    )
+    .await
 }
 
 // ── The walk: the account's own model, then the picker's other models ────
@@ -325,6 +672,16 @@ enum Walked {
     /// Nothing served the request — what every visited model answered is in the
     /// walk's trail.
     Unserved,
+}
+
+/// Why the walk ended before it could report on its models.
+#[derive(Debug)]
+enum WalkHalt {
+    /// The request itself cannot be sent at all, with the reason: no declaration of
+    /// any other model changes that.
+    Failed(String),
+    /// Global shutdown cut the walk.
+    Aborted,
 }
 
 /// What the walk will do, decided before any reference is loaded: the account's own
@@ -493,29 +850,20 @@ fn request_aspect_ratio(
     }
 }
 
-/// The room everything around the walk failure text takes before the model receives it:
+/// The room everything around the tool's own text takes before the model receives it:
 /// the wrapper `Agent::execute_tool` raises a fault with, and the failure envelope
 /// [`crate::tools::tool_failure_envelope_bytes`] accounts for — derived from those
 /// pieces rather than restated, so neither wrapper can drift from this budget.
 const WALK_ENVELOPE_BYTES: usize =
     crate::tools::tool_failure_envelope_bytes(ImageGenTool::NAME.len());
 
-/// The walk failure text's own budget: what a tool result is truncated to, less
-/// everything wrapped around that text.
+/// The room the tool's own text has — a walk's failure, a call's batch report: what a
+/// tool result is truncated to, less everything wrapped around that text.
 const WALK_MESSAGE_BYTES: usize = crate::util::TOOL_OUTPUT_BUDGET_BYTES - WALK_ENVELOPE_BYTES;
 
 /// The most room one visited model's line takes — and the most the fallback note gives
 /// what it says about the account's own model.
 const WALK_ENTRY_MAX_BYTES: usize = 300;
-
-/// The room one visited model's line has: the failure's budget less the header and the
-/// stop line, shared out over the lines and capped — counted in bytes, so a multi-byte
-/// name or answer cannot eat a neighbour's room, and shared out before the names are
-/// written, so a picker whose names alone outgrow the budget cannot push the message past
-/// it either.
-fn walk_line_bytes(models: usize, fixed: usize) -> usize {
-    WALK_ENTRY_MAX_BYTES.min(WALK_MESSAGE_BYTES.saturating_sub(fixed) / models.max(1))
-}
 
 /// The prefix the failure text gives the reason a walk stopped before exhausting its
 /// list, shared by both failure formatters.
@@ -557,7 +905,7 @@ impl ImageWalk<'_> {
     /// Run the walk: `own_step` for the account's own model, then `candidates` — the
     /// other models the account's picker offers, in picker order, with the tried
     /// model and repeats of any entry already left out.
-    async fn run(&mut self, own_step: Step, candidates: Vec<String>) -> anyhow::Result<Walked> {
+    async fn run(&mut self, own_step: Step, candidates: Vec<String>) -> Result<Walked, WalkHalt> {
         let own_model = self.own_model;
         if let Some(walked) = self
             .visit(own_model, own_step, !candidates.is_empty())
@@ -632,7 +980,7 @@ impl ImageWalk<'_> {
         model: &str,
         step: Step,
         more_models: bool,
-    ) -> anyhow::Result<Option<Walked>> {
+    ) -> Result<Option<Walked>, WalkHalt> {
         let (info, size) = match step {
             Step::Skip(reason) => {
                 tracing::debug!(model, %reason, "Image generation: model cannot serve the request");
@@ -649,7 +997,7 @@ impl ImageWalk<'_> {
         // be built for.
         let body = match self.body(model, info.as_ref(), size) {
             Ok(body) => body,
-            Err(e) if model == self.own_model => return Err(e),
+            Err(e) if model == self.own_model => return Err(WalkHalt::Failed(e.to_string())),
             Err(e) => {
                 let reason = e.to_string();
                 tracing::warn!(
@@ -693,9 +1041,7 @@ impl ImageWalk<'_> {
                     .push((model.to_string(), Visited::Attempted(failures)));
                 Ok(None)
             }
-            Err(AttemptOutcome::Aborted) => {
-                anyhow::bail!("{SHUTDOWN_ABORTED}");
-            }
+            Err(AttemptOutcome::Aborted) => Err(WalkHalt::Aborted),
         }
     }
 
@@ -737,6 +1083,34 @@ impl ImageWalk<'_> {
         !self.request.references.is_empty()
     }
 
+    /// What the walk ended with, in one line: the reason it stopped before trying
+    /// everything, or else the answer of the last model it visited — the compact form
+    /// a batch report gives each failed generation, whose full wording is
+    /// [`Self::failure_message`].
+    fn short_failure(&self) -> String {
+        let text = if let Some(stopped) = &self.stopped {
+            stopped.clone()
+        } else {
+            let cause = match self.trail.last() {
+                Some((_, Visited::Skipped(reason))) => reason.clone(),
+                Some((_, Visited::Attempted(failures))) => {
+                    describe_failure(failures, self.has_references())
+                }
+                None => "no model was tried".to_string(),
+            };
+            // One line cannot carry every visited model's own answer, so the count
+            // stands in for them: the reader still learns the walk went past the first
+            // model.
+            match self.trail.len() {
+                models if models > 1 => {
+                    format!("{models} image models tried, the last one: {cause}")
+                }
+                _ => cause,
+            }
+        };
+        provider_words(&text)
+    }
+
     /// The failure text: with nothing else configured to walk to, exactly what a lone
     /// attempt reported before the walk existed; otherwise what every visited model
     /// answered, what was skipped and why, and why the walk stopped where it did.
@@ -765,7 +1139,11 @@ impl ImageWalk<'_> {
             Some(stopped) => format!("\n{WALK_STOPPED_PREFIX}{stopped}"),
             None => String::new(),
         };
-        let line_bytes = walk_line_bytes(self.trail.len(), header.len() + stop.len());
+        let line_bytes = line_bytes(
+            self.trail.len(),
+            header.len() + stop.len(),
+            WALK_ENTRY_MAX_BYTES,
+        );
 
         let mut out = String::from(header);
         for (model, visited) in &self.trail {
@@ -809,13 +1187,11 @@ impl ImageWalk<'_> {
                 describe_failure(failures, self.has_references())
             ),
         };
-        // The note carries the provider's own answer, and the annotation it rides on is
-        // not scrubbed anywhere downstream — unlike the failure path and the tool text
-        // this note also feeds.
-        let fate = crate::util::cut_bytes(
-            &crate::util::scrub_credentials(&own_fate),
-            WALK_ENTRY_MAX_BYTES,
-        );
+        // The note carries the provider's own answer into the tool's report: scrubbed
+        // and marker-free before it is cut, so the outer scrub is not the only one it
+        // meets and a marker in a provider's words never becomes a file handed to the
+        // user (see `provider_words`).
+        let fate = crate::util::cut_bytes(&provider_words(&own_fate), WALK_ENTRY_MAX_BYTES);
         // A cut fate, or one the provider already punctuated, takes no second stop.
         let full_stop = if fate.ends_with(['.', '…']) {
             ""
@@ -1300,7 +1676,7 @@ fn validate_reference_count(
         return Err(match voice {
             RefusalVoice::OwnModel => format!(
                 "Model `{model}` does not support reference images. \
-                 Retry without the `images` parameter."
+                 Retry without this generation's reference images."
             ),
             RefusalVoice::Candidate => "does not support reference images".to_string(),
         });
@@ -1385,7 +1761,7 @@ fn unsupported_size(
     match (voice, supported.is_empty()) {
         (RefusalVoice::OwnModel, true) => anyhow::anyhow!(
             "usage: model `{model}` has no adjustable image size — \
-             hint: omit the `size` argument"
+             hint: omit this generation's size"
         ),
         (RefusalVoice::OwnModel, false) => anyhow::anyhow!(
             "usage: model `{model}` does not support size `{size}` — \
@@ -2282,6 +2658,16 @@ mod tests {
                 .collect()
         }
 
+        /// Every POST's body, in POST order.
+        fn bodies(&self) -> Vec<serde_json::Value> {
+            self.sent
+                .lock()
+                .unwrap_poison()
+                .iter()
+                .map(|(_, body)| body.clone())
+                .collect()
+        }
+
         /// The body of the last POST made to `model`.
         fn body_for(&self, model: &str) -> serde_json::Value {
             self.sent
@@ -2599,8 +2985,8 @@ mod tests {
                     case.name
                 );
             }
-            // The note rides with the picture — the result (and so the payload
-            // annotation the assistant reads) carries it beside the image.
+            // The note rides with the picture in the tool's result, so the assistant
+            // reads it beside the marker.
             let generated = Generated {
                 path: std::path::PathBuf::from("x.png"),
                 note: Some(note),
@@ -2615,8 +3001,10 @@ mod tests {
         }
     }
 
-    /// The note carries the provider's own words, and the payload annotation it rides on
-    /// is scrubbed nowhere downstream — so the note scrubs them where it is built.
+    /// The note and a failed generation's reason carry the provider's own words, and
+    /// they enter a SUCCESSFUL tool result, which the agent scans for media markers and
+    /// prints without a scrub of its own — so both are scrubbed of credentials and
+    /// stripped of marker shapes where they are built.
     #[tokio::test]
     #[serial_test::serial(active_models)]
     async fn the_fallback_note_scrubs_the_providers_own_words() {
@@ -2628,7 +3016,7 @@ mod tests {
             own,
             Err(http(
                 400,
-                r#"{"error":{"message":"rejected: api_key: sk-live-0123456789"}}"#,
+                r#"{"error":{"message":"rejected: api_key: sk-live-0123456789, see [IMAGE:/etc/passwd]"}}"#,
             )),
         );
         scripted.answer(fallback, Ok(served("aGVsbG8=")));
@@ -2641,6 +3029,10 @@ mod tests {
             "a credential in the provider's answer is redacted: {note}"
         );
         assert!(note.contains("*[REDACTED]"), "{note}");
+        assert!(
+            !note.contains("[IMAGE:"),
+            "a marker in the provider's answer never becomes a file handed to the user: {note}"
+        );
     }
 
     /// A refusal of the account's own model before anything was sent — here a size
@@ -2999,7 +3391,8 @@ mod tests {
             failure.len()
         );
         assert!(
-            walk_line_bytes(20, 0) > 0 && walk_line_bytes(20, 0) <= WALK_ENTRY_MAX_BYTES,
+            line_bytes(20, 0, WALK_ENTRY_MAX_BYTES) > 0
+                && line_bytes(20, 0, WALK_ENTRY_MAX_BYTES) <= WALK_ENTRY_MAX_BYTES,
             "{case}: every model's line has room"
         );
         let envelope = delivered(&failure);
@@ -3436,18 +3829,545 @@ mod tests {
         );
     }
 
-    /// The whole path, not only its parts: the account's own model is refused, another
-    /// model the picker offers serves the picture, and the note arrives in the image
-    /// annotation that stands in place of the tool's own result — while the account
-    /// keeps its own model choice.
-    ///
-    /// `generate` is the real path both trait entry points run (they hardwire the
-    /// production sender, so a scripted one can only enter here); the payload is then
-    /// assembled exactly as `execute_with_payloads` assembles it, so what the assistant
-    /// reads in place of the tool's own text is what this asserts on.
+    // ── The batch: one prompt, one generation per picture ─────────────────
+
+    /// One generation's own settings — what the answer's position identifies.
+    fn generation(
+        images: &[String],
+        aspect_ratio: Option<&str>,
+        size: Option<&str>,
+    ) -> serde_json::Value {
+        let mut entry = serde_json::Map::new();
+        if !images.is_empty() {
+            entry.insert("images".to_string(), json!(images));
+        }
+        if let Some(aspect_ratio) = aspect_ratio {
+            entry.insert("aspect_ratio".to_string(), json!(aspect_ratio));
+        }
+        if let Some(size) = size {
+            entry.insert("size".to_string(), json!(size));
+        }
+        entry.into()
+    }
+
+    /// A call's arguments: the shared prompt and the generations list.
+    fn batch_args(generations: &[serde_json::Value]) -> serde_json::Value {
+        json!({ "prompt": "retouch the defects", "generations": generations })
+    }
+
+    /// Everything the picture path reads from the config — a provider key, and the
+    /// picker list the walk draws its candidates from — restored however the test ends.
+    fn batch_config(picker: &str) -> ConfigFixture {
+        let guard = ConfigFixture(Some(crate::config::CONFIG.snapshot()));
+        let _ = crate::config::CONFIG.set_string_field("provider_key", "test-key");
+        let _ = crate::config::CONFIG.set_string_field("image_gen_models", picker);
+        guard
+    }
+
+    /// Run one call as `user`, whose own image model is `model` — what the settings
+    /// page leaves behind, and the model every walk of the call starts from.
+    async fn as_account<T>(
+        user: &str,
+        model: &str,
+        call: impl std::future::Future<Output = T>,
+    ) -> T {
+        crate::util::test::init_test_stores().await;
+        crate::users::store()
+            .set_image_gen_model(user, model)
+            .await
+            .expect("the account's own image model is set");
+        crate::agent::CURRENT_TOOL_USER_NAME
+            .scope(user.to_string(), call)
+            .await
+    }
+
+    /// A workspace holding `count` reference pictures in its `uploads/` directory —
+    /// the one place a generation's references may come from.
+    fn uploads_ws(count: usize) -> (tempfile::TempDir, crate::Workspace, Vec<String>) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let ws = crate::workspace::test_ws_named(&dir.path().to_string_lossy(), "image-gen-batch");
+        let uploads = dir.path().join("uploads");
+        std::fs::create_dir_all(&uploads).expect("uploads dir");
+        let paths = (0..count)
+            .map(|index| {
+                let path = uploads.join(format!("ref-{index}.png"));
+                std::fs::write(&path, crate::util::test::noisy_png(2, 2)).expect("reference");
+                path.to_string_lossy().into_owned()
+            })
+            .collect();
+        (dir, ws, paths)
+    }
+
+    /// Nothing is spent on a call one of whose generations is unusable: the whole call
+    /// is refused before a single picture is requested, naming the position at fault.
     #[tokio::test]
     #[serial_test::serial(active_models, config_persist)]
-    async fn fallback_reaches_the_assistant_through_the_real_generate_path() {
+    async fn a_call_is_refused_before_anything_is_spent() {
+        crate::util::test::init_test_stores().await;
+        seed_fixture_catalog().await;
+        let _config = batch_config("");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let uploads = dir.path().join("uploads");
+        std::fs::create_dir_all(&uploads).expect("uploads dir");
+        let upload = uploads.join("ref.png");
+        std::fs::write(&upload, crate::util::test::noisy_png(2, 2)).expect("reference");
+        let upload = upload.to_string_lossy().into_owned();
+        // A reference the workspace does not hold: the file exists, but outside the two
+        // directories a generation may read one from.
+        let outside = dir.path().join("outside.png");
+        std::fs::write(&outside, crate::util::test::noisy_png(2, 2)).expect("reference");
+        let outside = outside.to_string_lossy().into_owned();
+        let mut too_many: Vec<serde_json::Value> = (0..MAX_GENERATIONS)
+            .map(|_| generation(&[], None, None))
+            .collect();
+        too_many.push(generation(&[], None, None));
+        let ws =
+            crate::workspace::test_ws_named(&dir.path().to_string_lossy(), "image-gen-refused");
+
+        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+            (
+                "no generations at all",
+                json!({ "prompt": "retouch the defects" }),
+                "missing required argument \"generations\"",
+            ),
+            (
+                "an empty list",
+                batch_args(&[]),
+                "is empty — ask for at least one picture",
+            ),
+            (
+                "more than the limit",
+                batch_args(&too_many),
+                "at most 10 are produced per call",
+            ),
+            (
+                "an entry that is no generation",
+                batch_args(&[generation(&[], None, None), json!("a cat")]),
+                "generation 2 of \"generations\" must be an object",
+            ),
+            (
+                "a reference outside the workspace",
+                batch_args(&[
+                    generation(&[], None, None),
+                    generation(std::slice::from_ref(&outside), None, None),
+                ]),
+                "generation 2: forbidden",
+            ),
+            (
+                "more references than the provider accepts",
+                batch_args(&[generation(&vec![upload; 17], None, None)]),
+                "generation 1: Image generation supports at most 16 reference image(s)",
+            ),
+        ];
+
+        let scripted = Scripted::new();
+        for (name, args, reason) in cases {
+            let err = as_account(
+                "image_gen_batch_user",
+                "qwen/qwen-image-3-pro",
+                ImageGenTool.batch(&ws, &args, &scripted),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("[{name}] the call must be refused"));
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(reason),
+                "[{name}] must name the fault ({reason:?}): {message}"
+            );
+        }
+        assert!(
+            scripted.models_sent().is_empty(),
+            "nothing may be requested for a refused call: {:?}",
+            scripted.models_sent()
+        );
+    }
+
+    /// Only the prompt is shared: each generation's body carries its own references,
+    /// aspect ratio and size, and the walk that produced it belongs to that generation
+    /// alone.
+    #[tokio::test]
+    #[serial_test::serial(active_models, config_persist)]
+    async fn each_generation_carries_its_own_settings_and_the_prompt_is_shared() {
+        crate::util::test::init_test_stores().await;
+        seed_fixture_catalog().await;
+        let _config = batch_config("");
+        let (_dir, ws, refs) = uploads_ws(1);
+        let own = "qwen/qwen-image-3-pro";
+        let picture = STANDARD.encode(crate::util::test::noisy_png(4, 4));
+        let scripted = Scripted::new();
+        scripted.answer(own, Ok(served(&picture)));
+        scripted.answer(own, Ok(served(&picture)));
+        let args = batch_args(&[
+            generation(&refs, Some("1:1"), Some("1K")),
+            generation(&[], Some("16:9"), None),
+        ]);
+
+        let output = as_account(
+            "image_gen_batch_user",
+            own,
+            ImageGenTool.output(&ws, &args, &scripted),
+        )
+        .await
+        .expect("both generations produce a picture");
+
+        // Both generations are dispatched together, so which request reaches the sender
+        // first is no position: the bodies are read as a set.
+        let bodies = scripted.bodies();
+        assert_eq!(bodies.len(), 2, "one request per generation");
+        for body in &bodies {
+            assert_eq!(
+                body["prompt"], "retouch the defects",
+                "the prompt is shared"
+            );
+        }
+        let square = bodies
+            .iter()
+            .find(|body| body["aspect_ratio"] == "1:1")
+            .expect("the generation that named 1:1");
+        assert_eq!(square["resolution"], "1K");
+        assert_eq!(
+            square[crate::tools::INPUT_REFERENCES_KEY]
+                .as_array()
+                .map(Vec::len),
+            Some(1),
+            "the generation carries its own reference"
+        );
+        let wide = bodies
+            .iter()
+            .find(|body| body["aspect_ratio"] == "16:9")
+            .expect("the generation that named 16:9");
+        assert!(
+            wide.get("size").is_none() && wide.get("resolution").is_none(),
+            "an unset setting borrows nothing from its sibling: {wide}"
+        );
+        assert!(
+            wide.get(crate::tools::INPUT_REFERENCES_KEY).is_none(),
+            "the generation without references asks for a text-to-image picture: {wide}"
+        );
+        assert_eq!(
+            output.image_payloads.len(),
+            2,
+            "each picture stands on its own"
+        );
+        assert_eq!(
+            output.text.lines().count(),
+            2,
+            "one line per generation: {}",
+            output.text
+        );
+        assert!(output.text.starts_with("1. [IMAGE:"), "{}", output.text);
+        assert!(
+            output
+                .text
+                .lines()
+                .nth(1)
+                .is_some_and(|line| line.starts_with("2. [IMAGE:")),
+            "the answer names the second position: {}",
+            output.text
+        );
+    }
+
+    /// One generation failing costs its siblings nothing: every produced picture
+    /// arrives, and the report names every position — the produced ones with the facts
+    /// a single picture carries, the failed one with why it produced nothing.
+    #[tokio::test]
+    #[serial_test::serial(active_models, config_persist)]
+    async fn a_failed_generation_never_costs_its_siblings() {
+        crate::util::test::init_test_stores().await;
+        seed_fixture_catalog().await;
+        let _config = batch_config("");
+        let (_dir, ws, _) = uploads_ws(0);
+        let own = "qwen/qwen-image-3-pro";
+        let picture = STANDARD.encode(crate::util::test::noisy_png(4, 4));
+        let scripted = Scripted::new();
+        scripted.answer(own, Ok(served(&picture)));
+        scripted.answer(
+            own,
+            Err(http(400, r#"{"error":{"message":"unsupported"}}"#)),
+        );
+        scripted.answer(own, Ok(served(&picture)));
+
+        let output = as_account(
+            "image_gen_batch_user",
+            own,
+            ImageGenTool.output(
+                &ws,
+                &batch_args(&[
+                    generation(&[], None, None),
+                    generation(&[], None, None),
+                    generation(&[], None, None),
+                ]),
+                &scripted,
+            ),
+        )
+        .await
+        .expect("a partly successful call is a success");
+
+        let lines: Vec<&str> = output.text.lines().collect();
+        assert_eq!(lines.len(), 3, "one line per generation: {}", output.text);
+        assert!(lines[0].starts_with("1. [IMAGE:"), "{}", output.text);
+        assert!(
+            lines[1].starts_with("2. failed — ") && lines[1].contains("HTTP 400"),
+            "the failed generation says why, by position: {}",
+            output.text
+        );
+        assert!(lines[2].starts_with("3. [IMAGE:"), "{}", output.text);
+        assert_eq!(
+            output.image_payloads.len(),
+            2,
+            "a sibling's failure never costs a produced picture"
+        );
+        assert!(
+            output.text_is_content,
+            "the report is content the annotations must not replace"
+        );
+        // The failed generation's own line is all it adds: no wall of text.
+        assert!(
+            crate::util::truncate_tool_output(&output.text) == output.text,
+            "the report fits what a tool result may return: {}",
+            output.text.len()
+        );
+    }
+
+    /// A call that produced nothing at all fails as a whole, still naming every
+    /// position with one short line.
+    #[tokio::test]
+    #[serial_test::serial(active_models, config_persist)]
+    async fn a_call_that_produced_nothing_names_every_position() {
+        crate::util::test::init_test_stores().await;
+        seed_fixture_catalog().await;
+        let _config = batch_config("");
+        let (_dir, ws, _) = uploads_ws(0);
+        let own = "qwen/qwen-image-3-pro";
+        let scripted = Scripted::new();
+        // Neither failure is retryable, so each generation is one attempt.
+        scripted.answer(own, Err(http(402, "")));
+        scripted.answer(
+            own,
+            Err(http(400, r#"{"error":{"message":"unsupported"}}"#)),
+        );
+
+        let err = as_account("image_gen_batch_user", own, async {
+            let outcomes = ImageGenTool
+                .batch(
+                    &ws,
+                    &batch_args(&[generation(&[], None, None), generation(&[], None, None)]),
+                    &scripted,
+                )
+                .await?;
+            ImageGenTool.answer(&outcomes)
+        })
+        .await
+        .expect_err("nothing produced is a failed call");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.starts_with("Image generation failed: no picture was produced."),
+            "{message}"
+        );
+        assert!(
+            message
+                .lines()
+                .any(|line| line.starts_with("1. ") && line.contains("HTTP 402")),
+            "the first position says why: {message}"
+        );
+        assert!(
+            message
+                .lines()
+                .any(|line| line.starts_with("2. ") && line.contains("HTTP 400")),
+            "the second position says why: {message}"
+        );
+    }
+
+    /// The tightest room a call has: ten generations whose lines hold everything the
+    /// answer owes, so nothing is lost to the truncation a tool result goes through —
+    /// neither in the report nor in the all-failed message.
+    #[tokio::test]
+    #[serial_test::serial(active_models, config_persist)]
+    async fn ten_generations_fit_the_tool_result_budget() {
+        crate::util::test::init_test_stores().await;
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+        let fallback = "recraft/recraft-v4.1";
+        let _config = batch_config(fallback);
+        let (_dir, ws, _) = uploads_ws(0);
+        let picture = STANDARD.encode(crate::util::test::noisy_png(4, 4));
+        // A provider answer long enough to fill a line, as a real one can be.
+        let refusal = format!(r#"{{"error":{{"message":"{}"}}}}"#, "x".repeat(400));
+        let ten: Vec<serde_json::Value> = (0..MAX_GENERATIONS)
+            .map(|_| generation(&[], None, None))
+            .collect();
+
+        let scripted = Scripted::new();
+        for _ in 0..MAX_GENERATIONS {
+            scripted.answer(own, Err(http(400, &refusal)));
+            scripted.answer(fallback, Ok(served(&picture)));
+        }
+        let output = as_account(
+            "image_gen_budget_user",
+            own,
+            ImageGenTool.output(&ws, &batch_args(&ten), &scripted),
+        )
+        .await
+        .expect("every generation is served by the fallback");
+        assert_eq!(
+            output.image_payloads.len(),
+            MAX_GENERATIONS,
+            "every picture is attached"
+        );
+        assert_eq!(
+            crate::util::truncate_tool_output(&output.text),
+            output.text,
+            "the report survives the tool-result budget whole: {} bytes",
+            output.text.len()
+        );
+        let lines: Vec<&str> = output.text.lines().collect();
+        assert_eq!(lines.len(), MAX_GENERATIONS, "{}", output.text);
+        for (index, line) in lines.iter().enumerate() {
+            assert!(
+                line.starts_with(&format!("{}. [IMAGE:", index + 1)),
+                "every position keeps its own line: {line}"
+            );
+        }
+
+        // Nothing produced: the failure names all ten positions inside the same budget.
+        let _empty = batch_config("");
+        let failed = Scripted::new();
+        for _ in 0..MAX_GENERATIONS {
+            failed.answer(own, Err(http(400, &refusal)));
+        }
+        let err = as_account("image_gen_budget_user", own, async {
+            let outcomes = ImageGenTool.batch(&ws, &batch_args(&ten), &failed).await?;
+            ImageGenTool.answer(&outcomes)
+        })
+        .await
+        .expect_err("nothing produced is a failed call");
+        let delivered = delivered(&format!("{err:#}"));
+        assert_eq!(
+            crate::util::truncate_tool_output(&delivered),
+            delivered,
+            "the failure survives the tool-result budget whole: {} bytes",
+            delivered.len()
+        );
+        for position in 1..=MAX_GENERATIONS {
+            assert!(
+                delivered.contains(&format!("\n{position}. ")),
+                "position {position} is named: {delivered}"
+            );
+        }
+    }
+
+    /// A call that asked for one picture keeps what a single-picture call always read on
+    /// both paths: the command line gets the marker alone, or that generation's own full
+    /// wording with no position, while the agent's failure runs the same wording behind
+    /// the position the batch form names it by — one header only.
+    #[tokio::test]
+    #[serial_test::serial(active_models, config_persist)]
+    async fn a_lone_generation_keeps_its_own_wording_on_both_paths() {
+        crate::util::test::init_test_stores().await;
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+        let fallback = "recraft/recraft-v4.1";
+        let _config = batch_config(fallback);
+        let (_dir, ws, _) = uploads_ws(0);
+        let picture = STANDARD.encode(crate::util::test::noisy_png(4, 4));
+        let one = batch_args(&[generation(&[], None, None)]);
+        let scripted = Scripted::new();
+        // One scripted sequence, one answer per attempt: a fallback-served picture,
+        // then two walks in which the account's own model refuses and the fallback is
+        // out of credits.
+        for answer in [Ok(served(&picture)), Err(http(402, "")), Err(http(402, ""))] {
+            scripted.answer(fallback, answer);
+        }
+        for _ in 0..3 {
+            scripted.answer(
+                own,
+                Err(http(400, r#"{"error":{"message":"unsupported"}}"#)),
+            );
+        }
+
+        let answer = as_account(
+            "image_gen_batch_user",
+            own,
+            crate::agent::CURRENT_TOOL_COMMAND_LINE.scope(true, async {
+                let outcomes = ImageGenTool.batch(&ws, &one, &scripted).await?;
+                ImageGenTool.lone_answer(&outcomes)
+            }),
+        )
+        .await
+        .expect("the picture is produced");
+        assert!(
+            answer.starts_with("[IMAGE:")
+                && answer.contains(&format!("\n`{fallback}` produced this picture"))
+                && !answer.contains("1. "),
+            "the command line prints the marker and the note, never a position: {answer}"
+        );
+
+        let err = as_account(
+            "image_gen_batch_user",
+            own,
+            crate::agent::CURRENT_TOOL_COMMAND_LINE.scope(true, async {
+                let outcomes = ImageGenTool.batch(&ws, &one, &scripted).await?;
+                ImageGenTool.lone_answer(&outcomes)
+            }),
+        )
+        .await
+        .expect_err("a lone generation that failed");
+        let message = format!("{err:#}");
+        assert!(
+            message.starts_with("Image generation failed: ") && !message.contains("1. "),
+            "the lone generation's own wording, as the command line always read it: {message}"
+        );
+
+        let err = as_account("image_gen_batch_user", own, async {
+            let outcomes = ImageGenTool.batch(&ws, &one, &scripted).await?;
+            ImageGenTool.answer(&outcomes)
+        })
+        .await
+        .expect_err("the walk served nothing");
+        let message = format!("{err:#}");
+        assert!(
+            message.starts_with("1. Image generation failed: no configured image model served"),
+            "the position, then the walk's own wording: {message}"
+        );
+        for model in [own, fallback] {
+            assert!(
+                message.contains(model),
+                "every visited model is still named: {message}"
+            );
+        }
+        assert_eq!(
+            message.matches("Image generation failed").count(),
+            1,
+            "the failure is opened once: {message}"
+        );
+
+        // A refusal before anything is sent speaks the same way: no position, which
+        // only a batch has.
+        let args = batch_args(&[generation(&["no-such-picture.png".into()], None, None)]);
+        let refused = as_account("image_gen_batch_user", own, async {
+            crate::agent::CURRENT_TOOL_COMMAND_LINE
+                .scope(true, ImageGenTool.batch(&ws, &args, &scripted))
+                .await
+                .map(|_| ())
+        })
+        .await
+        .expect_err("a reference that is not there is refused");
+        let refused = format!("{refused:#}");
+        assert!(
+            refused.contains("not found") && !refused.contains("generation 1"),
+            "the command line's refusal carries no position: {refused}"
+        );
+    }
+
+    /// The whole path, not only its parts: the account's own model is refused, another
+    /// model the picker offers serves the picture, and the note naming that model
+    /// reaches the assistant in the report — while the account keeps its own model
+    /// choice.
+    #[tokio::test]
+    #[serial_test::serial(active_models, config_persist)]
+    async fn fallback_reaches_the_assistant_through_the_real_batch_path() {
         crate::util::test::init_test_stores().await;
         seed_fixture_catalog().await;
 
@@ -3458,13 +4378,7 @@ mod tests {
             .set_image_gen_model(user, own)
             .await
             .expect("the account's own model is set");
-
-        // The picker list and a provider key, as the settings page would leave them:
-        // restored however this test ends, so a panic here cannot leave the rest of the
-        // binary running on this config.
-        let _config = ConfigFixture(Some(crate::config::CONFIG.snapshot()));
-        let _ = crate::config::CONFIG.set_string_field("provider_key", "test-key");
-        let _ = crate::config::CONFIG.set_string_field("image_gen_models", fallback);
+        let _config = batch_config(fallback);
 
         let scripted = Scripted::new();
         scripted.answer(
@@ -3476,18 +4390,15 @@ mod tests {
             Ok(served(&STANDARD.encode(crate::util::test::noisy_png(4, 4)))),
         );
 
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let ws =
-            crate::workspace::test_ws_named(&dir.path().to_string_lossy(), "image-gen-fallback");
-        let output = crate::agent::CURRENT_TOOL_USER_NAME
-            .scope(user.to_string(), async {
-                let generated = ImageGenTool
-                    .generate(&ws, &json!({ "prompt": "a cat" }), &scripted)
-                    .await?;
-                anyhow::Ok(ImageGenTool.output(&generated).await)
-            })
-            .await;
-        let output = output.expect("a fallback-covered request is a success");
+        let (_dir, ws, _) = uploads_ws(0);
+        let output = as_account(
+            user,
+            own,
+            ImageGenTool.output(&ws, &batch_args(&[generation(&[], None, None)]), &scripted),
+        )
+        .await
+        .expect("a fallback-covered request is a success");
+
         assert_eq!(
             scripted.models_sent(),
             [own, fallback],
@@ -3499,22 +4410,20 @@ mod tests {
             output.text
         );
         assert!(
-            !output.text_is_content,
-            "the picture is offered as a payload, not as text"
-        );
-        let annotation = output
-            .image_payloads
-            .first()
-            .expect("the picture is attached")
-            .attached_annotation();
-        assert!(
-            annotation.contains(fallback),
-            "the assistant is told which model produced the picture: {annotation}"
+            output.text_is_content,
+            "the report is content, not a claim the annotations replace"
         );
         assert!(
-            annotation.contains(own) && annotation.contains("did not serve the request"),
-            "and what happened with the account's own model: {annotation}"
+            output.text.contains(fallback) && output.text.contains(own),
+            "the assistant is told which model produced the picture and what the account's own did: {}",
+            output.text
         );
+        assert!(
+            output.text.contains("did not serve the request"),
+            "and what happened with the account's own model: {}",
+            output.text
+        );
+        assert_eq!(output.image_payloads.len(), 1);
         assert_eq!(
             crate::users::resolve_image_gen_model(user).await,
             own,

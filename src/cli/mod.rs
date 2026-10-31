@@ -342,6 +342,33 @@ fn operation_word(family: &Family, operation: &Operation) -> String {
     }
 }
 
+/// The argument carrying the picture tool's generations. Its flags are each one
+/// generation's own setting, and this command always asks for exactly one picture, so
+/// it builds that generation itself — every other tool's flags ARE its arguments.
+const GENERATIONS_ARG: &str = "generations";
+
+/// Fold the picture tool's flat flags into the one generation this command asks for,
+/// with the prompt left beside it and a flag left out left out of the generation too,
+/// where the tool reads it as unset.
+fn fold_one_generation(args: &mut serde_json::Value) {
+    /// The settings one picture's generation carries — the tool schema's own entries,
+    /// held to them by the tie in the tests.
+    const GENERATION_SETTINGS: &[&str] = &["images", "aspect_ratio", "size"];
+    let Some(map) = args.as_object_mut() else {
+        return;
+    };
+    let mut generation = serde_json::Map::new();
+    for setting in GENERATION_SETTINGS {
+        if let Some(value) = map.remove(*setting) {
+            generation.insert((*setting).to_string(), value);
+        }
+    }
+    map.insert(
+        GENERATIONS_ARG.to_string(),
+        serde_json::Value::Array(vec![generation.into()]),
+    );
+}
+
 /// Whether this family's operations produce FILES — derived from the flags the
 /// registry already carries rather than stated a second time: a producing
 /// family's every operation carries the destination flag
@@ -1440,8 +1467,8 @@ const IMAGE_PROMPT_FLAG: Flag = Flag {
     purpose: "The text description of the picture to produce (required)",
 };
 
-/// The picture tool's `images` argument: the reference pictures a
-/// picture-from-pictures request is given.
+/// The reference pictures of the one generation the picture command builds: given any,
+/// it is picture-to-picture rather than text-to-picture.
 const IMAGE_IMAGES_FLAG: Flag = Flag {
     arg: "images",
     kind: FlagKind::PathList,
@@ -1451,7 +1478,7 @@ const IMAGE_IMAGES_FLAG: Flag = Flag {
               picture-to-picture rather than text-to-picture",
 };
 
-/// The picture tool's `aspect_ratio` argument.
+/// The aspect ratio of the one generation the picture command builds.
 const IMAGE_ASPECT_RATIO_FLAG: Flag = Flag {
     arg: "aspect_ratio",
     kind: FlagKind::Value,
@@ -1459,7 +1486,7 @@ const IMAGE_ASPECT_RATIO_FLAG: Flag = Flag {
     purpose: "The aspect ratio, like '16:9', '1:1' or '4:3'",
 };
 
-/// The picture tool's `size` argument.
+/// The size of the one generation the picture command builds.
 const IMAGE_SIZE_FLAG: Flag = Flag {
     arg: "size",
     kind: FlagKind::Value,
@@ -2406,7 +2433,7 @@ fn operation_help(family: &Family, operation: &Operation) -> String {
 /// misuse, and nothing is sent.
 pub async fn run(cli: Cli, args: &[String]) -> i32 {
     let family = cli.0;
-    let (tool, parsed) = match family.surface {
+    let (tool, mut parsed) = match family.surface {
         Surface::Operations(operations) => {
             let Some(named) = args.first().map(String::as_str) else {
                 return misuse(family, "no operation was given");
@@ -2456,6 +2483,12 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
             }
         }
     };
+
+    // The picture tool's flags are each one generation's own settings, and this command
+    // asks for exactly one picture: it builds that generation itself.
+    if tool == "image_gen" {
+        fold_one_generation(&mut parsed.args);
+    }
 
     // The destination, on the same footing as the words: a producing family's
     // operation writes where the caller says, and a place this command cannot
@@ -3265,12 +3298,42 @@ mod tests {
     }
 
     /// One command line of a family, as the flag tie is swept: what it is called,
-    /// the tool it runs, the arguments it can fill, and the flags it carries.
+    /// the tool it runs, the arguments that tool declares, and the flags it carries.
     struct CommandLine {
         called: String,
         tool: &'static str,
         arguments: serde_json::Map<String, serde_json::Value>,
         flags: &'static [Flag],
+    }
+
+    impl CommandLine {
+        /// The schema of the argument a flag fills: one of the tool's own, or — where
+        /// the command line builds a generation itself ([`Self::generation`]) — one of
+        /// that generation's settings.
+        fn property(&self, arg: &str) -> Option<&serde_json::Value> {
+            self.arguments.get(arg).or_else(|| {
+                self.arguments
+                    .get(self.generation()?)?
+                    .get("items")?
+                    .get("properties")?
+                    .get(arg)
+            })
+        }
+
+        /// The argument holding the one generation the picture command builds from its
+        /// own flags, when this is that command.
+        fn generation(&self) -> Option<&'static str> {
+            (self.tool == "image_gen").then_some(super::GENERATIONS_ARG)
+        }
+
+        /// The one generation's declared settings, when the command line builds one.
+        fn generation_settings(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+            self.arguments
+                .get(self.generation()?)?
+                .get("items")?
+                .get("properties")?
+                .as_object()
+        }
     }
 
     /// The JSON types one flag kind can fill.
@@ -3373,9 +3436,9 @@ mod tests {
         names
     }
 
-    /// The command lines of one family, as the flag and argument ties sweep them:
-    /// what each is called, the tool it runs, the arguments it can fill, and the
-    /// flags it carries.
+    /// The command lines of one family, as the flag and argument ties sweep them: what
+    /// each is called, the tool it runs, the arguments that tool declares, and the flags
+    /// it carries.
     fn command_lines(family: &'static Family) -> Vec<CommandLine> {
         match family.surface {
             Surface::Operations(operations) => operations
@@ -3387,15 +3450,18 @@ mod tests {
                     flags: operation.flags,
                 })
                 .collect(),
-            Surface::Standalone(flags) => vec![CommandLine {
-                called: family.word.to_string(),
-                tool: family.tools[0],
-                arguments: tool_schema(family.tools[0])["properties"]
-                    .as_object()
-                    .expect("the tool's properties")
-                    .clone(),
-                flags,
-            }],
+            Surface::Standalone(flags) => {
+                let tool = family.tools[0];
+                vec![CommandLine {
+                    called: family.word.to_string(),
+                    tool,
+                    arguments: tool_schema(tool)["properties"]
+                        .as_object()
+                        .expect("the tool's properties")
+                        .clone(),
+                    flags,
+                }]
+            }
         }
     }
 
@@ -3422,7 +3488,7 @@ mod tests {
                     if matches!(flag.kind, FlagKind::Destination) {
                         continue;
                     }
-                    let property = line.arguments.get(flag.arg).unwrap_or_else(|| {
+                    let property = line.property(flag.arg).unwrap_or_else(|| {
                         panic!(
                             "'{}' is not an argument of 'mahbot {}'",
                             flag.arg, line.called
@@ -3469,6 +3535,27 @@ mod tests {
                             );
                         }
                     }
+                }
+                // The picture tool's flags fill the one generation its command builds,
+                // and they must be exactly the settings that generation declares — a
+                // setting added to the schema cannot be left behind as a flag the tool
+                // would ignore.
+                if let Some(declared) = line.generation_settings() {
+                    let mut declared: Vec<&str> = declared.keys().map(String::as_str).collect();
+                    let mut folded: Vec<&str> = line
+                        .flags
+                        .iter()
+                        .filter(|flag| !matches!(flag.kind, FlagKind::Destination))
+                        .map(|flag| flag.arg)
+                        .filter(|arg| !line.arguments.contains_key(*arg))
+                        .collect();
+                    declared.sort_unstable();
+                    folded.sort_unstable();
+                    assert_eq!(
+                        declared, folded,
+                        "'mahbot {}' folds its per-generation flags into one generation",
+                        line.called
+                    );
                 }
             }
             // A producing family is one whose flag list carries the destination
@@ -3520,17 +3607,22 @@ mod tests {
                 let mut reachable: Vec<&str> = Vec::new();
                 let mut declared: Vec<&str> = Vec::new();
                 for line in lines.iter().filter(|line| line.tool == *tool) {
+                    // The argument holding the one generation a batch-shaped command
+                    // line builds is the command line's OWN shape: it reaches the tool
+                    // as an argument this frontend assembles, never as a flag.
                     let line_reachable: Vec<&str> = line
                         .flags
                         .iter()
                         .filter(|flag| !matches!(flag.kind, FlagKind::Destination))
                         .map(|flag| flag.arg)
+                        .chain(line.generation())
                         .collect();
                     let line_declared: Vec<&str> = line
                         .arguments
                         .keys()
                         .map(String::as_str)
                         .filter(|key| *key != "action")
+                        .chain(line.generation())
                         .collect();
                     if strict {
                         for argument in &line_declared {
@@ -4174,6 +4266,42 @@ mod tests {
         assert_eq!(p.args["file_name"], "report");
         let p = parsed("image", "gen", &["--prompt", "a cat by a window"]);
         assert_eq!(p.args["prompt"], "a cat by a window");
+    }
+
+    /// The picture family's flat flags become the one generation this command asks
+    /// for: the settings go inside the generation, the prompt stands beside the list,
+    /// and a flag left out is left out of the generation rather than sent as a flat
+    /// argument the tool would ignore.
+    #[test]
+    fn the_picture_family_folds_its_flags_into_one_generation() {
+        let mut args = serde_json::json!({
+            "prompt": "retouch the defects",
+            "images": ["reference.png"],
+            "size": "1K",
+        });
+        super::fold_one_generation(&mut args);
+        assert_eq!(args["prompt"], "retouch the defects");
+        assert!(
+            args.get("images").is_none() && args.get("size").is_none(),
+            "no setting stays a flat argument the tool would ignore: {args}"
+        );
+        let generations = args[crate::cli::GENERATIONS_ARG]
+            .as_array()
+            .expect("the batch form");
+        assert_eq!(generations.len(), 1, "one picture is a batch of one");
+        assert_eq!(generations[0]["images"][0], "reference.png");
+        assert_eq!(generations[0]["size"], "1K");
+        assert!(
+            generations[0].get("aspect_ratio").is_none(),
+            "a flag left out is unset in the generation: {}",
+            generations[0]
+        );
+
+        // A call that carries none of the settings is still one generation: every
+        // setting is optional, and none is invented here.
+        let mut bare = serde_json::json!({ "prompt": "a cat" });
+        super::fold_one_generation(&mut bare);
+        assert_eq!(bare["generations"][0], serde_json::json!({}), "{bare}");
     }
 
     /// A path a STRUCTURED value carries resolves exactly like a `--path` value:

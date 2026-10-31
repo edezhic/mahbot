@@ -1395,9 +1395,11 @@ pub(crate) struct ToolOutput {
     /// literal text; without it, the annotations REPLACE `text` and such a
     /// marker is a claim that may be turned into an injected image. `true` for
     /// the read tool's converted-document answer (extracted text, or the note
-    /// standing in for what a document could not yield) and for the computer
+    /// standing in for what a document could not yield), for the computer
     /// tool, whose result describes the surface and the action rather than the
-    /// image.
+    /// image, and for the picture tool's batch report, which names every
+    /// generation — including the ones that produced nothing — beside the
+    /// pictures it made.
     pub text_is_content: bool,
 }
 
@@ -1513,8 +1515,8 @@ pub(crate) struct ImagePayload {
     /// context (mirrors the `[Recovered path: ...]` note shown for text reads).
     pub recovery_note: Option<String>,
     /// An extra line the annotation carries, for a tool-specific fact that must
-    /// reach the assistant with the image itself (image_gen names the model that
-    /// produced the picture when a fallback served it).
+    /// reach the assistant with the image itself (the computer tool names the
+    /// reduction a capture over the attachment cap reached the model as).
     pub note: Option<String>,
     /// Tool that produced the image, selecting the annotation opener
     /// ("Read image file", "Generated image file", "Chrome screenshot").
@@ -1578,8 +1580,7 @@ impl ImagePayload {
     /// (`crate::util::local_image_to_compressed_data_uri_with_meta(...).await.ok()?`)
     /// and passes the decoded meta in to build the payload.
     ///
-    /// The annotation `note` (a tool-specific fact carried with the image, e.g.
-    /// image_gen naming the model that produced a fallback picture) is left
+    /// The annotation `note` (a tool-specific fact carried with the image) is left
     /// `None` for the caller to set.
     #[must_use]
     pub(crate) fn from_compressed_meta(
