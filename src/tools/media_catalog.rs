@@ -173,7 +173,7 @@ pub mod image {
     /// it speaks to the account's pick. A walk candidate's skip line leaves it out —
     /// the model the account chose is not the one the walk passed over.
     const IMAGE_MODEL_REMEDIATION: &str =
-        " Set an image-capable model in Settings → Image Generation and retry.";
+        " Set an image-capable model in Settings → Provider → Models settings and retry.";
 
     /// Reject a catalog-listed model that explicitly declares text-only output.
     /// (Shape drift — missing/empty modalities — is tolerated as capable.)

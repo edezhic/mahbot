@@ -102,10 +102,18 @@ fn remove_model_from_list(model: &str, list: &mut Option<String>) {
     };
 }
 
-/// Build one model-picker entry row: a plain model label plus the shared
-/// compact gray [`widgets::compact_x_button`] removal button.
+/// Build one model-picker entry row: the model name and the shared compact gray
+/// [`widgets::compact_x_button`] removal button. Both the row and the label take
+/// the width they are given — the name wraps instead of pushing the button out
+/// of the popup, and a shrink-width row would measure the name against the whole
+/// row and leave the button nothing.
 fn model_entry_row(target: ModelPickerTarget, model: String) -> Element<'static, SettingsMessage> {
-    let mut entry = row![text(model.clone()).size(theme::TEXT_12)];
+    let mut entry = row![
+        text(model.clone())
+            .size(theme::TEXT_12)
+            .width(Length::Fill)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+    ];
     entry = entry
         .push(Space::new().width(theme::SPACE_4))
         .push(widgets::compact_x_button(
@@ -117,7 +125,7 @@ fn model_entry_row(target: ModelPickerTarget, model: String) -> Element<'static,
             }),
             None,
         ));
-    entry.align_y(Alignment::Center).into()
+    entry.align_y(Alignment::Center).width(Length::Fill).into()
 }
 
 /// Render a model picker with a list of model entries, remove buttons per
@@ -300,6 +308,19 @@ fn picker_list_key(t: ModelPickerTarget) -> &'static str {
     }
 }
 
+/// Whether `field` is one the Models settings popup owns — the two model slots
+/// and the two model lists. A save that fails for one of them reopens the popup,
+/// so its inline error is never hidden behind a closed window.
+fn is_model_setting_field(field: &str) -> bool {
+    matches!(
+        field,
+        CONFIG_FIELD_IMAGE_GEN_MODELS | CONFIG_FIELD_VIDEO_MODELS
+    ) || matches!(
+        field.strip_prefix("config:"),
+        Some(CONFIG_KEY_MANAGER_MODEL | CONFIG_KEY_WORKER_MODEL)
+    )
+}
+
 /// Which password field the visibility toggle applies to.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum PasswordTarget {
@@ -456,6 +477,12 @@ pub enum SettingsMessage {
     CustomRolesMsg(custom_roles::CustomRolesMessage),
     /// Escape key pressed (dismisses modal if open).
     Escape,
+    // ── Model settings popup ───────────────────────────────
+    /// Open the Models settings popup from the Provider section.
+    OpenModelsPopup,
+    /// Close the Models settings popup. Closing is not a cancel: text still
+    /// inside its settle window keeps saving.
+    CloseModelsPopup,
     // ── Model picker messages ─────────────────────────────
     /// Operations on a model picker (add/remove list models).
     ModelPicker {
@@ -650,6 +677,10 @@ pub struct SettingsState {
     /// A failed endpoint save closes the section (the runtime stayed on
     /// OpenRouter), so the toggle never shows ON while nothing is configured.
     custom_revealed: bool,
+    /// Whether the Models settings popup is open. Held, not derived, because a
+    /// save that fails after the owner closed the popup reopens it with its
+    /// inline error — the failure is never hidden behind a closed window.
+    models_popup_open: bool,
 
     // ── Application state ───────────────────────────────────────
     /// What the system reports about starting the product at login — the
@@ -793,6 +824,7 @@ impl SettingsState {
             error: None,
             password_visible: HashSet::new(),
             custom_revealed: false,
+            models_popup_open: false,
             autolaunch: None,
             autolaunch_applying: false,
             autolaunch_epoch: 0,
@@ -1366,6 +1398,12 @@ impl SettingsState {
                         self.field_errors.insert(field.clone(), e.clone());
                         if field == CONFIG_FIELD_PROVIDER_ENDPOINT {
                             self.endpoint_warning = None;
+                        }
+                        // The model settings live in a popup: a save that fails
+                        // there reopens it, so the inline error is never hidden
+                        // behind a closed window (closing is not a cancel).
+                        if is_model_setting_field(&field) {
+                            self.models_popup_open = true;
                         }
                         if Self::field_reverts_on_error(&field) {
                             // Discrete-state controls (toggles/pickers) roll
@@ -2002,13 +2040,24 @@ impl SettingsState {
                 }
                 Err(e) => {
                     // Inline error on the picker — no toast (silent success /
-                    // inline rejection for config validation).
+                    // inline rejection for config validation). The popup it
+                    // belongs to reopens if it was closed meanwhile.
                     let key = picker_list_key(target);
                     self.field_errors
                         .insert(key.to_string(), format!("Model `{model}` rejected: {e}"));
+                    self.models_popup_open = true;
                     Task::none()
                 }
             },
+
+            SettingsMessage::OpenModelsPopup => {
+                self.models_popup_open = true;
+                Task::none()
+            }
+            SettingsMessage::CloseModelsPopup => {
+                self.models_popup_open = false;
+                Task::none()
+            }
 
             SettingsMessage::Escape => {
                 if self.show_add_workspace_modal {
@@ -2019,6 +2068,8 @@ impl SettingsState {
                     self.telegram_credentials_open = false;
                 } else if self.confirm_switch_to_cloud {
                     self.confirm_switch_to_cloud = false;
+                } else if self.models_popup_open {
+                    self.models_popup_open = false;
                 } else {
                     // The last tier, matching render_modal_overlay: the
                     // custom-tools details window, the custom-roles editor and
@@ -2071,8 +2122,6 @@ impl SettingsState {
             .push(self.provider_section())
             .push(Space::new().height(16))
             .push(self.integrations_section())
-            .push(Space::new().height(16))
-            .push(self.models_section())
             .push(Space::new().height(16));
         // With a custom chat endpoint active, provider routing is a no-op —
         // hide the section entirely.
@@ -2084,7 +2133,8 @@ impl SettingsState {
             config_sections
         };
         // Audio section — macOS only; off macOS no section and no spacer is
-        // pushed, so nothing is left dangling between Models and About.
+        // pushed, so nothing is left dangling between Provider Routing and
+        // About.
         #[cfg(target_os = "macos")]
         let config_sections = config_sections
             .push(self.audio_section())
@@ -3175,9 +3225,9 @@ impl SettingsState {
 
     /// Render the Settings modal overlay: whichever of the add-workspace,
     /// add-user, user delete-confirm, workspace diagnostics, workspace rules,
-    /// workspace contexts, custom-tool details and custom-role editor /
-    /// delete-confirm windows is open, or a type-stable placeholder when none
-    /// is.
+    /// workspace contexts, custom-tool details, custom-role editor /
+    /// delete-confirm and Models settings windows is open, or a type-stable
+    /// placeholder when none is.
     fn render_modal_overlay(&self) -> Element<'_, SettingsMessage> {
         if self.show_add_workspace_modal {
             let dialog = self.add_workspace_dialog();
@@ -3220,6 +3270,9 @@ impl SettingsState {
             )
         } else if let Some(roles_modal) = self.custom_roles_modal() {
             roles_modal
+        } else if self.models_popup_open {
+            let dialog = self.models_dialog();
+            widgets::modal_backdrop(dialog, SettingsMessage::CloseModelsPopup, 0.5)
         } else if self.telegram_credentials_open {
             let dialog = self.telegram_credentials_dialog();
             widgets::modal_backdrop(dialog, SettingsMessage::CloseTelegramCredentials, 0.5)
@@ -3664,53 +3717,90 @@ impl SettingsState {
 
         section(
             "Provider",
-            Column::with_children(rows).spacing(theme::SPACE_4),
+            Column::with_children(rows)
+                .spacing(theme::SPACE_4)
+                .push(Space::new().height(theme::SPACE_4))
+                // The model slots and lists live only in the popup this opens.
+                .push(
+                    button(text("Models settings").size(theme::TEXT_12))
+                        .style(theme::button_secondary)
+                        .on_press(SettingsMessage::OpenModelsPopup),
+                ),
         )
     }
 
-    fn models_section(&self) -> Element<'_, SettingsMessage> {
-        let manager_row = self.config_model_slot_field(
-            crate::config::DEFAULT_MANAGER_MODEL,
-            CONFIG_KEY_MANAGER_MODEL,
-            "Manager, Assistant, Discovery, Engineer, Maintainer",
-        );
-        let worker_row = self.config_model_slot_field(
-            crate::config::DEFAULT_WORKER_MODEL,
-            CONFIG_KEY_WORKER_MODEL,
-            "Analyst, Worker, QA, Reviewer, Sanitation",
-        );
-        section(
-            "Models",
+    /// The model settings: the two model slots and the two model lists, with
+    /// their add/remove controls and inline errors. Rendered only inside the
+    /// Models settings popup — the page keeps no copy of them.
+    fn models_body(&self) -> Column<'_, SettingsMessage> {
+        column![
+            self.config_model_slot_field(
+                crate::config::DEFAULT_MANAGER_MODEL,
+                CONFIG_KEY_MANAGER_MODEL,
+                "Manager, Assistant, Discovery, Engineer, Maintainer",
+            ),
+            self.config_model_slot_field(
+                crate::config::DEFAULT_WORKER_MODEL,
+                CONFIG_KEY_WORKER_MODEL,
+                "Analyst, Worker, QA, Reviewer, Sanitation",
+            ),
+            Space::new().height(12),
+            widgets::section_subheading("Image Generation"),
+            Space::new().height(2),
+            model_picker_list(
+                ModelPickerTarget::ImageGen,
+                self.config.image_gen_models.as_deref(),
+                &self.model_picker_inputs[ModelPickerTarget::ImageGen.idx()],
+                "model name (e.g. google/gemini-...)",
+                self.field_errors
+                    .get(CONFIG_FIELD_IMAGE_GEN_MODELS)
+                    .map(String::as_str),
+            ),
+            Space::new().height(12),
+            widgets::section_subheading("Video Generation"),
+            Space::new().height(2),
+            model_picker_list(
+                ModelPickerTarget::Video,
+                self.config.video_models.as_deref(),
+                &self.model_picker_inputs[ModelPickerTarget::Video.idx()],
+                "model name (e.g. minimax/hailuo-3)",
+                self.field_errors
+                    .get(CONFIG_FIELD_VIDEO_MODELS)
+                    .map(String::as_str),
+            ),
+        ]
+        .spacing(theme::SPACE_4)
+    }
+
+    /// The Models settings popup: the model body, kept within the room the
+    /// window leaves under the heading — minus a margin, so the bubble never
+    /// spans the window — and scrolled inside itself past that, so the unbounded
+    /// lists can never grow it past the window.
+    fn models_dialog(&self) -> Element<'_, SettingsMessage> {
+        let body = responsive(|size| {
+            container(widgets::vscroll_sized(
+                self.models_body(),
+                Length::Fill,
+                Length::Shrink,
+            ))
+            .max_height((size.height - 2.0 * theme::PAD_16).max(0.0))
+            .into()
+        })
+        .height(Length::Shrink);
+        dialog::dialog_shell(
             column![
-                manager_row,
-                worker_row,
-                Space::new().height(12),
-                widgets::section_subheading("Image Generation"),
-                Space::new().height(2),
-                model_picker_list(
-                    ModelPickerTarget::ImageGen,
-                    self.config.image_gen_models.as_deref(),
-                    &self.model_picker_inputs[ModelPickerTarget::ImageGen.idx()],
-                    "model name (e.g. google/gemini-...)",
-                    self.field_errors
-                        .get(CONFIG_FIELD_IMAGE_GEN_MODELS)
-                        .map(String::as_str),
+                dialog::dialog_title_row(
+                    dialog::dialog_title("Models settings"),
+                    SettingsMessage::CloseModelsPopup,
                 ),
-                Space::new().height(12),
-                widgets::section_subheading("Video Generation"),
-                Space::new().height(2),
-                model_picker_list(
-                    ModelPickerTarget::Video,
-                    self.config.video_models.as_deref(),
-                    &self.model_picker_inputs[ModelPickerTarget::Video.idx()],
-                    "model name (e.g. minimax/hailuo-3)",
-                    self.field_errors
-                        .get(CONFIG_FIELD_VIDEO_MODELS)
-                        .map(String::as_str),
-                ),
+                Space::new().height(16),
+                body,
             ]
-            .spacing(theme::SPACE_4),
+            .width(Length::Fill),
+            620.0,
+            24.0,
         )
+        .into()
     }
 
     // ── Audio section (macOS only) ───────────────
@@ -5476,6 +5566,65 @@ mod tests {
             .count();
         assert_eq!(deduped, 1, "manager==worker dedups to a single routing row");
         let _ = state.routing_section(); // must not panic
+    }
+
+    /// Closing the Models settings popup is not a cancel, but a model save that
+    /// fails afterwards reopens it — its inline error is never hidden behind a
+    /// closed window. A failure for any other field leaves the popup closed.
+    #[test]
+    fn a_failed_model_save_reopens_the_closed_models_popup() {
+        let mut state = SettingsState::new();
+        let close = |state: &mut SettingsState| {
+            let _ = state.update(SettingsMessage::CloseModelsPopup);
+            assert!(!state.models_popup_open, "the popup is closed");
+        };
+
+        let _ = state.update(SettingsMessage::OpenModelsPopup);
+        assert!(
+            state.models_popup_open,
+            "the Provider section's button opens the popup"
+        );
+
+        close(&mut state);
+        let _ = state.update(SettingsMessage::ConfigFieldSaveResult {
+            field: format!("config:{CONFIG_KEY_FIRECRAWL_KEY}"),
+            generation: 0,
+            result: Err("refused".into()),
+        });
+        assert!(
+            !state.models_popup_open,
+            "a failure outside the model settings leaves the popup closed"
+        );
+
+        let _ = state.update(SettingsMessage::ConfigFieldSaveResult {
+            field: format!("config:{CONFIG_KEY_WORKER_MODEL}"),
+            generation: 0,
+            result: Err("refused".into()),
+        });
+        assert!(
+            state.models_popup_open,
+            "a failed model-slot save reopens the popup"
+        );
+        assert_eq!(
+            state
+                .field_errors
+                .get(&format!("config:{CONFIG_KEY_WORKER_MODEL}"))
+                .map(String::as_str),
+            Some("refused"),
+            "the reopened popup carries the inline error"
+        );
+        let _ = state.models_dialog(); // must not panic
+
+        close(&mut state);
+        let _ = state.update(SettingsMessage::ModelPickerAddResult {
+            target: ModelPickerTarget::ImageGen,
+            model: "vendor/text-only".into(),
+            ok: Err("no image output".into()),
+        });
+        assert!(
+            state.models_popup_open,
+            "a rejected added model reopens the popup"
+        );
     }
 
     /// The toggle only reveals the custom endpoint; what is staged and gated on it follows the
