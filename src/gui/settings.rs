@@ -2101,10 +2101,7 @@ impl SettingsState {
         // Workspace management section (right column).
         let ws_section = self.workspaces_section(workspace_map_error);
 
-        // User management section (right column, below workspaces)
-        let us_section = self.users_section();
-
-        // Custom tools area (right column, below users)
+        // Custom tools area (right column, below workspaces)
         let tools_section = self.custom_tools_section();
 
         // Custom roles area (right column, below the custom tools)
@@ -2132,14 +2129,18 @@ impl SettingsState {
         } else {
             config_sections
         };
-        // Audio section — macOS only; off macOS no section and no spacer is
-        // pushed, so nothing is left dangling between Provider Routing and
-        // About.
+        // Audio section — macOS only.
         #[cfg(target_os = "macos")]
         let config_sections = config_sections
             .push(self.audio_section())
             .push(Space::new().height(16));
-        let config_sections = config_sections.push(Self::about_section());
+        // Users section — directly under Audio, or under whatever section
+        // precedes it where Audio is not shown. Pushed outside the macOS-only
+        // block so every build keeps it, and always before About.
+        let config_sections = config_sections
+            .push(self.users_section())
+            .push(Space::new().height(16))
+            .push(Self::about_section());
 
         // Two strict 50/50 columns sharing ONE outer vertical scroll (`vscroll`
         // below). Both columns are `FillPortion(1)` inside a single row, so the
@@ -2149,8 +2150,6 @@ impl SettingsState {
         let left_col = config_sections;
         let right_col = column![
             ws_section,
-            Space::new().height(16),
-            us_section,
             Space::new().height(16),
             tools_section,
             Space::new().height(16),
