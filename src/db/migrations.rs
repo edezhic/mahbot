@@ -99,9 +99,12 @@
 //! already declares it). `75` adds the nullable `users.memory_inventory_day`
 //! column — the local day the nightly memory inventory last asked that account's
 //! assistant, so a restart cannot ask twice in one day (likewise a no-op on
-//! fresh installs).
+//! fresh installs). `76` drops the `firecrawl_key` setting together with a
+//! stored provider choice that names that removed provider, matched regardless
+//! of letter case and surrounding whitespace (a no-op on fresh installs, which
+//! have neither row: see [`drop_firecrawl_search_settings`]).
 //!
-//! Future schema changes resume the chain at id `76` with monotonically
+//! Future schema changes resume the chain at id `77` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -1291,6 +1294,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_users_memory_inventory_day),
     },
+    Migration {
+        id: "76",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(drop_firecrawl_search_settings),
+    },
 ];
 
 /// Apply the migration catalog to `conn` for one physical database.
@@ -2292,6 +2300,48 @@ async fn run_add_users_memory_inventory_day(conn: &Connection) -> anyhow::Result
     add_column_if_missing(conn, "users", "memory_inventory_day", "TEXT").await
 }
 
+fn drop_firecrawl_search_settings(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_drop_firecrawl_search_settings(conn))
+}
+
+/// Catalog `76`: retire the Firecrawl web-search provider. Its
+/// `config_kv` key is deleted outright — the provider no longer exists, so the
+/// secret is worthless and the deletion is irreversible by design — while the
+/// stored provider choice goes only when it names Firecrawl, compared in Rust so
+/// case and surrounding whitespace do not matter (SQL `trim()` strips spaces
+/// only). A fresh install has neither row, so the body is a no-op there; the
+/// boot-time orphan purge ([`crate::config::purge_unknown_kv_orphans`]) would
+/// drop the key too now that its field is gone, but this entry makes the
+/// deletion part of the version change itself. Idempotent and
+/// non-transactional like every Rust body.
+async fn run_drop_firecrawl_search_settings(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM config_kv WHERE key = 'firecrawl_key'", ())
+        .await
+        .context("Failed to delete the retired firecrawl_key setting")?;
+    let rows = conn
+        .query(
+            "SELECT rowid, value FROM config_kv WHERE key = 'web_search_provider'",
+            (),
+        )
+        .await
+        .context("Failed to read the stored web-search provider")?;
+    for row in rows {
+        let value = row
+            .get::<String>(1)
+            .context("Failed to read config_kv.value")?;
+        if !value.trim().eq_ignore_ascii_case("firecrawl") {
+            continue;
+        }
+        let rowid = row
+            .get::<i64>(0)
+            .context("Failed to read config_kv.rowid")?;
+        conn.execute("DELETE FROM config_kv WHERE rowid = ?1", params![rowid])
+            .await
+            .context("Failed to delete the stored firecrawl provider choice")?;
+    }
+    Ok(())
+}
+
 fn add_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_alarms_command(conn))
 }
@@ -2842,6 +2892,24 @@ mod tests {
             .into_iter()
             .map(|row| row.get::<String>(0).expect("id"))
             .collect()
+    }
+
+    /// Every `config_kv` row as (key, value), sorted so comparisons are stable.
+    async fn config_kv_rows(conn: &Connection) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = conn
+            .query("SELECT key, value FROM config_kv", ())
+            .await
+            .expect("read config_kv")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String>(0).expect("key"),
+                    row.get::<String>(1).expect("value"),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
     }
 
     /// Strip SQL `--` line comments (respecting single-quoted string literals)
@@ -4188,7 +4256,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`57`/`59`–`63`/`65`–`75` tail, and converges to the exact current
+    /// upfills and the `36`–`57`/`59`–`63`/`65`–`76` tail, and converges to the exact current
     /// core shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -4218,10 +4286,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
                 "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-                "70", "72", "73", "74", "75"
+                "70", "72", "73", "74", "75", "76"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–75 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–76 tail exactly"
         );
     }
 
@@ -4968,7 +5036,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-            "70", "72", "73", "74", "75",
+            "70", "72", "73", "74", "75", "76",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -4977,7 +5045,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–75"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–76"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -5431,7 +5499,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-            "70", "72", "73", "74", "75",
+            "70", "72", "73", "74", "75", "76",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -5440,7 +5508,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–75"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–76"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -6591,6 +6659,62 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             users_image_gen_models(&conn).await.get("alice"),
             Some(&Some(RETIRED_IMAGE_GEN_MODEL.to_string())),
             "a later deliberate re-add of the retired id must be kept: one-shot"
+        );
+    }
+    /// Catalog `76`: the removed provider's key goes unconditionally, while the
+    /// stored choice goes only when it names that provider — matched in Rust, so
+    /// case and surrounding whitespace do not matter. Another provider's key and
+    /// another choice survive, and a second run is a no-op.
+    #[tokio::test]
+    async fn drop_firecrawl_search_settings_matches_the_choice_loosely() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(tmp.path(), crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        run_migrations(&conn, TargetDb::Core)
+            .await
+            .expect("full catalog");
+        // Start from an empty settings store: the catalog's own seeds are not
+        // what this test is about.
+        conn.execute("DELETE FROM config_kv", ()).await.unwrap();
+        for (key, value) in [
+            ("firecrawl_key", "fc-secret"),
+            ("web_search_provider", "  FireCrawl "),
+            ("exa_key", "exa-secret"),
+        ] {
+            conn.execute(
+                "INSERT INTO config_kv (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .await
+            .unwrap();
+        }
+
+        run_drop_firecrawl_search_settings(&conn).await.unwrap();
+
+        assert_eq!(
+            config_kv_rows(&conn).await,
+            [("exa_key", "exa-secret")].map(|(key, value)| (key.to_string(), value.to_string())),
+            "the retired key and the choice naming it are gone; Exa's key survives"
+        );
+
+        // A choice naming another provider is kept; the key deletion stays
+        // unconditional and a second run is otherwise a no-op.
+        conn.execute(
+            "INSERT INTO config_kv (key, value) VALUES ('web_search_provider', 'exa')",
+            (),
+        )
+        .await
+        .unwrap();
+        run_drop_firecrawl_search_settings(&conn).await.unwrap();
+        assert_eq!(
+            config_kv_rows(&conn).await,
+            [("exa_key", "exa-secret"), ("web_search_provider", "exa")]
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+            "a surviving choice must be kept"
         );
     }
     /// Catalog `68` carries every branch of the role across the rename — the

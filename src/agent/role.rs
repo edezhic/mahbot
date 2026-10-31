@@ -301,7 +301,7 @@ use crate::tools::{
     GetTicketTool, HyperframesTool, ImageGenTool, ListAutomationsTool, ListTicketsTool,
     MahbotConfigTool, MahbotDebugTool, RasterizeTool, ReadTool, RemoveAutomationTool,
     SearchArchivedTicketsTool, SearchTool, SendTool, ShellMode, ShellTool, SleepTool,
-    UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool, WorkspaceTool,
+    UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchTool, WorkspaceTool,
 };
 
 /// Tools in the admin Assistant's set that a custom role is never offered or
@@ -658,38 +658,25 @@ impl Role {
         names
     }
 
-    /// Appends a web search tool based on the current configuration.
+    /// Appends a web search tool for the configured providers.
     ///
-    /// At most one web search tool is registered — if an explicit provider
-    /// is configured but its API key is missing, no tool is added.
-    /// Auto-selection: Firecrawl wins ties (both keys set, no preference).
+    /// At most one web search tool is registered. An explicit provider choice
+    /// is honoured even when the other key is configured; with no choice, text
+    /// goes to DeepSeek and pictures to Exa when that key exists. A key missing
+    /// for the chosen capability means no tool is added.
     /// The caller is responsible for skipping this for Manager (who is
     /// expected to delegate web searches to analysts via [`AnalyzeTool`])
     /// and Sanitation (whose toolset is deliberately search-free — see
     /// [`Role::tools`]).
     fn add_web_search_tool(tools: &mut Vec<Box<dyn Tool>>) {
         let provider = CONFIG.web_search_provider();
-        let firecrawl_key = CONFIG.firecrawl_key();
-        let exa_key = CONFIG.exa_key();
-
-        let backend: Option<WebSearchBackend> = match provider.as_deref() {
-            Some(p) if p.eq_ignore_ascii_case("firecrawl") => {
-                firecrawl_key.map(|key| WebSearchBackend::Firecrawl { key })
-            }
-            Some(p) if p.eq_ignore_ascii_case("exa") => {
-                exa_key.map(|key| WebSearchBackend::Exa { key })
-            }
-            Some(other) => {
-                tracing::warn!("Unknown web_search_provider: {other}");
-                None
-            }
-            None => firecrawl_key
-                .map(|key| WebSearchBackend::Firecrawl { key })
-                .or_else(|| exa_key.map(|key| WebSearchBackend::Exa { key })),
-        };
-
-        if let Some(backend) = backend {
-            tools.push(Box::new(WebSearchTool::new(backend)));
+        let tool = WebSearchTool::from_config(
+            provider.as_deref(),
+            CONFIG.deepseek_key(),
+            CONFIG.exa_key(),
+        );
+        if let Some(tool) = tool {
+            tools.push(Box::new(tool));
         }
     }
 }

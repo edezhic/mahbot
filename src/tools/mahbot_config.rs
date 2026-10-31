@@ -6,7 +6,7 @@
 //! (the Support role is gone). Adding a managed workspace is not one of its
 //! actions — that lives in the `workspace` tool.
 use crate::config::{
-    CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
+    CONFIG_KEY_DEEPSEEK_KEY, CONFIG_KEY_EXA_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
     CONFIG_KEY_WEB_SEARCH_PROVIDER,
 };
 use crate::custom_role::CustomRoleBehavior;
@@ -143,7 +143,7 @@ impl Tool for MahbotConfigTool {
                 },
                 "provider": {
                     "type": "string",
-                    "description": "(setup_web_search) The web-search provider: 'firecrawl' or 'exa'."
+                    "description": "(setup_web_search) The web-search provider: 'deepseek' or 'exa'."
                 },
                 "key": {
                     "type": "string",
@@ -289,17 +289,17 @@ impl MahbotConfigTool {
     async fn exec_setup_web_search(&self, args: serde_json::Value) -> anyhow::Result<String> {
         let provider = super::get_str(&args, "provider")?;
         let provider = provider.to_ascii_lowercase();
-        let firecrawl = provider == "firecrawl";
-        if !firecrawl && provider != "exa" {
-            return Err(err("provider must be 'firecrawl' or 'exa'"));
+        let deepseek = provider == "deepseek";
+        if !deepseek && provider != "exa" {
+            return Err(err("provider must be 'deepseek' or 'exa'"));
         }
         let key = super::get_str(&args, "key")?;
 
         crate::config::persist_settled_string_field(CONFIG_KEY_WEB_SEARCH_PROVIDER, &provider)
             .await?;
         crate::config::persist_settled_string_field(
-            if firecrawl {
-                CONFIG_KEY_FIRECRAWL_KEY
+            if deepseek {
+                CONFIG_KEY_DEEPSEEK_KEY
             } else {
                 CONFIG_KEY_EXA_KEY
             },
@@ -602,7 +602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_must_be_firecrawl_or_exa() {
+    async fn provider_must_be_deepseek_or_exa() {
         let tool = MahbotConfigTool;
         let ws = test_ws("/tmp/test_ws");
 
@@ -615,7 +615,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("provider must be 'firecrawl' or 'exa'"),
+            err.contains("provider must be 'deepseek' or 'exa'"),
             "rejected provider must be reported, got: {err}"
         );
     }

@@ -216,7 +216,7 @@ pub(crate) use ticket::{
 };
 pub(crate) use video_edit::VideoEditTool;
 pub(crate) use video_gen::VideoGenTool;
-pub(crate) use web_search::{WebSearchBackend, WebSearchTool};
+pub(crate) use web_search::WebSearchTool;
 pub(crate) use workspace::WorkspaceTool;
 
 use crate::agent::message_router::{AgentJob, MessageKind};

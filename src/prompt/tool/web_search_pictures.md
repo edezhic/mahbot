@@ -1,0 +1,1 @@
+Pass `pictures` only when you need to see what something looks like: the answer then also lists pictures of the results' subjects, each with its address and hosting page, or says that none were usable.

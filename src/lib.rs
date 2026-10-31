@@ -1539,8 +1539,9 @@ pub(crate) trait Tool: Send + Sync {
     /// 1. **Scrub-all** (trait default: `true`) — chrome, edit, analyze, ticket,
     ///    media-gen tools, and most others. The raw output may contain
     ///    credentials, so it is always scrubbed before the LLM sees it.
-    ///    `web_search` is scrub-all too, except on a picture call, which scrubs
-    ///    its own text — see its override.
+    ///    `web_search` is scrub-all too, except on a picture call from an
+    ///    instance that offers pictures (which scrubs its own text) — see its
+    ///    override.
     ///
     /// 2. **Skip scrubbing entirely** (`false`) — shell, search and debug tools.
     ///    - The shell tool's internal `apply_profile_pipeline` already scrubs

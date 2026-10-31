@@ -429,7 +429,7 @@ mod tests {
     async fn test_persist_settled_never_touches_wake_word_templates() {
         crate::util::test::init_test_stores().await;
         let store = crate::config_db::store();
-        // Restore the global CONFIG on exit: the firecrawl_key persist below
+        // Restore the global CONFIG on exit: the deepseek_key persist below
         // mutates it, and leaving the key set with its DB row deleted would
         // leak a phantom web-search key into parallel agent tests.
         let original = crate::config::CONFIG.snapshot();
@@ -470,7 +470,7 @@ mod tests {
         );
 
         // 2. An unrelated field persist must not delete the templates row.
-        crate::config::persist_settled_string_field("firecrawl_key", "fc-test-key")
+        crate::config::persist_settled_string_field("deepseek_key", "ds-test-key")
             .await
             .unwrap();
         let saved = store.get_kv("wake_word_templates").await.unwrap();
@@ -482,14 +482,14 @@ mod tests {
 
         // 3. The unrelated field itself must be persisted.
         assert_eq!(
-            store.get_kv("firecrawl_key").await.unwrap().as_deref(),
-            Some("fc-test-key"),
+            store.get_kv("deepseek_key").await.unwrap().as_deref(),
+            Some("ds-test-key"),
             "the unrelated field itself must be persisted"
         );
 
         // Clean up the shared store.
         let _ = store.delete_kv("wake_word_templates").await;
-        let _ = store.delete_kv("firecrawl_key").await;
+        let _ = store.delete_kv("deepseek_key").await;
         crate::config::CONFIG.swap(original);
     }
 

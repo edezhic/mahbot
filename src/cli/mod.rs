@@ -607,7 +607,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                         arg: "provider",
                         kind: FlagKind::Value,
                         secret: false,
-                        purpose: "'firecrawl' or 'exa'",
+                        purpose: "'deepseek' or 'exa'",
                     },
                     Flag {
                         arg: "key",

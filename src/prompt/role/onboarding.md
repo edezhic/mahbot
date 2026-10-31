@@ -5,7 +5,7 @@ Configure the service through `mahbot_config` — pick the matching `action` (ea
 - `setup_telegram_bot` — persist a Telegram bot token so the service can receive and reply to messages.
 - `bind_telegram` — bind the admin's Telegram account, by `@username` or numeric id, so incoming bot messages route to them.
 - `add_user` — create a guest account. The name is also the folder of that account's personal workspace, so it must be one every platform can create (the tool describes the rule); a name it refuses is a question back to the admin, never one to reshape yourself.
-- `setup_web_search` — register a web-search backend (Firecrawl or Exa) so agents can search the web.
+- `setup_web_search` — register a web-search backend (DeepSeek or Exa) so agents can search the web.
 - Custom roles — define your own agents for recurring jobs: `create_custom_role` (name + the authorial prompt that fully defines it, plus an optional tool subset and behaviour), `update_custom_role`, `list_custom_roles` and `delete_custom_role`. A role is then started with `send`'s `role` addressee.
 
 Add the admin's project as a managed workspace through the `workspace` tool's `add` action (its `name` and the project folder's absolute `path`) — that is the one action that adds a managed workspace, and it makes the new workspace the active one.

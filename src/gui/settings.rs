@@ -14,7 +14,7 @@ use crate::Role;
 use crate::Workspace;
 use crate::channels::telegram_local::{self, Health, Mode};
 use crate::config::{
-    CONFIG, CONFIG_KEY_AUTOUPDATE, CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY,
+    CONFIG, CONFIG_KEY_AUTOUPDATE, CONFIG_KEY_DEEPSEEK_KEY, CONFIG_KEY_EXA_KEY,
     CONFIG_KEY_MANAGER_MODEL, CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
     CONFIG_KEY_PROVIDER_KEY, CONFIG_KEY_TELEGRAM_API_HASH, CONFIG_KEY_TELEGRAM_API_ID,
     CONFIG_KEY_TELEGRAM_BOT_TOKEN, CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_WORKER_MODEL,
@@ -325,7 +325,7 @@ fn is_model_setting_field(field: &str) -> bool {
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum PasswordTarget {
     ProviderKey,
-    FirecrawlKey,
+    DeepSeekKey,
     ExaKey,
     TelegramToken,
     TelegramApiId,
@@ -563,7 +563,7 @@ const TEXT_INPUT_KEYS: &[&str] = &[
     CONFIG_KEY_PROVIDER_KEY,
     CONFIG_KEY_PROVIDER_ENDPOINT,
     CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
-    CONFIG_KEY_FIRECRAWL_KEY,
+    CONFIG_KEY_DEEPSEEK_KEY,
     CONFIG_KEY_EXA_KEY,
     CONFIG_KEY_TELEGRAM_BOT_TOKEN,
     CONFIG_KEY_MANAGER_MODEL,
@@ -4070,16 +4070,16 @@ impl SettingsState {
 
     fn integrations_section(&self) -> Element<'_, SettingsMessage> {
         // ── Web search provider pick list ──────────────────────────
-        // Three options: Auto (None), Firecrawl, Exa
+        // Three options: Auto (None), DeepSeek, Exa
         let current_display = match self.config.web_search_provider.as_deref() {
-            Some("firecrawl") => "Firecrawl",
+            Some("deepseek") => "DeepSeek",
             Some("exa") => "Exa",
             _ => "Auto",
         };
-        let pick_options: &[&str] = &["Auto", "Firecrawl", "Exa"];
+        let pick_options: &[&str] = &["Auto", "DeepSeek", "Exa"];
         let pick_list = pick_list(pick_options, Some(current_display), |v| {
             let value = match v {
-                "Firecrawl" => "firecrawl".to_string(),
+                "DeepSeek" => "deepseek".to_string(),
                 "Exa" => "exa".to_string(),
                 _ => String::new(), // "Auto" → empty → None
             };
@@ -4105,11 +4105,13 @@ impl SettingsState {
         let mut integrations = column![
             provider_row,
             self.config_password_field(
-                "Firecrawl API Key",
-                PasswordTarget::FirecrawlKey,
-                "fc-...",
-                CONFIG_KEY_FIRECRAWL_KEY,
-                None,
+                "DeepSeek Search API Key",
+                PasswordTarget::DeepSeekKey,
+                "sk-...",
+                CONFIG_KEY_DEEPSEEK_KEY,
+                Some(
+                    "DeepSeek platform key for web search — not the OpenRouter key used by models"
+                ),
                 false,
             ),
             self.config_password_field(
@@ -5251,8 +5253,8 @@ mod tests {
             AutosaveCase {
                 name: "an immediate toggle arms a zero-delay settle",
                 key: "web_search_provider",
-                steps: &[Typed("firecrawl")],
-                see: See::Field(Some(1), Some("firecrawl"), false, None, None),
+                steps: &[Typed("deepseek")],
+                see: See::Field(Some(1), Some("deepseek"), false, None, None),
             },
             AutosaveCase {
                 name: "a model slot keystroke arms a debounced settle",
@@ -5586,7 +5588,7 @@ mod tests {
 
         close(&mut state);
         let _ = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: format!("config:{CONFIG_KEY_FIRECRAWL_KEY}"),
+            field: format!("config:{CONFIG_KEY_DEEPSEEK_KEY}"),
             generation: 0,
             result: Err("refused".into()),
         });

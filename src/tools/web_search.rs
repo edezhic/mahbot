@@ -1,4 +1,4 @@
-//! The `web_search` tool: one query against a chosen backend (Firecrawl or
+//! The `web_search` tool: one query against a chosen backend (DeepSeek or
 //! Exa), and the per-session expand-id cache that tool instance owns.
 //!
 //! Not workspace file search (`tools::search`) and not link enrichment — this
@@ -6,9 +6,10 @@
 //! tool instance starts empty, and an expand id is valid only in the session
 //! that earned it.
 //!
-//! A flagged search (`pictures`) also lists pictures of the results' subjects —
+//! A search flagged `pictures` also lists pictures of the results' subjects —
 //! discovery only, never an attached image: the agent fetches what it wants to
-//! look at with its own tools.
+//! look at with its own tools. Only Exa supplies pictures, and that capability is
+//! resolved separately from the text backend.
 
 use crate::Tool;
 use async_trait::async_trait;
@@ -26,87 +27,94 @@ use tokio::sync::RwLock;
 
 /// Backend provider for web search.
 pub enum WebSearchBackend {
-    /// Firecrawl API (`api.firecrawl.dev/v2/search`).
-    Firecrawl { key: String },
+    /// DeepSeek API (`api.deepseek.com/v1/tools/search`).
+    DeepSeek { key: String },
     /// Exa API (`api.exa.ai/search`).
     Exa { key: String },
 }
 
-impl WebSearchBackend {
-    fn key(&self) -> &str {
-        match self {
-            Self::Firecrawl { key } | Self::Exa { key } => key,
-        }
+// ── DeepSeek API types ──────────────────────────────────────────────────────────
+
+/// DeepSeek's stand-alone search endpoint (fixed, not owner-editable).
+const DEEPSEEK_SEARCH_ENDPOINT: &str = "https://api.deepseek.com/v1/tools/search";
+
+/// Results asked of every backend.
+const RESULTS_PER_SEARCH: usize = 10;
+
+/// DeepSeek's documented query ceiling, in Unicode characters. A longer query is
+/// refused here rather than forwarded: the provider's rejection would reach the
+/// model as a failure it cannot act on. The other backend has no such limit.
+const DEEPSEEK_MAX_QUERY_CHARS: usize = 128;
+
+#[derive(Serialize)]
+struct DeepSeekSearchRequest<'a> {
+    query: &'a str,
+    count: usize,
+    need_content: bool,
+}
+
+#[derive(Deserialize, Debug)]
+struct DeepSeekSearchResponse {
+    #[serde(default)]
+    results: Vec<DeepSeekResult>,
+}
+
+/// `snippet` is the one-line description shown under a link; the provider's
+/// longer `summary` is deliberately unused — the model expands a result when it
+/// wants more.
+#[derive(Deserialize, Debug)]
+struct DeepSeekResult {
+    title: Option<String>,
+    url: String,
+    #[serde(default)]
+    snippet: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// The DeepSeek search body. `need_content` is what makes a result's page text
+/// arrive with it: without it `expand` would always answer "no full text".
+fn deepseek_request_body(query: &str) -> DeepSeekSearchRequest<'_> {
+    DeepSeekSearchRequest {
+        query,
+        count: RESULTS_PER_SEARCH,
+        need_content: true,
     }
 }
 
-// ── Firecrawl API types ─────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct ScrapeOptions {
-    formats: Vec<String>,
-    #[serde(rename = "onlyMainContent")]
-    only_main_content: bool,
+/// DeepSeek's results as the shared row shape.
+fn deepseek_rows(results: Vec<DeepSeekResult>) -> Vec<SearchRow> {
+    results
+        .into_iter()
+        .map(|r| SearchRow {
+            title: r.title,
+            url: r.url,
+            text: r.content,
+            description: r.snippet,
+        })
+        .collect()
 }
 
-#[derive(Serialize)]
-struct SearchRequest {
-    query: String,
-    limit: usize,
-    #[serde(rename = "scrapeOptions")]
-    scrape_options: ScrapeOptions,
-    /// Flag-gated: without it Firecrawl searches the web source alone, exactly
-    /// as before. The image source is a second search (`limit` applies per
-    /// source) and is what a flagged call buys.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sources: Option<Vec<SearchSource>>,
+/// Refuse a query DeepSeek would reject anyway, before a request is made.
+fn deepseek_query_limit(query: &str) -> anyhow::Result<()> {
+    let chars = query.chars().count();
+    if chars > DEEPSEEK_MAX_QUERY_CHARS {
+        anyhow::bail!(
+            "Search query is too long: DeepSeek accepts at most \
+             {DEEPSEEK_MAX_QUERY_CHARS} characters, got {chars}. \
+             Shorten the query and try again."
+        );
+    }
+    Ok(())
 }
 
-#[derive(Serialize)]
-struct SearchSource {
-    #[serde(rename = "type")]
-    kind: &'static str,
-}
-
-#[derive(Deserialize, Debug)]
-struct WebResult {
-    title: Option<String>,
-    url: String,
-    markdown: Option<String>,
-    description: Option<String>,
-}
-
-#[derive(Deserialize, Debug)]
-struct ImageResult {
-    /// `Option` rather than a defaulted string: a `null` entry costs one
-    /// candidate, not the whole response.
-    #[serde(default, rename = "imageUrl")]
-    image_url: Option<String>,
-    /// The page the picture was found on.
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default, rename = "imageWidth")]
-    width: Option<u32>,
-    #[serde(default, rename = "imageHeight")]
-    height: Option<u32>,
-}
-
-#[derive(Deserialize, Debug)]
-struct SearchData {
-    #[serde(default, deserialize_with = "null_as_default")]
-    web: Vec<WebResult>,
-    /// Present only for a call that asked for the image source.
-    #[serde(default, deserialize_with = "null_as_default")]
-    images: Vec<ImageResult>,
-}
+// ── Exa API types ───────────────────────────────────────────────────────────────
 
 /// Deserialize an absent-or-null field as the field's default.
 ///
-/// Both providers omit a list they did not produce in one response and send
-/// `null` in another; a plain `#[serde(default)]` covers only the first, and a
-/// parse failure here would cost a flagged call its text results.
+/// Exa omits a list it did not produce in one response and sends `null` in
+/// another; a plain `#[serde(default)]` covers only the first, and a parse
+/// failure here would cost a flagged call its text results.
 fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -114,14 +122,6 @@ where
 {
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
-
-#[derive(Deserialize, Debug)]
-struct SearchResponse {
-    success: bool,
-    data: SearchData,
-}
-
-// ── Exa API types ───────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct ExaContentsOptions {
@@ -201,11 +201,13 @@ struct ExaSearchResponse {
 
 // ── Shared result formatting ────────────────────────────────────────────
 
-/// A normalized search result shared by both backends.
+/// A normalized search result shared by DeepSeek and Exa.
 struct SearchRow {
     title: Option<String>,
     url: String,
     text: Option<String>,
+    /// The one-line description rendered under the link. DeepSeek supplies one
+    /// (its `snippet`); Exa's results carry none.
     description: Option<String>,
 }
 
@@ -218,21 +220,22 @@ struct SearchAnswer {
 
 // ── Picture discovery ───────────────────────────────────────────────────────────
 
-/// A picture of a result's subject: offered by the backend, then verified —
-/// either by the size it reported or by a probe.
+/// A picture of a result's subject: offered by the backend, then verified by a
+/// probe of the image itself.
 struct Picture {
     /// The address, exactly as the backend returned it: the agent fetches it.
     url: String,
-    /// The alt text (Exa) or title (Firecrawl) describing what it shows.
+    /// The alt text Exa reported, describing what it shows.
     description: String,
     /// The page the picture was found on.
     page: String,
-    /// The size the backend reported; `None` when a probe has to measure it.
-    /// Never rendered.
-    dims: Option<(u32, u32)>,
 }
 
 /// What a search that may ask for pictures learned about them.
+///
+/// Pictures are an Exa-only capability, so everything the text backend answers
+/// arrives [`Pictures::NotRequested`] unless a picture call had to be recovered
+/// as text, which reports [`Pictures::Unavailable`] instead.
 enum Pictures {
     /// The call did not ask for pictures; output is exactly what it always was.
     NotRequested,
@@ -527,10 +530,7 @@ async fn probe_picture_dimensions(url: &str) -> Option<(u32, u32)> {
 /// Confirm a picture really is an image at the size bar, keeping its address
 /// exactly as the backend returned it.
 async fn verify_picture(picture: Picture) -> Option<Picture> {
-    let (width, height) = match picture.dims {
-        Some(dims) => dims,
-        None => probe_picture_dimensions(&picture.url).await?,
-    };
+    let (width, height) = probe_picture_dimensions(&picture.url).await?;
     (width >= MIN_PICTURE_WIDTH && height >= MIN_PICTURE_HEIGHT).then_some(picture)
 }
 
@@ -633,7 +633,7 @@ impl WebSearchCache {
 /// Check a web search API response for HTTP errors and extract structured
 /// JSON error messages when available.
 ///
-/// Both Firecrawl and Exa return structured JSON errors — this reads the
+/// Both DeepSeek and Exa return structured JSON errors — this reads the
 /// response body, extracts the error detail (string `error` field or the
 /// nested-envelope cascade — see
 /// [`crate::util::extract_provider_error_detail`]), and bails with a
@@ -722,95 +722,132 @@ impl WebSearchCache {
 
 // ── Tool ────────────────────────────────────────────────────────────────────────
 
-/// Web search tool backed by a configurable backend (Firecrawl or Exa).
+/// Web search tool: one text backend, plus the Exa key pictures go to.
 ///
-/// Dispatches to the appropriate API based on [`WebSearchBackend`]. Results are
-/// cached per-instance in-memory and can be expanded via the `expand` parameter
-/// to retrieve full text content.  Each agent session gets its own tool instance,
-/// so caches are automatically freed when the agent session ends.
+/// Results are cached per-instance in-memory and can be expanded via the
+/// `expand` parameter to retrieve full text content. Each agent session gets its
+/// own tool instance, so caches are automatically freed when the agent session
+/// ends.
 pub struct WebSearchTool {
-    backend: WebSearchBackend,
+    /// Every text search goes here.
+    text: WebSearchBackend,
+    /// The Exa key a search asking for pictures goes to. Only Exa supplies
+    /// pictures, so `Some` also *is* this instance's picture capability: with
+    /// `None` the tool offers no `pictures` parameter and ignores one if sent.
+    pictures: Option<String>,
     cache: WebSearchCache,
 }
 
 impl WebSearchTool {
     #[must_use]
-    pub fn new(backend: WebSearchBackend) -> Self {
+    fn new(text: WebSearchBackend, pictures: Option<String>) -> Self {
         Self {
-            backend,
+            text,
+            pictures,
             cache: WebSearchCache::new(),
         }
     }
 
-    /// One backend request, with no fallback of its own.
-    async fn backend_answer(&self, query: &str, pictures: bool) -> anyhow::Result<SearchAnswer> {
-        match &self.backend {
-            WebSearchBackend::Firecrawl { .. } => self.firecrawl_answer(query, pictures).await,
-            WebSearchBackend::Exa { .. } => self.exa_answer(query, pictures).await,
+    /// Resolve the stored choice into the two capabilities.
+    ///
+    /// An explicit choice is honoured even when the other key is configured;
+    /// with no explicit choice text goes to DeepSeek and pictures to the only
+    /// backend that can supply them. A key missing for the chosen capability
+    /// means no tool at all — there is no fallback between providers.
+    #[must_use]
+    pub(crate) fn from_config(
+        provider: Option<&str>,
+        deepseek_key: Option<String>,
+        exa_key: Option<String>,
+    ) -> Option<Self> {
+        match provider {
+            Some(p) if p.eq_ignore_ascii_case("deepseek") => {
+                deepseek_key.map(|key| Self::new(WebSearchBackend::DeepSeek { key }, None))
+            }
+            Some(p) if p.eq_ignore_ascii_case("exa") => {
+                exa_key.map(|key| Self::new(WebSearchBackend::Exa { key: key.clone() }, Some(key)))
+            }
+            Some(other) => {
+                tracing::warn!("Unknown web_search_provider: {other}");
+                None
+            }
+            None => match (deepseek_key, exa_key) {
+                (Some(deepseek), pictures) => Some(Self::new(
+                    WebSearchBackend::DeepSeek { key: deepseek },
+                    pictures,
+                )),
+                (None, Some(exa)) => Some(Self::new(
+                    WebSearchBackend::Exa { key: exa.clone() },
+                    Some(exa),
+                )),
+                (None, None) => None,
+            },
         }
     }
 
-    /// A search, with the one fallback rule: a flagged call whose picture part
+    /// A plain search: the text backend, and nothing else.
+    async fn text_answer(&self, query: &str) -> anyhow::Result<SearchAnswer> {
+        match &self.text {
+            WebSearchBackend::DeepSeek { key } => self.deepseek_answer(key, query).await,
+            WebSearchBackend::Exa { key } => self.exa_answer(key, query, false).await,
+        }
+    }
+
+    /// A search, with the one recovery rule: a picture call whose picture part
     /// failed still returns its text results and reports the pictures
     /// unavailable rather than none.
+    ///
+    /// The flag is honoured only when this instance has a picture backend; on
+    /// one without, the call is a plain text search.
+    ///
+    /// That retry is the only place a call moves between backends — it is the
+    /// recovery of a request the picture backend refused, not a fallback: it
+    /// obeys the text backend's own limits, so a DeepSeek retry of an over-long
+    /// query fails with that refusal.
     async fn search(&self, query: &str, pictures: bool) -> anyhow::Result<SearchAnswer> {
-        match self.backend_answer(query, pictures).await {
+        let Some(key) = self.pictures.as_deref().filter(|_| pictures) else {
+            return self.text_answer(query).await;
+        };
+        match self.exa_answer(key, query, true).await {
             Ok(answer) => Ok(answer),
-            Err(error) if pictures => {
+            Err(error) => {
                 tracing::warn!(%error, "picture search failed; retrying as text only");
-                let mut answer = self.backend_answer(query, false).await?;
+                let mut answer = self.text_answer(query).await?;
                 answer.pictures = Pictures::Unavailable;
                 Ok(answer)
             }
-            Err(error) => Err(error),
         }
     }
 
-    /// One Firecrawl search. `success` is how a refused search is told apart from
-    /// an empty one.
-    async fn firecrawl_answer(&self, query: &str, pictures: bool) -> anyhow::Result<SearchAnswer> {
-        let key = self.backend.key();
+    /// One DeepSeek search. The provider's own query ceiling is enforced first
+    /// so the model gets a refusal it can act on.
+    async fn deepseek_answer(&self, key: &str, query: &str) -> anyhow::Result<SearchAnswer> {
+        deepseek_query_limit(query)?;
 
         let res = crate::util::http::media_http_client()
-            .post("https://api.firecrawl.dev/v2/search")
-            .header("Authorization", format!("Bearer {key}"))
-            .json(&search_request_body(query, pictures))
+            .post(DEEPSEEK_SEARCH_ENDPOINT)
+            .bearer_auth(key)
+            .json(&deepseek_request_body(query))
             .send()
             .await?;
 
         let res = check_search_error(res).await?;
-        let response = res.json::<SearchResponse>().await?;
+        let response = res.json::<DeepSeekSearchResponse>().await?;
 
-        // `success` can be false with results present — render no results, and
-        // report the pictures unavailable: the search that would have produced
-        // them never ran.
-        if !response.success {
-            return Ok(SearchAnswer {
-                rows: Vec::new(),
-                pictures: if pictures {
-                    Pictures::Unavailable
-                } else {
-                    Pictures::NotRequested
-                },
-            });
-        }
-
-        let rows = firecrawl_rows(response.data.web);
-        let pictures = if pictures {
-            Pictures::Usable(
-                verified_pictures(firecrawl_candidates(response.data.images), rows.len()).await,
-            )
-        } else {
-            Pictures::NotRequested
-        };
-        Ok(SearchAnswer { rows, pictures })
+        Ok(SearchAnswer {
+            rows: deepseek_rows(response.results),
+            pictures: Pictures::NotRequested,
+        })
     }
 
     /// One Exa search: rows, plus one group of picture candidates per result
     /// when the flag asked for pictures.
-    async fn exa_answer(&self, query: &str, pictures: bool) -> anyhow::Result<SearchAnswer> {
-        let key = self.backend.key();
-
+    async fn exa_answer(
+        &self,
+        key: &str,
+        query: &str,
+        pictures: bool,
+    ) -> anyhow::Result<SearchAnswer> {
         let res = crate::util::http::media_http_client()
             .post("https://api.exa.ai/search")
             .header("x-api-key", key)
@@ -918,30 +955,10 @@ fn picture_section(pictures: &Pictures) -> Option<String> {
     }
 }
 
-/// The Firecrawl search body. Only `sources` is flag-gated: the scrape options
-/// stay in place, so a text search keeps its markdown and its credit price, and
-/// a picture search pays for the image source on top.
-fn search_request_body(query: &str, pictures: bool) -> SearchRequest {
-    SearchRequest {
-        query: query.to_string(),
-        limit: 10,
-        scrape_options: ScrapeOptions {
-            formats: vec!["markdown".to_string()],
-            only_main_content: true,
-        },
-        sources: pictures.then(|| {
-            vec![
-                SearchSource { kind: "web" },
-                SearchSource { kind: "images" },
-            ]
-        }),
-    }
-}
-
 /// The Exa search body. A picture search leaves `lite` for the one documented
 /// mode that accepts `contents.extras`; a text search's body is untouched.
 ///
-/// Neither body carries a moderation switch: both backends keep their own
+/// Neither backend's body carries a moderation switch: each keeps its own
 /// default when the field is absent, and a flagged call must not change the text
 /// results by switching filtering on for itself.
 fn exa_request_body(query: &str, pictures: bool) -> ExaSearchBody {
@@ -952,7 +969,7 @@ fn exa_request_body(query: &str, pictures: bool) -> ExaSearchBody {
         } else {
             EXA_SEARCH_MODE
         },
-        num_results: 10,
+        num_results: RESULTS_PER_SEARCH,
         contents: ExaContentsOptions {
             text: true,
             extras: pictures.then_some(ExaExtrasOptions {
@@ -961,55 +978,6 @@ fn exa_request_body(query: &str, pictures: bool) -> ExaSearchBody {
             }),
         },
     }
-}
-
-/// Firecrawl's web results as the shared row shape.
-fn firecrawl_rows(web: Vec<WebResult>) -> Vec<SearchRow> {
-    web.into_iter()
-        .map(|r| SearchRow {
-            title: r.title,
-            url: r.url,
-            text: r.markdown,
-            description: r.description,
-        })
-        .collect()
-}
-
-/// Firecrawl's `images` source as candidate groups of one picture each.
-///
-/// Firecrawl usually reports a picture's size with the result, so most
-/// candidates are judged without a fetch; one that arrives without a size is
-/// probed like an Exa candidate. A picture with no hosting page is dropped — an
-/// entry the agent cannot attribute is not a discovery.
-fn firecrawl_candidates(images: Vec<ImageResult>) -> Vec<Vec<Picture>> {
-    images
-        .into_iter()
-        .filter_map(|image| {
-            let url = image.image_url.as_deref()?.trim().to_string();
-            let page = image.url.as_deref()?.trim().to_string();
-            if page.is_empty() {
-                return None;
-            }
-            let description = image
-                .title
-                .as_deref()
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let dims = image.width.zip(image.height);
-            let big_enough = dims.is_none_or(|(width, height)| {
-                width >= MIN_PICTURE_WIDTH && height >= MIN_PICTURE_HEIGHT
-            });
-            (big_enough && candidate_is_plausible(&url, &description)).then(|| {
-                vec![Picture {
-                    url,
-                    description,
-                    page,
-                    dims,
-                }]
-            })
-        })
-        .collect()
 }
 
 /// Every picture of one Exa result its alt text presents as the subject, best
@@ -1040,7 +1008,6 @@ fn exa_picture_group(result: &ExaResult) -> Option<Vec<Picture>> {
                     url: url.to_string(),
                     description: description.to_string(),
                     page: page.to_string(),
-                    dims: None,
                 }
             })
         })
@@ -1054,8 +1021,21 @@ impl Tool for WebSearchTool {
         "web_search"
     }
 
+    fn description(&self) -> String {
+        // A tool with no picture backend must not promise pictures: the model
+        // would ask for something nothing here can produce.
+        let mut description = crate::prompt::load_prompt("tool/web_search.md")
+            .trim_end()
+            .to_string();
+        if self.pictures.is_some() {
+            description.push(' ');
+            description.push_str(crate::prompt::load_prompt("tool/web_search_pictures.md").trim());
+        }
+        description
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "query": {
@@ -1065,17 +1045,20 @@ impl Tool for WebSearchTool {
                 "expand": {
                     "type": "integer",
                     "description": "Expand ID of a result from a previous search in this same session; retrieves its full cached text instead of running a new search."
-                },
-                "pictures": {
-                    "type": "boolean",
-                    "description": "Also list pictures of the results' subjects, each with its address and hosting page."
                 }
             },
             "oneOf": [
                 {"required": ["query"]},
                 {"required": ["expand"]}
             ]
-        })
+        });
+        if self.pictures.is_some() {
+            schema["properties"]["pictures"] = json!({
+                "type": "boolean",
+                "description": "Also list pictures of the results' subjects, each with its address and hosting page."
+            });
+        }
+        schema
     }
 
     fn preserve_full_output(&self) -> bool {
@@ -1089,11 +1072,13 @@ impl Tool for WebSearchTool {
     }
 
     fn should_scrub_output(&self, args: &serde_json::Value) -> bool {
-        // A picture call scrubs its own text and then appends picture addresses,
-        // which this pass would redact (`?token=…` in a signed image URL) — an
-        // address the agent cannot fetch is not a discovered picture. The
-        // formatting side reads the same fact from `Pictures::NotRequested`.
-        !pictures_requested(args)
+        // An instance with no picture backend never honours `pictures`, so it
+        // always scrubs. Otherwise a picture call scrubs its own text and then
+        // appends picture addresses, which this pass would redact (`?token=…` in
+        // a signed image URL) — an address the agent cannot fetch is not a
+        // discovered picture. The formatting side reads the same fact from
+        // `Pictures::NotRequested`.
+        self.pictures.is_none() || !pictures_requested(args)
     }
 
     async fn execute(
@@ -1104,8 +1089,11 @@ impl Tool for WebSearchTool {
         let (query, expand_id) = self.cache.validate_execute_args(&args)?;
         // Read before the expand branch: a wrong-typed flag is a usage error on
         // either kind of call, and `pictures` with `expand` is accepted and
-        // ignored — an expand call has no query to find pictures for.
-        let pictures = super::get_opt_bool(&args, "pictures")?.unwrap_or(false);
+        // ignored — an expand call has no query to find pictures for. Without a
+        // picture backend the flag is not even parsed: the tool ignores it as if
+        // it were not sent.
+        let pictures =
+            self.pictures.is_some() && super::get_opt_bool(&args, "pictures")?.unwrap_or(false);
 
         if let Some(id) = expand_id {
             tracing::debug!("Expanding result id: {}", id);
@@ -1391,19 +1379,9 @@ mod tests {
 
     #[test]
     fn test_request_bodies_gate_pictures() {
-        let plain = serde_json::to_value(search_request_body("frogs", false)).unwrap();
-        assert!(
-            plain.get("sources").is_none(),
-            "unflagged Firecrawl body: {plain}"
-        );
-        assert!(
-            plain.get("scrapeOptions").is_some(),
-            "scraping must stay: {plain}"
-        );
-        let flagged = serde_json::to_value(search_request_body("frogs", true)).unwrap();
         assert_eq!(
-            flagged["sources"],
-            json!([{"type": "web"}, {"type": "images"}])
+            serde_json::to_value(deepseek_request_body("frogs")).unwrap(),
+            json!({"query": "frogs", "count": 10, "need_content": true})
         );
 
         let plain = serde_json::to_value(exa_request_body("frogs", false)).unwrap();
@@ -1418,89 +1396,6 @@ mod tests {
             flagged["contents"]["extras"],
             json!({"imageLinks": PICTURES_PER_RESULT, "richImageLinks": PICTURES_PER_RESULT})
         );
-    }
-
-    #[test]
-    fn test_firecrawl_candidates_filter() {
-        let image =
-            |url: &str, title: &str, width: Option<u32>, height: Option<u32>, page: &str| {
-                ImageResult {
-                    image_url: Some(url.to_string()),
-                    url: Some(page.to_string()),
-                    title: Some(title.to_string()),
-                    width,
-                    height,
-                }
-            };
-        let candidates = firecrawl_candidates(vec![
-            // A logo is small and a tracking pixel has no size at all.
-            image(
-                "https://site.test/logo.png",
-                "Site logo",
-                Some(80),
-                Some(80),
-                "https://a.test",
-            ),
-            // Neither address nor title says furniture: only the size does.
-            image(
-                "https://img.test/9f3a.jpg",
-                "Jane Doe",
-                Some(96),
-                Some(96),
-                "https://a.test",
-            ),
-            image(
-                "https://site.test/pixel.gif",
-                "Pixel",
-                None,
-                None,
-                "https://a.test",
-            ),
-            // Without a hosting page the agent cannot attribute it.
-            ImageResult {
-                image_url: Some("https://img.test/frog.jpg".to_string()),
-                url: None,
-                title: Some("Red-eyed tree frog".to_string()),
-                width: Some(1600),
-                height: Some(900),
-            },
-            image(
-                "https://img.test/frog-hero.jpg",
-                "Red-eyed tree frog",
-                Some(1600),
-                Some(900),
-                "https://a.test",
-            ),
-        ]);
-        assert_eq!(candidates.len(), 1);
-        let picture = &candidates[0][0];
-        assert_eq!(picture.url, "https://img.test/frog-hero.jpg");
-        assert_eq!(picture.page, "https://a.test");
-        assert_eq!(picture.dims, Some((1600, 900)));
-    }
-
-    #[tokio::test]
-    async fn test_verified_pictures_takes_first_per_group_and_caps() {
-        let picture = |url: &str, (width, height): (u32, u32)| Picture {
-            url: url.to_string(),
-            description: "a red-eyed tree frog".to_string(),
-            page: "https://site.test/page".to_string(),
-            dims: Some((width, height)),
-        };
-        let groups = vec![
-            // The first candidate is too small; the group's second must still
-            // count.
-            vec![
-                picture("https://img.test/small.jpg", (120, 90)),
-                picture("https://img.test/frog.jpg", (1200, 800)),
-            ],
-            vec![picture("https://img.test/other.jpg", (800, 600))],
-            vec![picture("https://img.test/third.jpg", (800, 600))],
-        ];
-        let pictures = verified_pictures(groups, 2).await;
-        assert_eq!(pictures.len(), 2, "capped at the text-result count");
-        assert_eq!(pictures[0].url, "https://img.test/frog.jpg");
-        assert_eq!(pictures[1].url, "https://img.test/other.jpg");
     }
 
     #[test]
@@ -1540,12 +1435,36 @@ mod tests {
         assert_eq!(group[0].url, "https://img.test/xm5.jpg");
         assert_eq!(group[0].page, "https://site.test/headphones");
         assert_eq!(group[0].description, "Sony WH-1000XM5 headphones");
-        assert!(group[0].dims.is_none(), "Exa reports no dimensions");
+    }
+
+    #[test]
+    fn test_picture_capability_shapes_description_and_schema() {
+        let with = WebSearchTool::new(
+            WebSearchBackend::Exa { key: String::new() },
+            Some(String::new()),
+        );
+        assert!(with.description().contains("`pictures`"));
+        assert!(
+            with.parameters_schema()["properties"]
+                .get("pictures")
+                .is_some()
+        );
+
+        // No picture backend: the model must not be told about a capability
+        // nothing here can produce.
+        let without = WebSearchTool::new(WebSearchBackend::DeepSeek { key: String::new() }, None);
+        assert!(!without.description().contains("pictures"));
+        assert!(
+            without.parameters_schema()["properties"]
+                .get("pictures")
+                .is_none()
+        );
     }
 
     #[test]
     fn test_scrub_policy_covers_picture_calls_only() {
-        let tool = WebSearchTool::new(WebSearchBackend::Exa { key: String::new() });
+        let exa = || WebSearchBackend::Exa { key: String::new() };
+        let tool = WebSearchTool::new(exa(), Some(String::new()));
         // A picture search scrubs its own text, so the agent-level pass is off;
         // an expand or a plain search keeps the default, and an explicit null
         // is the same as an absent argument on either flag.
@@ -1556,13 +1475,21 @@ mod tests {
         assert!(
             !tool.should_scrub_output(&json!({"query": "frogs", "pictures": true, "expand": null}))
         );
+
+        // Without a picture backend the flag is never honoured, so it cannot
+        // turn the agent-level scrub off.
+        let text_only = WebSearchTool::new(WebSearchBackend::DeepSeek { key: String::new() }, None);
+        assert!(text_only.should_scrub_output(&json!({"query": "frogs", "pictures": true})));
     }
 
     #[tokio::test]
     async fn test_picture_section_keeps_addresses_intact() {
-        let tool = WebSearchTool::new(WebSearchBackend::Exa {
-            key: "test-key".to_string(),
-        });
+        let tool = WebSearchTool::new(
+            WebSearchBackend::Exa {
+                key: "test-key".to_string(),
+            },
+            Some("test-key".to_string()),
+        );
         let rows = vec![SearchRow {
             title: Some("Signed images".to_string()),
             url: "https://site.test/page".to_string(),
@@ -1578,7 +1505,6 @@ mod tests {
                     url: signed.to_string(),
                     description: "a red-eyed tree frog".to_string(),
                     page: "https://site.test/page".to_string(),
-                    dims: None,
                 }]),
             )
             .await;
@@ -1598,9 +1524,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_picture_section_reports_empty_and_refused_separately() {
-        let tool = WebSearchTool::new(WebSearchBackend::Exa {
-            key: "test-key".to_string(),
-        });
+        let tool = WebSearchTool::new(
+            WebSearchBackend::Exa {
+                key: "test-key".to_string(),
+            },
+            Some("test-key".to_string()),
+        );
         let rows = vec![SearchRow {
             title: Some("Result".to_string()),
             url: "https://site.test/page".to_string(),
@@ -1644,5 +1573,133 @@ mod tests {
             !plain.contains("ictures"),
             "unflagged output is unchanged: {plain}"
         );
+    }
+
+    #[test]
+    fn test_deepseek_rows_map_a_response() {
+        let response: DeepSeekSearchResponse = serde_json::from_str(
+            r##"{"results":[
+                {"title":"Red-eyed tree frog",
+                 "url":"https://a.test/frog",
+                 "snippet":"A frog with red eyes",
+                 "content":"# Frog\n\nThe full page text."},
+                {"title":null,"url":"https://b.test/x","snippet":null,"content":""}
+            ]}"##,
+        )
+        .expect("a hand-written response parses");
+        let rows = deepseek_rows(response.results);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].title.as_deref(), Some("Red-eyed tree frog"));
+        assert_eq!(rows[0].url, "https://a.test/frog");
+        assert_eq!(rows[0].description.as_deref(), Some("A frog with red eyes"));
+        assert_eq!(
+            rows[0].text.as_deref(),
+            Some("# Frog\n\nThe full page text.")
+        );
+        // An empty page text survives as an empty string: `expand` is what turns
+        // it into "no full text available".
+        assert_eq!(rows[1].title, None);
+        assert_eq!(rows[1].description, None);
+        assert_eq!(rows[1].text.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_deepseek_query_ceiling_is_128_characters() {
+        let at_limit = "a".repeat(DEEPSEEK_MAX_QUERY_CHARS);
+        deepseek_query_limit(&at_limit).expect("a query at the ceiling is accepted");
+        let over_limit = "a".repeat(DEEPSEEK_MAX_QUERY_CHARS + 1);
+        let error = deepseek_query_limit(&over_limit).expect_err("a longer query is refused");
+        assert!(error.to_string().contains("128"), "{error}");
+    }
+
+    #[test]
+    fn test_from_config_resolution_table() {
+        /// One configured state and what the tool must be made of: the text
+        /// backend, the picture capability, or `None` for no tool at all.
+        struct Case {
+            provider: Option<&'static str>,
+            deepseek: Option<&'static str>,
+            exa: Option<&'static str>,
+            expected: Option<(&'static str, Option<&'static str>)>,
+        }
+        let cases = [
+            // An explicit choice is honoured even when the other key is set ...
+            Case {
+                provider: Some("deepseek"),
+                deepseek: Some("ds"),
+                exa: Some("exa"),
+                expected: Some(("deepseek", None)),
+            },
+            // ... and a missing key for it means no tool at all.
+            Case {
+                provider: Some("deepseek"),
+                deepseek: None,
+                exa: Some("exa"),
+                expected: None,
+            },
+            Case {
+                provider: Some("exa"),
+                deepseek: Some("ds"),
+                exa: Some("exa"),
+                expected: Some(("exa", Some("exa"))),
+            },
+            Case {
+                provider: Some("exa"),
+                deepseek: Some("ds"),
+                exa: None,
+                expected: None,
+            },
+            // A spelling no build supports.
+            Case {
+                provider: Some("google"),
+                deepseek: Some("ds"),
+                exa: Some("exa"),
+                expected: None,
+            },
+            // No choice: text on DeepSeek, pictures on Exa.
+            Case {
+                provider: None,
+                deepseek: Some("ds"),
+                exa: Some("exa"),
+                expected: Some(("deepseek", Some("exa"))),
+            },
+            Case {
+                provider: None,
+                deepseek: Some("ds"),
+                exa: None,
+                expected: Some(("deepseek", None)),
+            },
+            Case {
+                provider: None,
+                deepseek: None,
+                exa: Some("exa"),
+                expected: Some(("exa", Some("exa"))),
+            },
+            Case {
+                provider: None,
+                deepseek: None,
+                exa: None,
+                expected: None,
+            },
+        ];
+        for case in &cases {
+            let tool = WebSearchTool::from_config(
+                case.provider,
+                case.deepseek.map(str::to_string),
+                case.exa.map(str::to_string),
+            );
+            let actual = tool.as_ref().map(|tool| {
+                let text = match &tool.text {
+                    WebSearchBackend::DeepSeek { .. } => "deepseek",
+                    WebSearchBackend::Exa { .. } => "exa",
+                };
+                (text, tool.pictures.as_deref())
+            });
+            assert_eq!(
+                actual, case.expected,
+                "provider: {:?}, deepseek: {:?}, exa: {:?}",
+                case.provider, case.deepseek, case.exa
+            );
+        }
     }
 }
