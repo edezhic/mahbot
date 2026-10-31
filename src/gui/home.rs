@@ -2021,7 +2021,12 @@ impl HomeState {
         let sender = crate::users::ADMIN_USER_NAME.to_string();
 
         let super::attachment::Staged { dirs, markers } = staged;
-        let content = compose_content(voice, &markers, trimmed);
+        // The urgent mark is read on the text the user typed, before the
+        // dictated part and the attachment markers are composed around it, so
+        // the optimistic bubble and the stored history show the message without
+        // it. A transcript never decides urgency.
+        let (typed, urgent) = crate::channels::take_urgent(trimmed);
+        let content = compose_content(voice, &markers, &typed);
 
         // Generate an optimistic ID for non-command messages so the Home page
         // can display the user's message immediately and replace it when the
@@ -2029,7 +2034,10 @@ impl HomeState {
         // optimistically shown because `handle_bot_command` intercepts
         // them before the GUI broadcast in `process_channel_message` — the
         // confirmation never arrives, so an optimistic entry would become an orphan.
-        let is_command = content.starts_with('/');
+        // Read from what was typed, and only when it leads the message: removing
+        // the urgent mark must not turn a message into a command, and neither a
+        // dictated part nor attachment markers can make one.
+        let is_command = voice.is_none() && markers.is_empty() && trimmed.starts_with('/');
         let optimistic_id = if is_command {
             None
         } else {
@@ -2093,6 +2101,7 @@ impl HomeState {
             optimistic_id,
             reply_reference: reply,
             dictated: voice.is_some(),
+            urgent,
             ..Default::default()
         };
 

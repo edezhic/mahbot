@@ -324,6 +324,7 @@ mod tests {
                         originating_workspace: None,
                         custom_role: None,
                         reply_to_custom: None,
+                        urgent: false,
                     },
                     id.to_string(),
                 )

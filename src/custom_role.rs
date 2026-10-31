@@ -474,6 +474,7 @@ mod tests {
                 reply_to: None,
             }),
             reply_to_custom: None,
+            urgent: false,
         };
         crate::agent::message_router::persist_pending(&job, "stop_marker_pending".to_string())
             .await

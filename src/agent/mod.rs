@@ -255,6 +255,28 @@ pub(crate) const RETRY_EXHAUSTION_MARKER: &str = "exhausted retry budget";
 /// abandoned exactly as before (full history kept, owner not disturbed).
 const SUMMARIZE_ATTEMPTS: u32 = 3;
 
+/// The interrupted turn's whole reply, delivered on the surface its urgent
+/// message came from and recorded in the conversation, so both the user and the
+/// assistant see that the previous turn was cut short instead of answered.
+const URGENT_INTERRUPT_NOTICE: &str =
+    "⏹️ Interrupted: an urgent message arrived, so I stopped that turn.";
+
+/// The one result a tool call the urgent-message interrupt cut before it
+/// returned is settled with: an ordinary tool result — not a failure — that says
+/// what happened and claims no knowledge of the call's effect.
+fn interrupted_outcome() -> ToolExecutionOutcome {
+    ToolExecutionOutcome {
+        output: crate::prompt::load_prompt("tool_interrupted.md")
+            .trim()
+            .to_string(),
+        success: true,
+        image_payloads: Vec::new(),
+        text_is_content: false,
+        suspended: false,
+        ends_turn: false,
+    }
+}
+
 /// Boxed future returned by [`Agent::complete_pending_tool_calls`] — a pinned
 /// box so the caller (`Agent::work`) awaits a `dyn Future` instead of a concrete
 /// opaque type. Naming the boxed future breaks the async opaque-type Send cycle
@@ -698,12 +720,14 @@ impl Agent {
         {
             cancel_token.cancel();
         }
+        let interrupt_token = tokio_util::sync::CancellationToken::new();
         let generation = crate::agent::registry::AGENT_REGISTRY.register(
             agent_id.clone(),
             role.to_string(),
             ticket.as_ref().map(|t| t.id.clone()),
             ws,
             cancel_token.clone(),
+            interrupt_token.clone(),
             parent_key.clone(),
             parent_label.clone(),
             pause_stop.clone(),
@@ -754,6 +778,7 @@ impl Agent {
                 crate::tools::shell::BackgroundSessions::default(),
             ),
             chrome_sessions,
+            interrupt_token,
         }
     }
 }
@@ -953,11 +978,18 @@ impl Agent {
     /// Run a complete agent turn: initialize session, work loop (with shutdown
     /// cancellation), finalize session.
     ///
+    /// `messages` is what the turn answers, in arrival order: one message for an
+    /// ordinary turn, several when an urgent message cut the previous turn and
+    /// brought everything already waiting with it. Every message is appended to
+    /// the session as its own user message — the model reads them as consecutive
+    /// messages — while the per-turn blocks (personal changes, the model-change
+    /// line, the activity line) ride the first one only.
+    ///
     /// The turn's log scope rides one span for the whole turn — the agent, its
     /// role, the workspace's name (never its path) and the ticket when the run has
     /// one — so every record the turn produces is scoped to the work it belongs to,
     /// including the ones outside the LLM loop (see [`crate::logs`]).
-    pub async fn work(&mut self, msg: &str, resume: bool) -> anyhow::Result<String> {
+    pub async fn work(&mut self, messages: &[&str], resume: bool) -> anyhow::Result<String> {
         let span = tracing::info_span!(
             "agent",
             agent_id = %self.agent_id,
@@ -965,11 +997,11 @@ impl Agent {
             workspace = %self.workspace.name,
             ticket = self.ticket.as_ref().map(|ticket| ticket.id.as_str())
         );
-        self.run_turn(msg, resume).instrument(span).await
+        self.run_turn(messages, resume).instrument(span).await
     }
 
     /// [`Self::work`]'s body, running inside the turn's scope span.
-    async fn run_turn(&mut self, msg: &str, resume: bool) -> anyhow::Result<String> {
+    async fn run_turn(&mut self, messages: &[&str], resume: bool) -> anyhow::Result<String> {
         // Whether this turn's user message lands decides whether the turn may
         // advance a personal folder's change baseline at its end (the report
         // rides that message); see `session::personal_changes::refresh_after_turn`.
@@ -1033,12 +1065,15 @@ impl Agent {
         };
 
         // A turn that recorded no user message (an empty-message recovery retry)
-        // leaves `turn_recorded` false, so it advances no baseline.
-        if !msg.is_empty() {
+        // leaves `turn_recorded` false, so it advances no baseline. The index the
+        // turn's own messages start at is recorded first: a compaction triggered
+        // below must keep every one of them (see `select_retention_window`).
+        let turn_start = self.session.history().len();
+        if messages.iter().any(|msg| !msg.is_empty()) {
             self.session
-                .append_turn_message(
+                .append_turn_messages(
                     &self.agent_id,
-                    msg,
+                    messages,
                     &self.workspace,
                     &self.role,
                     self.ticket.as_ref(),
@@ -1069,7 +1104,7 @@ impl Agent {
         // A resumed stage-agent round starting with an empty message would
         // otherwise never surface board comments (the session-start ticket block
         // is not re-rendered). Inject any it has not seen.
-        self.inject_outstanding_comments(resume, msg).await;
+        self.inject_outstanding_comments(resume, messages).await;
 
         // Mandatory: destructive over-threshold compaction is SKIPPED on resumed
         // turns AND on turns that just settled dangling tool results — the
@@ -1081,7 +1116,7 @@ impl Agent {
         // stage re-drive on a >SUMMARIZATION_THRESHOLD session); summarization
         // happens on the next plain turn instead.
         if !resume && !self.turn_state.settled_tool_results {
-            self.maybe_summarize().await;
+            self.maybe_summarize(turn_start).await;
         }
 
         let shutdown = crate::shutdown::shutdown_token();
@@ -1368,6 +1403,7 @@ impl Agent {
     /// Run the full agent loop: LLM calls → tool execution → loop until final answer.
     ///
     /// Runs inside [`Self::work`]'s turn span, which carries the run's log scope.
+    #[expect(clippy::too_many_lines)] // the round loop with its cut and drain gates
     async fn llm_loop(&mut self) -> anyhow::Result<String> {
         let mut tool_rounds = 0usize;
         let mut accumulated_media_paths: Vec<(&'static str, String)> = Vec::new();
@@ -1395,6 +1431,15 @@ impl Agent {
             // fires). The round is resumed at boot via the job row
             // (status='launched').
             Self::bail_on_shutdown()?;
+            // Urgent-message interrupt: an urgent message arrived and cut this
+            // turn. It is not a cancellation — the turn ends with its
+            // interruption notice, delivered as its reply, and every tool result
+            // it produced is already committed above — so it is checked here,
+            // after shutdown/drain (their priority is unchanged), and before
+            // another model call.
+            if self.interrupt_token.is_cancelled() {
+                return Ok(self.notice_interruption());
+            }
             if tool_rounds >= MAX_TOOL_ROUNDS {
                 anyhow::bail!(
                     "Agent exceeded maximum of {MAX_TOOL_ROUNDS} tool rounds \
@@ -1410,7 +1455,17 @@ impl Agent {
             // Leader-stagger signal: fire after the FIRST LLM call
             // completes, success or failure — the wait is fail-open;
             // Notify's stored permit covers a fire-before-wait race.
-            let llm_result = self.llm_call().await;
+            //
+            // Raced against the urgent-message interrupt: cutting a model
+            // request means dropping it (nothing of it is recorded), which is
+            // what makes the cut immediate. The stagger signal is skipped on that
+            // path: this turn ends here.
+            let interrupt = self.interrupt_token.clone();
+            let llm_result = tokio::select! {
+                biased;
+                () = interrupt.cancelled() => return Ok(self.notice_interruption()),
+                result = self.llm_call() => result,
+            };
             if tool_rounds == 0
                 && let Some(notify) = &self.first_call_notify
             {
@@ -1501,6 +1556,18 @@ impl Agent {
                 .flatten();
             let all_outcomes = self.execute_tool_round(&tool_calls, sleep_rejection).await;
 
+            // A call the interrupt cut (`None`) is settled with the one fixed
+            // synthetic result — an ordinary tool result saying it was
+            // interrupted before it returned and whether it had any effect is
+            // unknown — in its own place, so every call of the frame ends with a
+            // result contiguous with it and the exchange stays valid for the
+            // model. A call that had already returned keeps its real result.
+            let cut = all_outcomes.iter().any(Option::is_none);
+            let all_outcomes: Vec<ToolExecutionOutcome> = all_outcomes
+                .into_iter()
+                .map(|outcome| outcome.unwrap_or_else(interrupted_outcome))
+                .collect();
+
             // Track media generation outcomes for marker fallback
             accumulated_media_paths.extend(extract_media_from_outcomes(
                 &self.tools,
@@ -1532,16 +1599,39 @@ impl Agent {
                 return Ok(String::new());
             }
 
+            // The cut round's results are committed, so the interruption is
+            // answered by its notice — this turn's whole reply — instead of
+            // another round. A sleep that succeeded returned above: that round
+            // concluded inside its only call, so nothing was cut and no notice
+            // follows.
+            if cut || self.interrupt_token.is_cancelled() {
+                return Ok(self.notice_interruption());
+            }
+
             tool_rounds += 1;
         }
+    }
+
+    /// End this turn on an urgent-message interrupt: record the notice as the
+    /// turn's reply — so the session shows the previous turn was cut short — and
+    /// hand it back for delivery on the surface the urgent message came from.
+    /// The interrupted answer is abandoned; nothing of it is delivered later.
+    fn notice_interruption(&mut self) -> String {
+        self.session
+            .push_assistant(URGENT_INTERRUPT_NOTICE.to_string());
+        URGENT_INTERRUPT_NOTICE.to_string()
     }
 
     /// Execute a batch of tool calls respecting side-effect ordering.
     ///
     /// Read-only tools run in parallel within groups; side-effecting tools
     /// run one at a time. Groups execute sequentially in the original call
-    /// order. The returned outcomes correspond one-to-one with `tool_calls`.
-    async fn execute_tool_group(&self, tool_calls: &[ToolCall]) -> Vec<ToolExecutionOutcome> {
+    /// order. The returned outcomes correspond one-to-one with `tool_calls`;
+    /// `None` is a call the urgent-message interrupt cut before it returned.
+    async fn execute_tool_group(
+        &self,
+        tool_calls: &[ToolCall],
+    ) -> Vec<Option<ToolExecutionOutcome>> {
         // Determine side_effects for each tool call. Unknown tools are
         // conservatively treated as side-effecting (default: true).
         let side_flags: Vec<bool> = tool_calls
@@ -1549,7 +1639,7 @@ impl Agent {
             .map(|call| find_tool(&self.tools, &call.name).is_none_or(super::Tool::side_effects))
             .collect();
 
-        let mut outcomes: Vec<ToolExecutionOutcome> = Vec::with_capacity(tool_calls.len());
+        let mut outcomes: Vec<Option<ToolExecutionOutcome>> = Vec::with_capacity(tool_calls.len());
         let mut i = 0usize;
 
         self.in_tool_context(async {
@@ -1557,7 +1647,9 @@ impl Agent {
                 if side_flags[i] {
                     // Side-effecting: single-call group, executed alone.
                     let outcome = self
-                        .execute_tool(&tool_calls[i].name, tool_calls[i].arguments.clone())
+                        .race_interrupt(
+                            self.execute_tool(&tool_calls[i].name, tool_calls[i].arguments.clone()),
+                        )
                         .await;
                     outcomes.push(outcome);
                     i += 1;
@@ -1569,13 +1661,16 @@ impl Agent {
                     }
                     let group_calls = &tool_calls[group_start..i];
 
-                    // Execute the entire read-only group in parallel.
-                    let group_outcomes: Vec<_> = futures_util::future::join_all(
-                        group_calls
-                            .iter()
-                            .map(|call| self.execute_tool(&call.name, call.arguments.clone())),
-                    )
-                    .await;
+                    // Execute the entire read-only group in parallel. Each call is
+                    // raced on its own, so one that had already returned keeps its
+                    // real result while its cut siblings settle as interrupted.
+                    let group_outcomes: Vec<_> =
+                        futures_util::future::join_all(group_calls.iter().map(|call| {
+                            self.race_interrupt(
+                                self.execute_tool(&call.name, call.arguments.clone()),
+                            )
+                        }))
+                        .await;
 
                     outcomes.extend(group_outcomes);
                 }
@@ -1586,19 +1681,40 @@ impl Agent {
         outcomes
     }
 
+    /// Run one tool call against the urgent-message interrupt: `None` when the cut
+    /// came first, which drops the call — stopping it the way an abort stops a
+    /// call today (a shell call's whole process tree with it). A cut that had
+    /// already landed must not start the call at all: one poll is enough to spawn
+    /// a child or write a file. Biased on the call, so one that completed in the
+    /// same instant the cut fired keeps its real result.
+    async fn race_interrupt<F>(&self, call: F) -> Option<ToolExecutionOutcome>
+    where
+        F: std::future::Future<Output = ToolExecutionOutcome>,
+    {
+        if self.interrupt_token.is_cancelled() {
+            return None;
+        }
+        let interrupt = self.interrupt_token.clone();
+        tokio::select! {
+            biased;
+            outcome = call => Some(outcome),
+            () = interrupt.cancelled() => None,
+        }
+    }
+
     /// Execute one tool round under the sleep-delivery guard: when a rejection
     /// is active, every `sleep` call in the round is intercepted BEFORE
     /// execution (a successful sleep would end the run silently via
     /// `ends_turn_on_success`) and settled as a synthetic failure outcome at
     /// its original position, while all sibling calls execute normally. The
-    /// returned outcomes stay one-to-one with `tool_calls` (consumers
-    /// `extract_media_from_outcomes` and `commit_tool_results` rely on the
-    /// alignment).
+    /// returned outcomes stay one-to-one with `tool_calls` (`commit_tool_results`
+    /// relies on the alignment); `None` is a call the urgent-message interrupt
+    /// cut.
     async fn execute_tool_round(
         &self,
         tool_calls: &[ToolCall],
         sleep_rejection: Option<&'static str>,
-    ) -> Vec<ToolExecutionOutcome> {
+    ) -> Vec<Option<ToolExecutionOutcome>> {
         let Some(reason) = sleep_rejection else {
             return self.execute_tool_group(tool_calls).await;
         };
@@ -1622,7 +1738,7 @@ impl Agent {
             .collect();
         let mut sibling_outcomes = self.execute_tool_group(&sibling_calls).await.into_iter();
 
-        let mut outcomes = Vec::with_capacity(tool_calls.len());
+        let mut outcomes: Vec<Option<ToolExecutionOutcome>> = Vec::with_capacity(tool_calls.len());
         for call in tool_calls {
             if call.name == "sleep" {
                 self.push_tool_call_record(
@@ -1632,7 +1748,9 @@ impl Agent {
                     false,
                     Some(reason.to_string()),
                 );
-                outcomes.push(Self::failure_outcome(&call.name, &call.arguments, reason).0);
+                outcomes.push(Some(
+                    Self::failure_outcome(&call.name, &call.arguments, reason).0,
+                ));
             } else {
                 outcomes.push(
                     sibling_outcomes
@@ -2400,8 +2518,8 @@ impl Agent {
     /// bounce-feedback path runs with `resume=false` (non-empty `msg`), so the
     /// `!resume` check excludes it. Runs once per turn, fail-open persist like
     /// live delivery.
-    async fn inject_outstanding_comments(&mut self, resume: bool, msg: &str) {
-        if !resume || !msg.is_empty() {
+    async fn inject_outstanding_comments(&mut self, resume: bool, messages: &[&str]) {
+        if !resume || messages.iter().any(|msg| !msg.is_empty()) {
             return;
         }
 
@@ -2600,7 +2718,7 @@ impl Agent {
     /// KV-cache preservation: [`Agent::summarize`] keeps all parameters
     /// identical (see [`Agent::build_chat_request`]) so the cached prefix is
     /// reusable.
-    async fn maybe_summarize(&mut self) {
+    async fn maybe_summarize(&mut self, turn_start: usize) {
         let token_length = self.session.token_length();
         let image_count = session_image_marker_count(self.session.history());
         tracing::debug!(
@@ -2631,6 +2749,7 @@ impl Agent {
                         self.ticket.as_ref(),
                         self.is_admin,
                         &self.user_name,
+                        turn_start,
                     )
                     .await;
             }
@@ -2668,7 +2787,8 @@ impl Agent {
         {
             return;
         }
-        self.maybe_summarize().await;
+        // The turn is over: nothing of it is still owed a full read.
+        self.maybe_summarize(self.session.history().len()).await;
     }
 }
 
@@ -3000,13 +3120,17 @@ impl Drop for RunEndCleanup {
 /// `launch` is the launch this run executes — `Some` for a branch role (a
 /// custom role's authorial prompt and tool subset taken at launch, or a worker
 /// branch's address); `None` for every built-in role.
+///
+/// `messages` is what the turn answers, in arrival order: one message for an
+/// ordinary run, several when an urgent message cut the previous turn and
+/// brought everything already waiting with it (see [`Agent::work`]).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_agent(
     agent_id: String,
     role: crate::Role,
     ws: &crate::Workspace,
     ticket: Option<&crate::pipeline::board::Ticket>,
-    message: &str,
+    messages: &[&str],
     user_name: String,
     channel: String,
     is_admin: bool,
@@ -3057,7 +3181,7 @@ pub(crate) async fn run_agent(
         agent.agent_id.clone(),
         std::sync::Arc::clone(&agent.chrome_sessions),
     );
-    let result = agent.work(message, resume).await;
+    let result = agent.work(messages, resume).await;
 
     // Absorb the product's own writes into a personal folder before the turn
     // ends, or a later change report would blame the user for them. Every turn
@@ -3145,7 +3269,7 @@ pub(crate) async fn run_default_agent(
         role,
         ws,
         None,
-        message,
+        &[message],
         String::new(),
         String::new(),
         false,
@@ -3307,6 +3431,7 @@ mod tests {
                 crate::tools::shell::BackgroundSessions::default(),
             ),
             chrome_sessions: std::sync::Arc::new(crate::tools::chrome::ChromeRunSessions::default()),
+            interrupt_token: CancellationToken::new(),
         }
     }
 
@@ -3743,16 +3868,19 @@ mod tests {
             1,
             "one tool call should produce one outcome"
         );
-        assert!(outcomes[0].success, "ReadTaskLocalsTool should succeed");
+        let outcome = outcomes[0]
+            .as_ref()
+            .expect("the call should produce an outcome");
+        assert!(outcome.success, "ReadTaskLocalsTool should succeed");
         assert!(
-            outcomes[0].output.contains("user=alice"),
+            outcome.output.contains("user=alice"),
             "should propagate user_name: {}",
-            outcomes[0].output
+            outcome.output
         );
         assert!(
-            outcomes[0].output.contains("channel=gui"),
+            outcome.output.contains("channel=gui"),
             "should propagate channel: {}",
-            outcomes[0].output
+            outcome.output
         );
     }
 
@@ -3800,6 +3928,7 @@ mod tests {
                 originating_workspace: None,
                 custom_role: None,
                 reply_to_custom: None,
+                urgent: false,
             };
             let _ = tx.send(job);
 
@@ -3946,7 +4075,7 @@ mod tests {
                 crate::util::test::expect_ticket(crate::pipeline::board::store(), &ticket_id).await;
 
             let mut agent = make_inject_agent(agent_id, role, ticket, Some("round 1 task")).await;
-            agent.inject_outstanding_comments(true, "").await;
+            agent.inject_outstanding_comments(true, &[""]).await;
 
             let prefix = format!("[Comment from {author} on ticket]");
             let history = agent.session.history();
@@ -3991,7 +4120,7 @@ mod tests {
             Some(&seed),
         )
         .await;
-        agent.inject_outstanding_comments(true, "").await;
+        agent.inject_outstanding_comments(true, &[""]).await;
 
         let history = agent.session.history();
         assert_eq!(
@@ -4030,10 +4159,10 @@ mod tests {
         .await;
         // Bounce-feedback path: non-empty msg.
         agent
-            .inject_outstanding_comments(true, "round 2 feedback")
+            .inject_outstanding_comments(true, &["round 2 feedback"])
             .await;
         // Fresh (non-resumed) round.
-        agent.inject_outstanding_comments(false, "").await;
+        agent.inject_outstanding_comments(false, &[""]).await;
 
         let history = agent.session.history();
         assert!(
@@ -4200,7 +4329,7 @@ mod tests {
             crate::Role::Analyst,
             &ws,
             None,
-            "task",
+            &["task"],
             String::new(),
             String::new(),
             false,
@@ -4250,7 +4379,7 @@ mod tests {
             crate::Role::Assistant,
             &ws,
             None,
-            "hello",
+            &["hello"],
             "sleep_user".to_string(),
             "gui".to_string(),
             false,
@@ -4297,7 +4426,7 @@ mod tests {
             crate::Role::Assistant,
             &ws,
             None,
-            "wake up",
+            &["wake up"],
             "sleep_user".to_string(),
             "gui".to_string(),
             false,
@@ -4341,7 +4470,7 @@ mod tests {
             crate::Role::Assistant,
             &ws,
             None,
-            "hello",
+            &["hello"],
             "sleep_text_user".to_string(),
             "gui".to_string(),
             false,
@@ -4422,7 +4551,7 @@ mod tests {
             crate::Role::Assistant,
             &ws,
             None,
-            "hello",
+            &["hello"],
             "sleep_bundle_user".to_string(),
             "gui".to_string(),
             false,
@@ -5196,14 +5325,14 @@ mod tests {
         let mut agent = make_agent(vec![]);
 
         // None (new / pre-migration session): early exit, nothing fires.
-        agent.maybe_summarize().await;
+        agent.maybe_summarize(agent.session.history().len()).await;
         assert_eq!(agent.session.token_length(), None);
 
         // A real value below the fixed threshold is equally a no-op.
         agent
             .session
             .set_token_length(Some(crate::session::SUMMARIZATION_THRESHOLD / 2));
-        agent.maybe_summarize().await;
+        agent.maybe_summarize(agent.session.history().len()).await;
     }
 
     /// The post-delivery compaction of the long-lived chat roles: only they may
@@ -5386,7 +5515,7 @@ mod tests {
         let mut agent = make_agent_with_role(vec![], crate::Role::Assistant);
         agent.agent_id = agent_id.to_string();
         let resp = agent
-            .work("[IMAGE:/tmp/photo.png] describe this photo", false)
+            .work(&["[IMAGE:/tmp/photo.png] describe this photo"], false)
             .await
             .expect("the run must not fail wholesale on a rejected input image");
         assert_eq!(
@@ -5467,7 +5596,7 @@ mod tests {
         let mut agent = make_agent_with_role(vec![], crate::Role::Assistant);
         agent.agent_id = agent_id.to_string();
         let result = agent
-            .work("[IMAGE:/tmp/photo.png] describe this photo", false)
+            .work(&["[IMAGE:/tmp/photo.png] describe this photo"], false)
             .await;
         assert!(
             result.is_err(),
@@ -5510,7 +5639,7 @@ mod tests {
         let mut agent = make_agent_with_role(vec![], crate::Role::Assistant);
         agent.agent_id = agent_id.to_string();
         let result = agent
-            .work("[IMAGE:/tmp/photo.png] describe this photo", false)
+            .work(&["[IMAGE:/tmp/photo.png] describe this photo"], false)
             .await;
         assert!(
             result.is_err(),
@@ -6864,5 +6993,134 @@ mod tests {
             "an end that is final releases at once"
         );
         chrome_release::clear_pending_releases();
+    }
+
+    /// Tools for the urgent-interrupt test: both read-only, so they run in one
+    /// parallel group; one returns at once, the other (`hang`) never returns and
+    /// announces that it started.
+    struct UrgentTestTool {
+        tool_name: &'static str,
+        result: String,
+        started: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    #[async_trait]
+    impl Tool for UrgentTestTool {
+        fn name(&self) -> &'static str {
+            self.tool_name
+        }
+
+        fn description(&self) -> String {
+            "test".into()
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+
+        fn side_effects(&self) -> bool {
+            false
+        }
+
+        async fn execute(
+            &self,
+            _ws: &crate::Workspace,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<String> {
+            match &self.started {
+                Some(started) => {
+                    started.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::future::pending().await
+                }
+                None => Ok(self.result.clone()),
+            }
+        }
+    }
+
+    /// A turn cut by an urgent message: the call that had already returned keeps
+    /// its real result, the call still in flight is settled where it stands with
+    /// the one fixed interrupted result, nothing is replayed, and the notice is
+    /// the turn's whole reply — not a failure, not a cancellation.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn urgent_interrupt_settles_the_cut_round_with_the_notice() {
+        crate::util::test::init_test_stores().await;
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fake = std::sync::Arc::new(FakeProvider::new().ok_text_and_tool_calls(
+            "",
+            &[
+                ("quick", serde_json::json!({})),
+                ("hang", serde_json::json!({})),
+            ],
+        ));
+        let _provider_guard = install_fake_provider(fake);
+        let mut agent = make_agent_with_role(
+            vec![
+                Box::new(UrgentTestTool {
+                    tool_name: "quick",
+                    result: "the sibling's own result".into(),
+                    started: None,
+                }),
+                Box::new(UrgentTestTool {
+                    tool_name: "hang",
+                    result: String::new(),
+                    started: Some(std::sync::Arc::clone(&started)),
+                }),
+            ],
+            crate::Role::Engineer,
+        );
+        agent.agent_id = "e2e_urgent_interrupt".to_string();
+        let interrupt = agent.interrupt_token.clone();
+        let turn = tokio::spawn(async move {
+            let answer = agent.work(&["do two things"], false).await;
+            (agent, answer)
+        });
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        interrupt.cancel();
+
+        let (agent, answer) = turn.await.expect("the turn task must not panic");
+        assert_eq!(
+            answer.expect("an interrupted turn is not a failure"),
+            URGENT_INTERRUPT_NOTICE,
+            "the notice is the whole reply of the turn the cut abandoned"
+        );
+        assert!(
+            !agent.cancel_token.is_cancelled(),
+            "the interrupt is not a cancellation"
+        );
+
+        let history = agent.session.history().to_vec();
+        let results: Vec<String> = history
+            .iter()
+            .filter(|message| message.role == crate::ChatRole::Tool)
+            .map(|message| {
+                let payload: serde_json::Value =
+                    serde_json::from_str(&message.content).expect("tool result is JSON");
+                crate::util::json::get_str(&payload, "content")
+                    .expect("tool result has content")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(results.len(), 2, "every call of the cut round has a result");
+        assert_eq!(
+            results[0], "the sibling's own result",
+            "a call that had already returned keeps its real result"
+        );
+        assert_eq!(
+            results[1],
+            crate::prompt::load_prompt("tool_interrupted.md").trim(),
+            "the cut call is settled with the one fixed interrupted result"
+        );
+        assert_eq!(
+            history.last().map(|message| message.content.as_str()),
+            Some(URGENT_INTERRUPT_NOTICE),
+            "the notice is recorded in the conversation"
+        );
+        assert!(
+            agent.session.pending_tool_frame().is_none(),
+            "no call is left dangling for a later turn to replay"
+        );
     }
 }

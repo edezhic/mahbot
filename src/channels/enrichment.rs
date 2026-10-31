@@ -1256,6 +1256,7 @@ mod tests {
             forwarded: false,
             update_ids: Vec::new(),
             dictated: false,
+            urgent: false,
         }
     }
 

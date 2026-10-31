@@ -44,7 +44,7 @@
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -190,6 +190,12 @@ pub struct AgentJob {
     /// other job.
     #[serde(default)]
     pub reply_to_custom: Option<Asker>,
+    /// True when the user's message was marked urgent: it must not wait behind
+    /// the running turn. Only a surface a user types into sets it
+    /// ([`route_user_message`]) — every other producer, and every already-stored
+    /// envelope, leaves it `false`.
+    #[serde(default)]
+    pub urgent: bool,
 }
 
 /// The conversation that asked for a forwarded reply — the asking branch's
@@ -210,9 +216,69 @@ pub struct Asker {
 
 // ── Global router ─────────────────────────────────────────────────────────
 
-/// Global router table: maps agent ID → unbounded sender for that agent's
-/// consumer loop.
-static ROUTER: OnceLock<RwLock<HashMap<String, mpsc::UnboundedSender<AgentJob>>>> = OnceLock::new();
+/// Global router table: maps agent ID → that agent's consumer.
+static ROUTER: OnceLock<RwLock<HashMap<String, Consumer>>> = OnceLock::new();
+
+/// How long an announced urgent message has to reach the queue before the turn
+/// cut for it answers what it already has. Generous, because the message's
+/// attachments are still being understood while the turn holds (that is the
+/// whole point of cutting on staging); bounded, because a hand-over that never
+/// arrives must not stall the agent's queue.
+const URGENT_ARRIVAL_SECS: u64 = 600;
+
+/// One agent's consumer: its job queue, plus what reaches it out of band — the
+/// announcement that an urgent message is on its way.
+struct Consumer {
+    jobs: mpsc::UnboundedSender<AgentJob>,
+    urgent: Arc<UrgentArrivals>,
+}
+
+/// Urgent messages announced for one agent and not yet handed to its queue: when
+/// each was announced, and the token that ends the wait it started. The consumer
+/// cuts its running turn on the announcement — staging is where the cut is taken
+/// — and holds the next turn until the message itself arrives.
+#[derive(Default)]
+struct UrgentArrivals {
+    announced: std::sync::Mutex<Vec<(tokio::time::Instant, CancellationToken)>>,
+    changed: tokio::sync::Notify,
+}
+
+impl UrgentArrivals {
+    /// An urgent message for this agent is on its way: it is not in the queue
+    /// yet, so the consumer cuts what runs now and waits for it.
+    fn announce(&self) -> UrgentAnnouncement {
+        let token = CancellationToken::new();
+        self.announced
+            .lock()
+            .unwrap_poison()
+            .push((tokio::time::Instant::now(), token.clone()));
+        // `notify_waiters`, not `notify_one`: only a consumer that is watching —
+        // one with a turn running — is cut. One that is between turns finds the
+        // announcement and waits for the message before it starts any turn.
+        self.changed.notify_waiters();
+        UrgentAnnouncement(token)
+    }
+
+    /// The announcements outstanding now: the messages a turn cut at this instant
+    /// waits for. Taking them means one is never waited for twice; anything
+    /// announced later is a later arrival with a turn of its own.
+    fn take(&self) -> Vec<(tokio::time::Instant, CancellationToken)> {
+        std::mem::take(&mut *self.announced.lock().unwrap_poison())
+    }
+}
+
+/// An urgent message announced for an agent, owned by the task staging it.
+/// Dropping it ends the wait it started — when the message was handed to the
+/// queue, or because that task died before it could be: a hand-over that never
+/// arrives must not hold the agent's queue.
+#[must_use]
+pub struct UrgentAnnouncement(CancellationToken);
+
+impl Drop for UrgentAnnouncement {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 
 /// Initialise the global router table.
 ///
@@ -224,6 +290,24 @@ pub fn init_global() -> anyhow::Result<()> {
         .set(RwLock::new(HashMap::new()))
         .map_err(|_| anyhow::anyhow!("ROUTER already initialised"))?;
     Ok(())
+}
+
+/// Cut the turn `agent_id` is running right now, because a user's urgent message
+/// is on its way to it: the message's hand-over is not waited for, so the cut
+/// lands before anything about that message — its attachments included — is
+/// understood. The turn the message creates then answers it together with
+/// everything that was already waiting, itself last (see [`route_user_message`]).
+///
+/// The returned guard is held by the staging task until the message is handed to
+/// the queue: dropping it — then, or because that task died first — ends the wait
+/// the announcement started. `None` when the agent has no consumer at all: no
+/// turn was cut, and the message is answered by the next turn as usual.
+#[must_use]
+pub fn announce_urgent(agent_id: &str) -> Option<UrgentAnnouncement> {
+    let table = ROUTER.get()?.read().unwrap_poison();
+    table
+        .get(agent_id)
+        .map(|consumer| consumer.urgent.announce())
 }
 
 /// Route a job to the consumer for the given agent ID.
@@ -248,8 +332,8 @@ pub fn route(agent_id: &str, job: AgentJob) {
             .get()
             .expect("ROUTER not initialised — call init_global() first");
         let guard = map.read().unwrap_poison();
-        if let Some(tx) = guard.get(agent_id) {
-            if tx.send(job).is_err() {
+        if let Some(consumer) = guard.get(agent_id) {
+            if consumer.jobs.send(job).is_err() {
                 error!(agent_id = %agent_id, "Router: consumer dropped — failed to route job");
             }
             return;
@@ -264,14 +348,16 @@ pub fn route(agent_id: &str, job: AgentJob) {
 
     // Double-check: another task might have created the entry while we
     // waited for the write lock.
-    if let Some(tx) = guard.get(agent_id) {
-        if tx.send(job).is_err() {
+    if let Some(consumer) = guard.get(agent_id) {
+        if consumer.jobs.send(job).is_err() {
             error!(agent_id = %agent_id, "Router: consumer dropped (double-check) — failed to route job");
         }
         return;
     }
 
     let (tx, rx) = mpsc::unbounded_channel::<AgentJob>();
+    let urgent = Arc::new(UrgentArrivals::default());
+    let urgent_for_consumer = Arc::clone(&urgent);
     let agent_id_for_consumer = agent_id.to_string();
     let agent_id_for_cleanup = agent_id_for_consumer.clone();
 
@@ -279,9 +365,14 @@ pub fn route(agent_id: &str, job: AgentJob) {
         // Wrap consumer_loop in catch_unwind so a panic doesn't leave a dead
         // sender in the router table, causing permanent message loss for this
         // agent ID.
-        let result = std::panic::AssertUnwindSafe(consumer_loop(agent_id_for_consumer, rx))
-            .catch_unwind()
-            .await;
+        #[expect(clippy::large_futures)] // one consumer per agent, spawned once
+        let result = std::panic::AssertUnwindSafe(consumer_loop(
+            agent_id_for_consumer,
+            rx,
+            urgent_for_consumer,
+        ))
+        .catch_unwind()
+        .await;
 
         // Always clean up the router entry — runs on both normal exit and panic.
         if let Some(map) = ROUTER.get() {
@@ -307,7 +398,7 @@ pub fn route(agent_id: &str, job: AgentJob) {
         error!(agent_id = %agent_id, "Router: brand-new consumer dropped immediately — failed to route job");
     }
 
-    guard.insert(agent_id.to_string(), tx);
+    guard.insert(agent_id.to_string(), Consumer { jobs: tx, urgent });
 }
 
 /// The `MessageKind::UserMessage` envelope every producer of an owner-side
@@ -315,7 +406,8 @@ pub fn route(agent_id: &str, job: AgentJob) {
 /// the command line's handover ([`deliver_command_line_message`]), and a notice
 /// the product addresses to the owner's assistant
 /// ([`assistant_notice_job`], shared by both of its delivery paths). The routing
-/// fields such a message never carries are the shape's own defaults.
+/// fields such a message never carries are the shape's own defaults — including
+/// `urgent`, which only the user's own typed message can be.
 fn user_message_job(
     content: String,
     workspace_name: String,
@@ -336,16 +428,30 @@ fn user_message_job(
         originating_workspace: None,
         custom_role: None,
         reply_to_custom: None,
+        urgent: false,
     }
+}
+
+/// The agent a user message for `role` in `workspace_name` is routed to — the ID
+/// [`route_user_message`] computes, for a caller that must reach the agent before
+/// the message does ([`announce_urgent`]).
+#[must_use]
+pub fn user_message_agent_id(user_name: &str, role: Role, workspace_name: &str) -> String {
+    // The same normalization `route_user_message` applies, so the two can never
+    // name different agents for one message.
+    let user_name = crate::session::normalize_user_name(user_name, "route_user_message");
+    crate::session::resolve_agent_id(user_name, role.as_str(), workspace_name)
 }
 
 /// Route a user message to the agent for the given role in a workspace.
 ///
-/// Computes the agent ID via `crate::session::resolve_agent_id` (Manager
-/// role → `manager_{ws_name}`, others → channel-agnostic direct ID per
-/// user+workspace+role) and enqueues
+/// Resolves the agent ID the same way [`user_message_agent_id`] does and enqueues
 /// a [`MessageKind::UserMessage`] job. Surrounding per-site pipelines (broadcast,
 /// persistence, enrichment) remain at the call sites.
+///
+/// `urgent` says the user marked the message urgent (see
+/// `crate::channels::take_urgent`): it cuts the agent's running turn and brings
+/// everything already waiting with it, instead of queueing behind it.
 ///
 /// # Durability (at-least-once)
 ///
@@ -361,17 +467,18 @@ pub async fn route_user_message(
     channel: String,
     role: Role,
     reply_target: Option<String>,
+    urgent: bool,
 ) {
     // Invariant: the routed user identity is never an empty string. A real
     // admin account is always seeded. Normalize defensively so no path can create
     // a malformed identity (bare "_ws_role" key) or persist/reply under an
-    // empty user. (direct_agent_id also normalizes the ID key; this layer
-    // normalizes the delivery payload.)
+    // empty user — once, so the agent ID key and the delivery payload always
+    // name the same person.
     let user_name =
         crate::session::normalize_user_name(&user_name, "route_user_message").to_string();
-
     let agent_id = crate::session::resolve_agent_id(&user_name, role.as_str(), &workspace_name);
-    let job = user_message_job(
+
+    let mut job = user_message_job(
         content,
         workspace_name,
         user_name,
@@ -379,6 +486,7 @@ pub async fn route_user_message(
         role,
         reply_target,
     );
+    job.urgent = urgent;
 
     // DURABLE kinds = UserMessage (manager-bound), AgentMessage, ManagerNotify,
     // CustomRoleNotify, GuestMessage, AnalyzeToolResult, ResearchResult,
@@ -495,6 +603,7 @@ fn agent_message_job(
         originating_workspace: None,
         custom_role: None,
         reply_to_custom: asker,
+        urgent: false,
     }
 }
 
@@ -549,6 +658,7 @@ pub(crate) async fn route_guest_message(
         originating_workspace: None,
         custom_role: None,
         reply_to_custom: None,
+        urgent: false,
     };
     let target = crate::jobs::envelope_target(&job);
     hand_over(job, &target, "guest message", answered_for).await
@@ -717,7 +827,13 @@ pub fn register_agent(agent_id: &str) -> mpsc::UnboundedReceiver<AgentJob> {
         .get()
         .expect("ROUTER not initialised — call init_global() first");
     let mut guard = map.write().unwrap_poison();
-    guard.insert(agent_id.to_string(), tx);
+    guard.insert(
+        agent_id.to_string(),
+        Consumer {
+            jobs: tx,
+            urgent: Arc::new(UrgentArrivals::default()),
+        },
+    );
     rx
 }
 
@@ -745,17 +861,108 @@ pub fn try_route(agent_id: &str, job: AgentJob) -> bool {
         return false;
     };
     let guard = map.read().unwrap_poison();
-    if let Some(tx) = guard.get(agent_id) {
-        tx.send(job).is_ok()
-    } else {
-        false
+    guard
+        .get(agent_id)
+        .is_some_and(|consumer| consumer.jobs.send(job).is_ok())
+}
+
+/// The turn a queue forms: everything already waiting up to and including the
+/// first urgent message — answered together, the urgent one last — or, when
+/// nothing is urgent, the one job at the front.
+///
+/// The first urgent message in queue order closes the batch: it is the one whose
+/// hand-in took the cut, and everything behind it — a second urgent message
+/// included — is left for the next turn. Nothing is ever answered after an
+/// urgent message that was already waiting when it arrived, and queue order
+/// always holds.
+fn take_turn_batch(waiting: &mut std::collections::VecDeque<AgentJob>) -> Vec<AgentJob> {
+    match waiting.iter().position(|job| job.urgent) {
+        Some(at) => waiting.drain(..=at).collect(),
+        None => waiting.drain(..1).collect(),
     }
+}
+
+/// Hold the turn about to start for the urgent messages announced before it: the
+/// cut was taken at staging, so those messages are still on their way and must be
+/// answered together with everything already waiting, last. Whatever reaches the
+/// queue meanwhile joins that turn.
+///
+/// The wait for an announcement ends when its message is handed over — or when
+/// the task staging it is gone — and is bounded from the instant it was
+/// announced, so a hand-over that never arrives lets the turn answer what it
+/// already has instead of parking the agent's queue. A shutdown or a drain ends
+/// it at once. Returns `false` when the consumer must stop.
+async fn hold_for_urgent(
+    waiting: &mut std::collections::VecDeque<AgentJob>,
+    urgent: &UrgentArrivals,
+    rx: &mut mpsc::UnboundedReceiver<AgentJob>,
+    shutdown: &CancellationToken,
+    agent_id: &str,
+    hold: std::time::Duration,
+) -> bool {
+    // Only what was announced before this turn started is waited for: a message
+    // announced later is a later arrival, and either lands in this turn's queue
+    // or cuts the turn that starts once the wait is over.
+    let awaiting = urgent.take();
+    let Some(deadline) = awaiting
+        .iter()
+        .map(|(announced, _)| *announced + hold)
+        .min()
+    else {
+        return true;
+    };
+    loop {
+        let settled = async {
+            for (_, token) in &awaiting {
+                token.cancelled().await;
+            }
+        };
+        let pulled = tokio::select! {
+            pulled = tokio::time::timeout_at(deadline, rx.recv()) => pulled,
+            () = settled => break,
+            () = shutdown.cancelled() => return false,
+            () = crate::shutdown::drain_wait() => return false,
+        };
+        match pulled {
+            Ok(Some(job)) => {
+                waiting.push_back(job);
+                // A queue that never empties must not postpone the turn past the
+                // window: the deadline is checked here because `timeout_at` polls
+                // the receive first and a steady stream would never reach it.
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+            // The queue closed: the caller's next receive sees it.
+            Ok(None) => return true,
+            Err(_) => {
+                // A message that settled as the window ran out was handed over
+                // after all — only one that is still awaited never arrived.
+                if awaiting.iter().any(|(_, token)| !token.is_cancelled()) {
+                    warn!(
+                        agent_id = %agent_id,
+                        "Message router: announced urgent message never arrived — answering what is queued",
+                    );
+                }
+                break;
+            }
+        }
+    }
+    // The message that ended the wait was handed to the queue before its
+    // announcement dropped, so take what is already here with it.
+    while let Ok(job) = rx.try_recv() {
+        waiting.push_back(job);
+    }
+    true
 }
 
 // ── Consumer loop ─────────────────────────────────────────────────────────
 
-/// The consumer task that processes agent jobs for a single agent instance,
-/// one job at a time.
+/// The consumer task that processes agent jobs for a single agent instance.
+///
+/// One turn at a time, in queue order; an urgent message cuts the running turn
+/// and is answered by the next one together with everything that was already
+/// waiting (see [`AgentJob::urgent`]).
 ///
 /// Shutdown-aware loop: checks for global shutdown between jobs.
 ///
@@ -763,8 +970,16 @@ pub fn try_route(agent_id: &str, job: AgentJob) -> bool {
 /// by the outer wrapper in [`route()`], which runs on both normal exit and
 /// (via `catch_unwind`) panic exit.
 #[expect(clippy::too_many_lines)]
-async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJob>) {
+async fn consumer_loop(
+    agent_id: String,
+    mut rx: mpsc::UnboundedReceiver<AgentJob>,
+    urgent: Arc<UrgentArrivals>,
+) {
     let shutdown = crate::shutdown::shutdown_token();
+    let urgent_hold = std::time::Duration::from_secs(URGENT_ARRIVAL_SECS);
+    // Jobs that reached this queue while a turn was running: the next turn's
+    // items, in queue order.
+    let mut waiting: std::collections::VecDeque<AgentJob> = std::collections::VecDeque::new();
 
     loop {
         if shutdown.is_cancelled() {
@@ -778,86 +993,151 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             break;
         }
 
-        let mut job = tokio::select! {
-            job = rx.recv() => {
-                match job {
+        // ── Take this turn's batch ────────────────────────────────────────
+        // Nothing is waiting: block for the next job.
+        if waiting.is_empty() {
+            let job = tokio::select! {
+                job = rx.recv() => match job {
                     Some(job) => job,
                     None => break,
-                }
-            }
-            () = shutdown.cancelled() => {
-                info!(agent_id = %agent_id, "Message router: shutting down (global shutdown)");
-                break;
-            }
-        };
-
-        // A launch and the role are one fact: derive the role from the launch
-        // FIRST, so a job built without the derivation cannot smuggle a launch
-        // past the pinning rule below or the custom-role guard that follows.
-        job.role = job.role.for_launch(job.custom_role.as_ref());
-
-        // Execution-time invariant: pinned roles (Assistant)
-        // never run outside the user's personal workspace, no matter what the
-        // producer stored. Empty-user envelopes for pinned roles are refused
-        // outright.
-        let Some(pinned_ws) =
-            crate::users::enforce_personal_pinning(job.role, &job.workspace_name, &job.user_name)
-        else {
-            error!(
-                agent_id = %agent_id,
-                role = %job.role.as_str(),
-                workspace = %job.workspace_name,
-                "Message router: pinned role with empty user — refusing to run unpinned, skipping job"
-            );
-            confirm_pending_delivery(&job).await;
-            continue;
-        };
-        job.workspace_name = pinned_ws;
-
-        // A custom-role job is meaningless without its launch — the record's
-        // prompt, tool subset and branch address all travel in it — and a
-        // branch whose record has since been deleted must never be resumed
-        // with a definition that no longer exists (a round the role dispatched
-        // may still complete after the delete). Both are refused here, in the
-        // one funnel every producer goes through, and the durable pending row
-        // is reclaimed so boot replay does not resurrect them. The cost is one
-        // primary-key lookup per custom-role turn.
-        if job.role == Role::Custom {
-            let refusal = match job.custom_role.as_ref() {
-                None => Some("the job carries no custom-role launch"),
-                Some(launch) => match crate::custom_role::get(&launch.name).await {
-                    Ok(Some(_)) => None,
-                    Ok(None) => Some("the custom role no longer exists"),
-                    Err(e) => {
-                        // A transient read failure is not a verdict about the
-                        // role: run the turn and let the error surface wherever
-                        // the turn itself needs the store.
-                        warn!(
-                            agent_id = %agent_id,
-                            role = %launch.name,
-                            error = %e,
-                            "Message router: custom role lookup failed — running the turn anyway",
-                        );
-                        None
-                    }
                 },
+                () = shutdown.cancelled() => {
+                    info!(agent_id = %agent_id, "Message router: shutting down (global shutdown)");
+                    break;
+                }
             };
-            if let Some(refusal) = refusal {
+            waiting.push_back(job);
+        }
+        // Everything else the queue already holds is waiting too: gathered now,
+        // so an urgent message among them starts ONE turn together with them
+        // instead of interrupting a turn that started a moment earlier.
+        while let Ok(job) = rx.try_recv() {
+            waiting.push_back(job);
+        }
+        // An announced urgent message is still being staged (its attachments may
+        // still be understood): the cut was taken the moment it was announced, and
+        // this turn waits for the message itself so it is answered together with
+        // everything already waiting, last. A shutdown or drain that began during
+        // that wait ends this loop here, as the top-of-loop guards would.
+        if !hold_for_urgent(
+            &mut waiting,
+            &urgent,
+            &mut rx,
+            &shutdown,
+            agent_id.as_str(),
+            urgent_hold,
+        )
+        .await
+            || crate::shutdown::aborting()
+        {
+            info!(agent_id = %agent_id, "Message router: draining — no new jobs pulled");
+            break;
+        }
+        // The batch ends with the first urgent message it holds — that one is
+        // taken last, after everything that was already waiting, and everything
+        // behind it is a later arrival that gets its own turn. A batch with no
+        // urgent message is the one job at the front.
+        let batch = take_turn_batch(&mut waiting);
+
+        // Execution-time normalization every job of the batch goes through: the
+        // role derived from its launch, the pinned-role rule, and the
+        // custom-role guard. A refused job is confirmed and dropped so it cannot
+        // take the rest of the batch with it.
+        let mut validated: Vec<AgentJob> = Vec::with_capacity(batch.len());
+        for mut item in batch {
+            // TicketComment jobs should NEVER reach the consumer loop — they are
+            // delivered directly via try_route() to agents that drain them in
+            // llm_loop. If one arrives here, someone used route() instead of
+            // try_route(), or the agent's receiver was dropped.
+            if item.kind == MessageKind::TicketComment {
                 warn!(
                     agent_id = %agent_id,
-                    reason = %refusal,
-                    "Message router: refusing a custom-role job",
+                    "Consumer loop received TicketComment — was try_route() used instead of route()? Discarding",
                 );
-                confirm_pending_delivery(&job).await;
+                confirm_pending_delivery(&item).await;
                 continue;
             }
+
+            // A launch and the role are one fact: derive the role from the launch
+            // FIRST, so a job built without the derivation cannot smuggle a launch
+            // past the pinning rule below or the custom-role guard that follows.
+            item.role = item.role.for_launch(item.custom_role.as_ref());
+
+            // Execution-time invariant: pinned roles (Assistant)
+            // never run outside the user's personal workspace, no matter what the
+            // producer stored. Empty-user envelopes for pinned roles are refused
+            // outright.
+            let Some(pinned_ws) = crate::users::enforce_personal_pinning(
+                item.role,
+                &item.workspace_name,
+                &item.user_name,
+            ) else {
+                error!(
+                    agent_id = %agent_id,
+                    role = %item.role.as_str(),
+                    workspace = %item.workspace_name,
+                    "Message router: pinned role with empty user — refusing to run unpinned, skipping job"
+                );
+                confirm_pending_delivery(&item).await;
+                continue;
+            };
+            item.workspace_name = pinned_ws;
+
+            // A custom-role job is meaningless without its launch — the record's
+            // prompt, tool subset and branch address all travel in it — and a
+            // branch whose record has since been deleted must never be resumed
+            // with a definition that no longer exists (a round the role dispatched
+            // may still complete after the delete). Both are refused here, in the
+            // one funnel every producer goes through, and the durable pending row
+            // is reclaimed so boot replay does not resurrect them. The cost is one
+            // primary-key lookup per custom-role turn.
+            if item.role == Role::Custom {
+                let refusal = match item.custom_role.as_ref() {
+                    None => Some("the job carries no custom-role launch"),
+                    Some(launch) => match crate::custom_role::get(&launch.name).await {
+                        Ok(Some(_)) => None,
+                        Ok(None) => Some("the custom role no longer exists"),
+                        Err(e) => {
+                            // A transient read failure is not a verdict about the
+                            // role: run the turn and let the error surface wherever
+                            // the turn itself needs the store.
+                            warn!(
+                                agent_id = %agent_id,
+                                role = %launch.name,
+                                error = %e,
+                                "Message router: custom role lookup failed — running the turn anyway",
+                            );
+                            None
+                        }
+                    },
+                };
+                if let Some(refusal) = refusal {
+                    warn!(
+                        agent_id = %agent_id,
+                        reason = %refusal,
+                        "Message router: refusing a custom-role job",
+                    );
+                    confirm_pending_delivery(&item).await;
+                    continue;
+                }
+            }
+            validated.push(item);
         }
+        // The turn's identity — its surface, user, channel and reply target —
+        // is the last item's: the urgent message is what the turn answers, and
+        // everything waiting rides in front of it. The items before it are its
+        // messages, in queue order.
+        let Some(job) = validated.pop() else {
+            continue;
+        };
+        let queued = validated;
 
         debug!(
             agent_id = %agent_id,
             workspace = %job.workspace_name,
             user = %job.user_name,
             kind = ?job.kind,
+            messages = queued.len() + 1,
             "Message router: processing job",
         );
 
@@ -870,6 +1150,9 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                     workspace = %job.workspace_name,
                     "Message router: workspace not found — skipping job",
                 );
+                for item in &queued {
+                    report_unrunnable_branch(item).await;
+                }
                 report_unrunnable_branch(&job).await;
                 continue;
             }
@@ -934,10 +1217,8 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         broadcast_typing(&users, &job.workspace_name, true);
 
         // ── Chronicle timeline drain (Manager only) ────────────────────────
-        // TicketComment jobs should NEVER reach the consumer loop — they are
-        // delivered directly via try_route() to agents that drain them in
-        // llm_loop. If one arrives here, someone used route() instead of
-        // try_route(), or the agent's receiver was dropped.
+        // Each item the turn answers becomes its own message, in queue order; the
+        // job that ended the batch (the urgent one) is last.
         let message = match (role, job.kind) {
             (Role::Manager, MessageKind::UserMessage | MessageKind::AgentMessage) => {
                 // Flush the CDC drainer so a transition committed moments ago is
@@ -955,15 +1236,10 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                     format!("{drained}\n{content}", content = job.content)
                 }
             }
-            (_, MessageKind::TicketComment) => {
-                warn!(
-                    agent_id = %agent_id,
-                    "Consumer loop received TicketComment — was try_route() used instead of route()? Discarding",
-                );
-                continue;
-            }
             _ => job.content.clone(),
         };
+        let mut messages: Vec<String> = queued.iter().map(|item| item.content.clone()).collect();
+        messages.push(message);
 
         // ── Run the agent ─────────────────────────────────────────────
         // The admin gets the Assistant's widened toolset and role prompt;
@@ -988,12 +1264,23 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             ),
             None => (None, None),
         };
-        let (mut agent, response) = crate::agent::run_agent(
+        // ── Run the turn, watching the queue ──────────────────────────
+        // The turn answers every message of the batch. While it runs, two things
+        // cut it: an urgent message announced for this agent — staging is where
+        // that cut is taken, so it never waits for the message's own attachments
+        // to be understood — and an urgent message handed straight to the queue.
+        // Everything that reaches the queue while the turn runs is the next turn's
+        // items, in queue order, so the urgent one is answered last, together with
+        // everything already waiting. No interruption is attempted while the
+        // product is stopping or draining.
+        let message_refs: Vec<&str> = messages.iter().map(String::as_str).collect();
+        let mut queue_open = true;
+        let mut turn = std::pin::pin!(crate::agent::run_agent(
             agent_id.clone(),
             role,
             &ws,
             None,
-            &message,
+            &message_refs,
             job.user_name.clone(),
             job.channel.clone(),
             is_admin,
@@ -1003,8 +1290,28 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             parent_key,
             parent_label,
             job.custom_role.clone(),
-        )
-        .await;
+        ));
+        // `interrupt` is a no-op when the run has already concluded — or has not
+        // registered itself yet — and that message is then answered by the next
+        // turn as usual.
+        let (mut agent, response) = loop {
+            tokio::select! {
+                done = &mut turn => break done,
+                pulled = rx.recv(), if queue_open => match pulled {
+                    Some(next) => {
+                        let urgent_job = next.urgent;
+                        waiting.push_back(next);
+                        if urgent_job && !crate::shutdown::aborting() {
+                            crate::agent::registry::AGENT_REGISTRY.interrupt(&agent_id);
+                        }
+                    }
+                    None => queue_open = false,
+                },
+                () = urgent.changed.notified(), if !crate::shutdown::aborting() => {
+                    crate::agent::registry::AGENT_REGISTRY.interrupt(&agent_id);
+                },
+            }
+        };
 
         // ── Stop typing ───────────────────────────────────────────────
         for (cancel, handle) in typing_tasks {
@@ -1061,6 +1368,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                     .await;
             }
             confirm_pending_delivery(&job).await;
+            confirm_turn_delivery(&queued).await;
             continue;
         };
 
@@ -1068,6 +1376,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         // new input — deliver nothing (no empty bubble, no failure emoji), but
         // still confirm the at-least-once pending-jobs boundary.
         if agent.sleep_ended {
+            confirm_turn_delivery(&queued).await;
             confirm_pending_delivery(&job).await;
             continue;
         }
@@ -1121,6 +1430,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                 }
             }
         }
+        confirm_turn_delivery(&queued).await;
         confirm_pending_delivery(&job).await;
 
         // A long-lived chat role's session over a summary trigger compacts here,
@@ -1176,6 +1486,16 @@ async fn confirm_pending_delivery(job: &AgentJob) {
                 );
             }
         }
+    }
+}
+
+/// Confirm the turn's earlier items too: each carries its own durable pending
+/// row (the same at-least-once boundary as the job that ended the batch), so a
+/// turn answering several messages reclaims them all. The last item is confirmed
+/// by the caller as before.
+async fn confirm_turn_delivery(queued: &[AgentJob]) {
+    for item in queued {
+        confirm_pending_delivery(item).await;
     }
 }
 
@@ -1327,6 +1647,7 @@ fn admin_assistant_job(
         originating_workspace: originating_workspace.map(str::to_string),
         custom_role: None,
         reply_to_custom: None,
+        urgent: false,
     }
 }
 
@@ -1381,6 +1702,7 @@ fn branch_job(content: String, asker: &Asker, kind: MessageKind) -> AgentJob {
         originating_workspace: None,
         custom_role: Some(asker.launch.clone()),
         reply_to_custom: None,
+        urgent: false,
     }
 }
 
@@ -1717,6 +2039,250 @@ mod tests {
 
     // ── Consumer loop lifecycle tests ─────────────────────────────────
 
+    /// The turn a queue forms ends with the first urgent message it holds: an
+    /// urgent one never overtakes what was already waiting and never brings a
+    /// later arrival with it.
+    #[test]
+    fn a_turn_ends_with_its_urgent_message_and_leaves_later_arrivals() {
+        let job = |content: &str, urgent: bool| {
+            let mut job = make_job(Role::Assistant, "ws", "alice", "gui");
+            job.content = content.to_string();
+            job.urgent = urgent;
+            job
+        };
+        let contents = |batch: &[AgentJob]| -> Vec<String> {
+            batch.iter().map(|job| job.content.clone()).collect()
+        };
+
+        // Nothing urgent: the one job at the front, everything behind it queued.
+        let mut waiting: std::collections::VecDeque<_> =
+            [job("one", false), job("two", false)].into();
+        assert_eq!(contents(&take_turn_batch(&mut waiting)), ["one"]);
+        assert_eq!(waiting.len(), 1, "the rest keeps its turn");
+
+        // An urgent message behind two waiting ones takes them with it, itself
+        // last; a later arrival stays queued.
+        let mut waiting: std::collections::VecDeque<_> = [
+            job("one", false),
+            job("two", false),
+            job("urgent", true),
+            job("later", false),
+        ]
+        .into();
+        let batch = take_turn_batch(&mut waiting);
+        assert_eq!(contents(&batch), ["one", "two", "urgent"]);
+        assert_eq!(waiting.len(), 1, "a later arrival is not pulled forward");
+
+        // An urgent message at the front is a turn of its own.
+        let mut waiting: std::collections::VecDeque<_> = [job("urgent", true)].into();
+        assert_eq!(contents(&take_turn_batch(&mut waiting)), ["urgent"]);
+        assert!(waiting.is_empty());
+
+        // Two urgent messages are two turns, in arrival order: the first closes
+        // its batch, the second closes the next one.
+        let mut waiting: std::collections::VecDeque<_> = [
+            job("urgent-a", true),
+            job("urgent-b", true),
+            job("later", false),
+        ]
+        .into();
+        assert_eq!(contents(&take_turn_batch(&mut waiting)), ["urgent-a"]);
+        assert_eq!(contents(&take_turn_batch(&mut waiting)), ["urgent-b"]);
+        assert_eq!(contents(&take_turn_batch(&mut waiting)), ["later"]);
+    }
+
+    /// An announcement is outstanding exactly until it is taken by the turn that
+    /// waits for it: it is never waited for twice.
+    #[test]
+    fn an_announcement_is_waited_for_once() {
+        let arrivals = UrgentArrivals::default();
+        assert!(arrivals.take().is_empty());
+        let announcement = arrivals.announce();
+        let second = arrivals.announce();
+        assert_eq!(
+            arrivals.take().len(),
+            2,
+            "both announcements are outstanding"
+        );
+        assert!(
+            arrivals.take().is_empty(),
+            "a taken announcement is not waited for again"
+        );
+        drop(announcement);
+        drop(second);
+    }
+
+    /// The turn waits for an announced urgent message and takes it last,
+    /// together with whatever reached the queue while it held.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // the hold observes the process-global drain flag
+    async fn a_pending_announcement_holds_the_turn_for_its_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let urgent = UrgentArrivals::default();
+        let announcement = urgent.announce();
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = tx.send(job_with_content("ordinary", false));
+            let _ = tx.send(job_with_content("urgent", true));
+            // The hand-over completed: the wait ends with it.
+            drop(announcement);
+        });
+
+        let mut waiting = std::collections::VecDeque::new();
+        let kept = hold_for_urgent(
+            &mut waiting,
+            &urgent,
+            &mut rx,
+            &CancellationToken::new(),
+            "test",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        sender.await.expect("the sender must not panic");
+
+        assert!(kept, "the hold ended on its own message, not on a stop");
+        let contents: Vec<&str> = waiting.iter().map(|job| job.content.as_str()).collect();
+        assert_eq!(contents, ["ordinary", "urgent"]);
+    }
+
+    /// A hand-over that never arrives is given up after its window instead of
+    /// parking the queue, and a staging task that is gone ends the wait at once.
+    #[tokio::test]
+    #[serial_test::serial(drain)] // the hold observes the process-global drain flag
+    async fn an_announcement_that_never_arrives_is_given_up() {
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        let urgent = UrgentArrivals::default();
+        let shutdown = CancellationToken::new();
+        let hold = std::time::Duration::from_millis(50);
+        let mut waiting = std::collections::VecDeque::new();
+
+        let _lost = urgent.announce();
+        let started = std::time::Instant::now();
+        assert!(hold_for_urgent(&mut waiting, &urgent, &mut rx, &shutdown, "test", hold).await);
+        assert!(
+            started.elapsed() >= hold,
+            "the announced message had its whole window"
+        );
+        assert!(waiting.is_empty());
+        assert!(
+            urgent.take().is_empty(),
+            "the wait gave the announcement up"
+        );
+
+        // The staging task is gone before handing the message over: nothing is
+        // coming, so the turn is not held at all.
+        let gone = urgent.announce();
+        drop(gone);
+        let started = std::time::Instant::now();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                hold_for_urgent(
+                    &mut waiting,
+                    &urgent,
+                    &mut rx,
+                    &shutdown,
+                    "test",
+                    std::time::Duration::from_secs(600)
+                )
+            )
+            .await
+            .expect("a hand-over that will never arrive must not hold the queue")
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a hand-over that will never arrive must not hold the queue"
+        );
+        assert!(urgent.take().is_empty(), "and nothing is left outstanding");
+    }
+
+    /// A drain ends the hold at once instead of parking the queue for a message
+    /// the consumer will not run.
+    #[tokio::test]
+    #[serial_test::serial(drain)]
+    async fn a_drain_ends_the_urgent_hold() {
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        let urgent = UrgentArrivals::default();
+        let _announcement = urgent.announce();
+        let mut waiting = std::collections::VecDeque::new();
+
+        crate::shutdown::drain_begin();
+        let kept = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            hold_for_urgent(
+                &mut waiting,
+                &urgent,
+                &mut rx,
+                &CancellationToken::new(),
+                "test",
+                std::time::Duration::from_secs(600),
+            ),
+        )
+        .await
+        .expect("a drain ends the hold");
+        crate::shutdown::drain_clear();
+
+        assert!(!kept, "a drain stops the consumer, so nothing holds it");
+    }
+
+    /// An announcement lands on the addressed agent's consumer only — and on
+    /// no agent at all when that agent has no consumer (nothing was running).
+    #[tokio::test]
+    async fn announce_urgent_reaches_the_addressed_consumer() {
+        let _ = init_global();
+        let agent_id = format!("_test_announce_{}", crate::generate_suffix());
+        let _rx = register_agent(&agent_id);
+        let other = format!("_test_announce_other_{}", crate::generate_suffix());
+        let _other_rx = register_agent(&other);
+
+        let announcement = announce_urgent(&agent_id).expect("the consumer is running");
+
+        let arrivals = |id: &str| -> Arc<UrgentArrivals> {
+            Arc::clone(
+                &ROUTER
+                    .get()
+                    .expect("router initialised")
+                    .read()
+                    .unwrap_poison()
+                    .get(id)
+                    .expect("consumer registered")
+                    .urgent,
+            )
+        };
+        assert_eq!(
+            arrivals(&agent_id).take().len(),
+            1,
+            "the addressed consumer waits for the message"
+        );
+        assert!(
+            arrivals(&other).take().is_empty(),
+            "another agent's consumer is untouched"
+        );
+
+        // No consumer: the message is answered by the next turn that is started
+        // for that agent, and the announcement is not an error.
+        assert!(
+            announce_urgent(&format!(
+                "_test_announce_absent_{}",
+                crate::generate_suffix()
+            ))
+            .is_none()
+        );
+
+        drop(announcement);
+        unregister_agent(&agent_id);
+        unregister_agent(&other);
+    }
+
+    /// A minimal job carrying `content` and the urgent mark.
+    fn job_with_content(content: &str, urgent: bool) -> AgentJob {
+        AgentJob {
+            content: content.to_string(),
+            urgent,
+            ..make_job(Role::Assistant, "ws", "alice", "gui")
+        }
+    }
+
     /// Shortcut to construct a minimal [`AgentJob`] for lifecycle tests.
     fn make_job(role: Role, workspace: &str, user: &str, channel: &str) -> AgentJob {
         AgentJob {
@@ -1731,6 +2297,7 @@ mod tests {
             originating_workspace: None,
             custom_role: None,
             reply_to_custom: None,
+            urgent: false,
         }
     }
 
@@ -1793,12 +2360,13 @@ mod tests {
         // Re-insert a dummy sender so the consumer's cleanup wrapper has an
         // entry to remove (proving it actually runs after the consumer exits).
         let (dummy_tx, _) = mpsc::unbounded_channel::<AgentJob>();
-        ROUTER
-            .get()
-            .unwrap()
-            .write()
-            .unwrap_poison()
-            .insert(id.to_string(), dummy_tx);
+        ROUTER.get().unwrap().write().unwrap_poison().insert(
+            id.to_string(),
+            Consumer {
+                jobs: dummy_tx,
+                urgent: Arc::new(UrgentArrivals::default()),
+            },
+        );
 
         // Poll until the consumer loop exits and its cleanup wrapper removes
         // the dummy entry.
@@ -1981,6 +2549,7 @@ mod tests {
             originating_workspace: None,
             custom_role: None,
             reply_to_custom: None,
+            urgent: false,
         };
 
         deliver_single_user_response(
@@ -2390,6 +2959,7 @@ mod tests {
             originating_workspace: None,
             custom_role: None,
             reply_to_custom: None,
+            urgent: false,
         };
 
         deliver_unregistered_user_response(

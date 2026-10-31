@@ -646,6 +646,13 @@ pub struct ChannelMessage {
     /// any typed one; the only difference is the dispatch log line, which names
     /// such a message without its content — spoken words stay out of the logs.
     pub dictated: bool,
+    /// True when the text the user typed for this message opened with the
+    /// urgent mark, which the surface consumed before composing `content` (see
+    /// `channels::take_urgent`). The message then cuts the Assistant's running
+    /// turn instead of waiting behind it. Only a surface a user types into can
+    /// set it: everything the product composes or routes — notices, command-line
+    /// hand-offs, automation and tool messages — leaves it `false`.
+    pub urgent: bool,
 }
 
 /// An outbound message to deliver on a channel.
@@ -1186,6 +1193,14 @@ pub struct Agent {
     /// tool-batch context via
     /// [`crate::agent::CURRENT_TOOL_BACKGROUND_SESSIONS`].
     background_sessions: std::sync::Arc<crate::tools::shell::BackgroundSessions>,
+    /// Fired by [`crate::agent::registry::AgentRegistry::interrupt`] when an
+    /// urgent user message arrives for this agent: the turn is cut where it
+    /// stands — a pending model request or tool call is dropped — and ends with
+    /// its interruption notice instead of an answer. Never a cancellation: it
+    /// leaves [`Self::cancel_token`] untouched, so the turn still settles its
+    /// tool results and finalizes its session. One token per turn (it dies with
+    /// the agent), so an urgent message interrupts at most the turn it cuts.
+    pub(crate) interrupt_token: CancellationToken,
 }
 
 // ── Verdict type ─────────────────────────────────────────────────

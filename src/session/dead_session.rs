@@ -538,6 +538,7 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
         // (`Launch::reply_to`), read by the report path; this field's remaining
         // user is the Manager leg.
         reply_to_custom: None,
+        urgent: false,
     };
 
     crate::agent::message_router::route(agent_id, job);
@@ -1033,6 +1034,7 @@ mod tests {
             "engineer".into(),
             None,
             &ws,
+            tokio_util::sync::CancellationToken::new(),
             tokio_util::sync::CancellationToken::new(),
             None,
             None,

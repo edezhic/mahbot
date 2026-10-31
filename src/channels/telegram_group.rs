@@ -267,6 +267,8 @@ enum Release {
     CharCap,
     /// Control input in that chat released the group ahead of itself.
     Control,
+    /// An urgent message in that chat released the group and left with it.
+    Urgent,
     /// The listener is going away.
     Stop,
 }
@@ -280,6 +282,7 @@ impl Release {
             Self::PartCap => "part_cap",
             Self::CharCap => "char_cap",
             Self::Control => "control",
+            Self::Urgent => "urgent",
             Self::Stop => "stop",
         }
     }
@@ -394,14 +397,18 @@ impl Collector {
         })
     }
 
-    /// Every open group of one account in one chat/thread — the group a control
-    /// message arriving in that chat is handed over ahead of, so a state-clearing
-    /// command does not land in front of it. Order is preserved only as enqueue
-    /// order: the group is put on the pipeline before the control message is.
-    fn release_chat(&mut self, user_name: &str, reply_target: &str) -> Vec<Released> {
-        self.take_where(|group| {
-            (group.key() == (user_name, reply_target)).then_some(Release::Control)
-        })
+    /// Every open group of one account in one chat/thread, released by
+    /// `release` — the group a control message arriving in that chat is handed
+    /// over ahead of, and the one an urgent message leaves with. Order is
+    /// preserved only as enqueue order: the group is put on the pipeline before
+    /// the message that released it is.
+    fn release_chat(
+        &mut self,
+        user_name: &str,
+        reply_target: &str,
+        release: Release,
+    ) -> Vec<Released> {
+        self.take_where(|group| (group.key() == (user_name, reply_target)).then_some(release))
     }
 
     /// Every open group — the listener is going away.
@@ -438,7 +445,8 @@ impl Collector {
 /// part — every part carries the same one, so any of them speaks for the group.
 /// `content` belongs to the parts. The record entries the parts stand for are
 /// moved onto the envelope, which is what the hand-over settles: a part does not
-/// keep entries the envelope already carries.
+/// keep entries the envelope already carries. The envelope is urgent when any of
+/// its parts is.
 fn group_message(mut parts: Vec<ChannelMessage>) -> ChannelMessage {
     // A released group always holds at least one part (see `OpenGroup`).
     let newest = parts
@@ -451,12 +459,14 @@ fn group_message(mut parts: Vec<ChannelMessage>) -> ChannelMessage {
         .iter_mut()
         .flat_map(|part| std::mem::take(&mut part.update_ids))
         .collect();
+    let urgent = parts.iter().any(|part| part.urgent);
     ChannelMessage {
         user_name,
         reply_target,
         channel,
         parts,
         update_ids,
+        urgent,
         ..Default::default()
     }
 }
@@ -546,8 +556,9 @@ async fn run_collector(
 
 /// Take one part from the listener: control input is never collected — the group
 /// open in that chat goes on the pipeline ahead of it — and joins no burst, so
-/// it is handed over without a record; everything else joins the burst of its
-/// sender in that chat.
+/// it is handed over without a record; an urgent message is never collected
+/// either, leaving at once with whatever group was open ahead of it; everything
+/// else joins the burst of its sender in that chat.
 async fn absorb(
     collector: &mut Collector,
     output: &mpsc::Sender<ChannelMessage>,
@@ -558,7 +569,7 @@ async fn absorb(
         if !hand_over_all(
             output,
             intake,
-            collector.release_chat(&msg.user_name, &msg.reply_target),
+            collector.release_chat(&msg.user_name, &msg.reply_target, Release::Control),
         )
         .await
         {
@@ -566,6 +577,20 @@ async fn absorb(
         }
         // Control input is never collected: there is no group to record.
         return send_to_pipeline(output, intake, msg).await;
+    }
+    // An urgent message never waits for a burst: the parts collected before it
+    // go out with it, in their order, and it is the last of them.
+    if msg.urgent {
+        let mut released =
+            collector.release_chat(&msg.user_name, &msg.reply_target, Release::Urgent);
+        match released.last_mut() {
+            Some(group) => group.parts.push(Part::new(msg)),
+            None => released.push(Released {
+                parts: vec![Part::new(msg)],
+                release: Release::Urgent,
+            }),
+        }
+        return hand_over_all(output, intake, released).await;
     }
     if let Some(released) = collector.push(msg, Instant::now())
         && !hand_over(output, intake, released).await
@@ -782,7 +807,7 @@ mod tests {
 
         // A control message's chat releases that conversation's group only: the
         // other chats' half-collected bursts keep waiting for their own window.
-        let released = collector.release_chat("alice", "chat-a");
+        let released = collector.release_chat("alice", "chat-a", Release::Control);
         assert_eq!(released.len(), 1);
         assert_eq!(released[0].parts.len(), 2);
         assert_eq!(released[0].parts[0].message.content, "a1");
@@ -837,6 +862,51 @@ mod tests {
         assert!(group.content.is_empty());
         let command = released(&mut output_rx).await;
         assert_eq!(command.content, "/clear");
+    }
+
+    /// An urgent message never waits for a burst: the parts collected before it
+    /// go out with it, in their order, and it is the last of them.
+    #[tokio::test]
+    async fn collector_hands_an_urgent_message_over_at_once_with_the_open_group() {
+        let (output, mut output_rx) = mpsc::channel(8);
+        let (intake, _store, _dir) = test_intake().await;
+        let mut collector = Collector::default();
+
+        collector.push(part("alice", "chat", "one"), Instant::now());
+        collector.push(part("alice", "chat", "two"), Instant::now());
+        assert!(
+            collector.deadline().is_some(),
+            "the open group is waiting on its window"
+        );
+
+        let mut urgent = part("alice", "chat", "now");
+        urgent.urgent = true;
+        assert!(absorb(&mut collector, &output, &intake, urgent).await);
+
+        // Nothing advanced the clock: the group is already on the pipeline.
+        let group = output_rx
+            .try_recv()
+            .expect("the urgent message was handed over at once");
+        let contents: Vec<&str> = group
+            .parts
+            .iter()
+            .map(|part| part.content.as_str())
+            .collect();
+        assert_eq!(contents, ["one", "two", "now"]);
+        assert!(group.urgent, "the envelope is urgent when a part is");
+        assert_eq!(collector.deadline(), None, "nothing is left waiting");
+
+        // With no group open, the urgent message is a group of its own — a
+        // one-part release is that message, moved rather than wrapped.
+        let mut solo = part("alice", "chat", "solo");
+        solo.urgent = true;
+        assert!(absorb(&mut collector, &output, &intake, solo).await);
+        let group = output_rx
+            .try_recv()
+            .expect("the urgent message is handed over at once");
+        assert!(group.parts.is_empty(), "a one-part release is the message");
+        assert_eq!(group.content, "solo");
+        assert!(group.urgent);
     }
 
     #[tokio::test]

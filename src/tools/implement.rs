@@ -179,7 +179,7 @@ pub(crate) async fn run_implement_with_job(
         Role::Worker,
         ws,
         None,
-        if has_session { "" } else { task },
+        &[if has_session { "" } else { task }],
         args.user_name.to_string(),
         args.channel.to_string(),
         false,

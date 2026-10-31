@@ -913,6 +913,7 @@ fn notify_manager_system(ws_name: &str, content: String) {
             originating_workspace: None,
             custom_role: None,
             reply_to_custom: None,
+            urgent: false,
         },
     );
 }
@@ -1169,6 +1170,7 @@ async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
             originating_workspace: None,
             custom_role: None,
             reply_to_custom: None,
+            urgent: false,
         },
     );
 }
@@ -1461,7 +1463,7 @@ async fn run_parallel_agents(
                         role,
                         &ws,
                         Some(&ticket),
-                        if has_session { "" } else { &task },
+                        &[if has_session { "" } else { task.as_str() }],
                         String::new(),
                         String::new(),
                         false,
@@ -1629,7 +1631,7 @@ async fn run_single_agent(
         role,
         ws,
         Some(ticket),
-        message,
+        &[message],
         String::new(),
         String::new(),
         false,

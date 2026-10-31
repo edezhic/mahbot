@@ -158,6 +158,10 @@ struct AgentEntry {
     generation: u64,
     handle: AgentHandle,
     cancel_token: CancellationToken,
+    /// The turn's urgent-message interrupt — see
+    /// [`AgentRegistry::interrupt`]. Fired, never removed: it dies with the
+    /// entry.
+    interrupt_token: CancellationToken,
     /// Whether a workspace-pause (strict freeze) cancellation was requested for
     /// this agent. Set by [`AgentRegistry::cancel_by_workspace_pause`] when the
     /// agent's workspace is paused — a FREEZE distinct from a code-driven
@@ -210,6 +214,10 @@ impl AgentRegistry {
     /// `parent_label` is the human-readable label of the agent's DIRECT PARENT
     /// INVOCATION (ticket title / analyze question / research question) for the
     /// Running Agents group header — purely presentational.
+    ///
+    /// `interrupt_token` is the turn's urgent-message interrupt, stored so the
+    /// router can fire it by agent id without knowing the run (see
+    /// [`Self::interrupt`]).
     #[expect(clippy::too_many_arguments)] // one positional arg per handle field; callers use literals
     pub fn register(
         &self,
@@ -218,6 +226,7 @@ impl AgentRegistry {
         ticket_id: Option<String>,
         ws: &crate::Workspace,
         cancel_token: CancellationToken,
+        interrupt_token: CancellationToken,
         parent_key: Option<ParentKey>,
         parent_label: Option<String>,
         pause_stop: Arc<AtomicBool>,
@@ -248,12 +257,27 @@ impl AgentRegistry {
                 generation,
                 handle,
                 cancel_token,
+                interrupt_token,
                 pause_stop,
                 activity: None,
             },
         );
         publish(RuntimeEvent::Registries);
         generation
+    }
+
+    /// Cut the turn an urgent user message interrupted: fire the interrupt of
+    /// the agent running under `agent_id`, if any. Not a cancellation: the token
+    /// is the turn's own (the agent's `interrupt_token`), so the run settles its
+    /// in-flight tool calls and finalizes its session. A turn that has already
+    /// concluded — or no run at all, which is also the instant before a
+    /// dispatched run registers itself — has nothing to cut, and the message is
+    /// answered by the next turn as usual.
+    pub fn interrupt(&self, agent_id: &str) {
+        let map = self.inner.lock().unwrap_poison();
+        if let Some(entry) = map.get(agent_id) {
+            entry.interrupt_token.cancel();
+        }
     }
 
     /// Register a live activity label on a running agent's card (e.g.
@@ -686,6 +710,7 @@ mod tests {
             None,
             &ws,
             CancellationToken::new(),
+            CancellationToken::new(),
             None,
             None,
             std::sync::Arc::new(AtomicBool::new(false)),
@@ -810,6 +835,7 @@ mod tests {
                 None,
                 &ws,
                 CancellationToken::new(),
+                CancellationToken::new(),
                 Some(parent),
                 None,
                 std::sync::Arc::new(AtomicBool::new(false)),
@@ -843,6 +869,41 @@ mod tests {
         );
         AGENT_REGISTRY.deregister(&b1, gen_b);
         let _ = (gen_a1, gen_a2);
+    }
+
+    #[test]
+    fn interrupt_fires_the_turns_own_token_and_nothing_else() {
+        let agent_id = format!("interrupt_token_{}", crate::generate_suffix());
+        let ws = crate::Workspace {
+            name: agent_id.clone(),
+            path: "/tmp/ws_interrupt".to_string(),
+            ..Default::default()
+        };
+        let cancel_token = CancellationToken::new();
+        let interrupt_token = CancellationToken::new();
+        let generation = AGENT_REGISTRY.register(
+            agent_id.clone(),
+            "assistant".to_string(),
+            None,
+            &ws,
+            cancel_token.clone(),
+            interrupt_token.clone(),
+            None,
+            None,
+            std::sync::Arc::new(AtomicBool::new(false)),
+        );
+
+        AGENT_REGISTRY.interrupt(&agent_id);
+        assert!(interrupt_token.is_cancelled(), "the running turn is cut");
+        assert!(
+            !cancel_token.is_cancelled(),
+            "a cut is not a cancellation of the agent"
+        );
+
+        // A turn that has already concluded — or never registered — has nothing
+        // to cut, and saying so is not an error.
+        AGENT_REGISTRY.deregister(&agent_id, generation);
+        AGENT_REGISTRY.interrupt(&agent_id);
     }
 
     #[test]

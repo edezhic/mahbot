@@ -27,6 +27,7 @@ fn launch_job(
         originating_workspace: None,
         custom_role: Some(launch),
         reply_to_custom: None,
+        urgent: false,
     }
 }
 

@@ -95,11 +95,15 @@ fn is_dangling_tool_call_frame(role: ChatRole, content: &str) -> bool {
 }
 
 /// Select the latest [`RETENTION_PER_SIDE`] user messages and assistant answers
-/// from `history`, merged in chronological order. Tool-call frames and tool
-/// results are excluded from both sides. The newest user message is always
-/// among them — callers must not re-append it separately.
+/// from `history`, merged in chronological order, plus everything from
+/// `keep_from` on. Tool-call frames and tool results are excluded from both
+/// sides. The newest user message is always among them — callers must not
+/// re-append it separately. `keep_from` is the index the turn in flight starts
+/// at: a turn answering several messages reaches the model in full, so nothing
+/// it carries is summarised away before it is read. Pass `history.len()` when no
+/// turn is in flight.
 #[must_use]
-fn select_retention_window(history: &[ChatMessage]) -> Vec<ChatMessage> {
+fn select_retention_window(history: &[ChatMessage], keep_from: usize) -> Vec<ChatMessage> {
     let mut users: Vec<(usize, &ChatMessage)> = Vec::new();
     let mut assistants: Vec<(usize, &ChatMessage)> = Vec::new();
     for (idx, msg) in history.iter().enumerate().rev() {
@@ -117,7 +121,9 @@ fn select_retention_window(history: &[ChatMessage]) -> Vec<ChatMessage> {
         }
     }
     let mut selected: Vec<(usize, &ChatMessage)> = users.into_iter().chain(assistants).collect();
+    selected.extend((keep_from.min(history.len())..history.len()).map(|idx| (idx, &history[idx])));
     selected.sort_by_key(|(idx, _)| *idx);
+    selected.dedup_by_key(|(idx, _)| *idx);
     selected.into_iter().map(|(_, m)| m.clone()).collect()
 }
 
@@ -2065,6 +2071,7 @@ mod tests {
                 "tester",
                 None,
                 false,
+                true,
             )
             .await
             .unwrap();
@@ -2716,21 +2723,39 @@ mod tests {
             (pairs, &["u2", "a2", "u3", "a3", "u4", "a4"]),
         ];
         for (messages, expected) in &cases {
-            let window = select_retention_window(messages);
+            let window = select_retention_window(messages, messages.len());
             let contents: Vec<&str> = window.iter().map(|m| m.content.as_str()).collect();
             assert_eq!(contents, *expected, "unexpected retention window");
         }
         // In-flight message appears exactly once — no duplicate re-append.
         assert_eq!(
-            select_retention_window(&cases[0].0)
+            select_retention_window(&cases[0].0, cases[0].0.len())
                 .iter()
                 .filter(|m| m.content == "u3")
                 .count(),
             1
         );
 
+        // A turn carrying several messages keeps all of them, whatever the
+        // per-side quota: nothing it carries is summarised away before it is read.
+        let combined = vec![
+            ChatMessage::system("prompt"),
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user("turn-1"),
+            ChatMessage::user("turn-2"),
+            ChatMessage::user("turn-3"),
+            ChatMessage::user("turn-4"),
+        ];
+        let turn_start = combined.len() - 4;
+        let kept: Vec<String> = select_retention_window(&combined, turn_start)
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(kept, ["a1", "turn-1", "turn-2", "turn-3", "turn-4"]);
+
         // First turn: no assistant answers → users only.
-        let window = select_retention_window(&[ChatMessage::user("u1")]);
+        let window = select_retention_window(&[ChatMessage::user("u1")], 1);
         assert_eq!(window.len(), 1);
         assert_eq!(window[0].content, "u1");
 
@@ -2745,8 +2770,10 @@ mod tests {
             crate::providers::reasoning::assistant_replay_payload(Some(""), &[], Some(&reasoning))
                 .to_string(),
         );
-        let window =
-            select_retention_window(&[reasoning_msg, ChatMessage::assistant("{\"result\": 42}")]);
+        let window = select_retention_window(
+            &[reasoning_msg, ChatMessage::assistant("{\"result\": 42}")],
+            2,
+        );
         assert_eq!(window.len(), 2);
     }
 

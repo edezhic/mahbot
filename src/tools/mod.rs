@@ -1275,6 +1275,7 @@ impl SyncDurableCore {
                         originating_workspace: None,
                         custom_role: custom,
                         reply_to_custom: None,
+                        urgent: false,
                     }
                 }
             };

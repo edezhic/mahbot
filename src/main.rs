@@ -1304,6 +1304,7 @@ async fn deliver_clear_reply(
             originating_workspace: None,
             custom_role: None,
             reply_to_custom: None,
+            urgent: false,
         },
         &effective_role,
         &[],
@@ -1611,6 +1612,10 @@ async fn process_channel_message(msg: ChannelMessage) {
     let user_name = msg.user_name.clone();
     let channel = msg.channel.clone();
     let reply_target = msg.reply_target.clone();
+    // The urgency the surface decided when it took the mark off the text the
+    // user typed — the envelope carries it for a lone message, an album and a
+    // collected burst alike (see `channels::take_urgent`).
+    let urgent = msg.urgent;
     let mut parts = if msg.parts.is_empty() {
         vec![msg]
     } else {
@@ -1631,6 +1636,25 @@ async fn process_channel_message(msg: ChannelMessage) {
     for part in &mut parts {
         part.workspace.clone_from(&ws.name);
     }
+
+    // An urgent message cuts the assistant's running turn NOW — on staging,
+    // before anything about this message is understood, so the cut never waits
+    // for its attachments to be extracted or transcribed. The message itself is
+    // routed below once it is composed; the turn it creates answers it together
+    // with everything that was already waiting. The guard is held until that
+    // hand-over: dropping it — here or on a task that died first — ends the wait
+    // the announcement started.
+    let announcement = if urgent && !mahbot::shutdown::aborting() {
+        mahbot::agent::message_router::announce_urgent(
+            &mahbot::agent::message_router::user_message_agent_id(
+                &user_name,
+                mahbot::Role::Assistant,
+                &ws.name,
+            ),
+        )
+    } else {
+        None
+    };
 
     // The raw user-typed text of every part, so chat_history stores what the
     // user wrote rather than the enriched form (which can carry large data URIs
@@ -1725,6 +1749,9 @@ async fn process_channel_message(msg: ChannelMessage) {
         channel,
         mahbot::Role::Assistant,
         Some(reply_target),
+        urgent,
     )
     .await;
+    // The message is in the queue: the turn cut for it can stop waiting.
+    drop(announcement);
 }

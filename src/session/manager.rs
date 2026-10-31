@@ -158,6 +158,51 @@ impl Session {
         Ok(())
     }
 
+    /// Append a turn's messages and session context into the loaded session.
+    /// A turn answers one message, or several when an urgent message cut the
+    /// previous turn and brought everything already waiting with it: each lands
+    /// as its own user message, in arrival order, and the model reads them as
+    /// consecutive messages.
+    ///
+    /// The per-turn blocks — the personal-workspace report, the model-change
+    /// line, the activity line — ride the FIRST message only, so a turn carrying
+    /// several never repeats them.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn append_turn_messages(
+        &mut self,
+        agent_id: &str,
+        messages: &[&str],
+        ws: &Workspace,
+        role: &Role,
+        ticket: Option<&crate::pipeline::board::Ticket>,
+        channel: &str,
+        user_name: &str,
+        round_ts: Option<&str>,
+        is_admin: bool,
+    ) -> Result<()> {
+        let present: Vec<&str> = messages
+            .iter()
+            .copied()
+            .filter(|message| !message.is_empty())
+            .collect();
+        for (at, message) in present.iter().enumerate() {
+            self.append_turn_message(
+                agent_id,
+                message,
+                ws,
+                role,
+                ticket,
+                channel,
+                user_name,
+                round_ts,
+                is_admin,
+                at == 0,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Append this turn's user message and session context into the loaded
     /// session. Moves the message-append half of [`init`](Self::init) here so
     /// the orchestrator can run the universal resume-completion step in between
@@ -165,6 +210,9 @@ impl Session {
     /// dangling tool calls are settled directly after their frame, and only then
     /// does the user message land. An empty `msg` is a no-op (RecoveryRetry
     /// re-triggers against the existing history without adding a turn).
+    ///
+    /// `turn_first` says whether this message is its turn's first — the per-turn
+    /// blocks ride only that one (see [`Self::append_turn_messages`]).
     ///
     /// `round_ts` pins the timestamp of the appended user message (one value
     /// per round for byte-identical first messages across parallel members);
@@ -181,6 +229,7 @@ impl Session {
         user_name: &str,
         round_ts: Option<&str>,
         is_admin: bool,
+        turn_first: bool,
     ) -> Result<()> {
         if !msg.is_empty() {
             let is_new = self.history.is_empty();
@@ -194,15 +243,25 @@ impl Session {
             // counts, never a path — so it cannot say what the user just touched,
             // and a session truncated from the Sessions page takes this path with
             // its baseline intact.
-            let (content, new_snapshot) = if !is_new && matches!(role, Role::Assistant) {
-                Self::prepend_model_change(agent_id, msg, user_name).await
+            //
+            // Every block here is per-turn, not per-message: on a turn carrying
+            // several messages they ride the first one only.
+            let (content, new_snapshot) =
+                if turn_first && !is_new && matches!(role, Role::Assistant) {
+                    Self::prepend_model_change(agent_id, msg, user_name).await
+                } else {
+                    (msg.to_string(), None)
+                };
+            let content = if turn_first {
+                crate::session::personal_changes::prepend_changes(&content, ws, role).await
             } else {
-                (msg.to_string(), None)
+                content
             };
-            let content =
-                crate::session::personal_changes::prepend_changes(&content, ws, role).await;
-            let (content, activity) =
-                super::activity::prepend(&content, agent_id, role, is_admin).await;
+            let (content, activity) = if turn_first {
+                super::activity::prepend(&content, agent_id, role, is_admin).await
+            } else {
+                (content, None)
+            };
 
             if is_new {
                 let (msgs, snapshot) = Self::build_turn_messages(
@@ -617,7 +676,8 @@ impl Session {
     /// containing a fresh system prompt (via `build_context_messages`), the
     /// given `summary_text`, and the latest [`super::RETENTION_PER_SIDE`]
     /// user messages + assistant answers from the pre-compaction history
-    /// (tool traffic excluded — see `select_retention_window`).
+    /// (tool traffic excluded — see `select_retention_window`), plus every
+    /// message from `turn_start` on.
     ///
     /// Before persisting, the messages this compaction deletes are dumped to
     /// a file via [`super::compaction_dump`] and the dump path is appended to
@@ -644,6 +704,7 @@ impl Session {
         ticket: Option<&crate::pipeline::board::Ticket>,
         is_admin: bool,
         user_name: &str,
+        turn_start: usize,
     ) {
         // Build fresh system prompt (may have changed since session start).
         let (mut compacted, snapshot) = Self::build_context_messages(
@@ -665,7 +726,7 @@ impl Session {
         // in-flight one on a pre-turn compaction, the answered one on a
         // post-delivery one) — no separate re-append here.
         let prefix = load_prompt("context/summary_prefix.md");
-        let retained = crate::session::select_retention_window(&self.history);
+        let retained = crate::session::select_retention_window(&self.history, turn_start);
         // Dump what this compaction deletes BEFORE persisting, so the path
         // rides inside the persisted summary message; a persist failure then
         // orphans the dump (accepted: an orphan is dead weight — its lifecycle
@@ -2175,6 +2236,7 @@ mod tests {
                     "tester",
                     None,
                     false,
+                    true,
                 )
                 .await
                 .unwrap();

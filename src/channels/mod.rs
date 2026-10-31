@@ -30,6 +30,7 @@ use crate::util::UnwrapPoison;
 use crate::{Channel, ChannelMessage, ChatDirection, SendMessage};
 use async_trait::async_trait;
 use enrichment::has_inbound_temp_marker;
+use std::borrow::Cow;
 // The voice channel (macOS-only) is the only `Arc` user in this module.
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
@@ -37,6 +38,24 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
+
+/// Take the urgent mark off the text a user typed: a leading `!`, after any
+/// spaces, tabs and blank lines, marks the message urgent and is consumed with
+/// that leading whitespace; every other message is returned exactly as written.
+///
+/// Read on the text the user typed and nothing else — a caption rather than the
+/// attachment markers the surface composes around it, never a transcript or a
+/// forward prefix — so no product-added text can make a message urgent or make
+/// an urgent one ordinary. There is no escape: an ordinary message that opens
+/// with the mark is urgent, and loses its `!`.
+#[must_use]
+pub(crate) fn take_urgent(typed: &str) -> (Cow<'_, str>, bool) {
+    let rest = typed.trim_start();
+    match rest.strip_prefix('!') {
+        Some(marked) => (Cow::Owned(marked.trim_start().to_string()), true),
+        None => (Cow::Borrowed(typed), false),
+    }
+}
 
 /// Keep the optional self-hosted Telegram Bot API server alive, updated and
 /// clean, and finish any switch a crash interrupted. A no-op in the cloud mode
@@ -414,5 +433,32 @@ mod tests {
             channel_registry().get("voice").is_some(),
             "VoiceChannel should be findable by 'voice' name"
         );
+    }
+}
+
+#[cfg(test)]
+mod urgent_tests {
+    use super::take_urgent;
+
+    /// Only a `!` opening the typed text — after spaces, tabs and blank lines —
+    /// is the mark; it is consumed and everything else is left as written.
+    #[test]
+    fn take_urgent_reads_only_the_leading_mark() {
+        let bare_spaces = "   \t\n  !foo";
+        let multi_line = "\n\t  !foo";
+        for (typed, expected, urgent) in [
+            ("!foo", "foo", true),
+            (bare_spaces, "foo", true),
+            ("foo", "foo", false),
+            ("foo!bar", "foo!bar", false),
+            ("!foo !bar", "foo !bar", true),
+            ("!", "", true),
+            (multi_line, "foo", true),
+        ] {
+            let (text, got) = take_urgent(typed);
+            let text: &str = text.as_ref();
+            assert_eq!(text, expected, "typed {typed:?}");
+            assert_eq!(got, urgent, "typed {typed:?}");
+        }
     }
 }

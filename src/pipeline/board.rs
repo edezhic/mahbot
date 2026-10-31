@@ -1680,6 +1680,7 @@ impl BoardStore {
                 originating_workspace: None,
                 custom_role: None,
                 reply_to_custom: None,
+                urgent: false,
             };
 
             if crate::agent::message_router::try_route(&agent_id, job) {

@@ -674,6 +674,7 @@ pub(crate) async fn complete_durable_job(
         originating_workspace: None,
         custom_role: custom,
         reply_to_custom: None,
+        urgent: false,
     };
     // INSERT-failure policy: fall back to a non-durable best-effort route.
     if complete_job_with_envelope(&crate::session::store().conn, job_id, &envelope)

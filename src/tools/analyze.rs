@@ -605,7 +605,7 @@ async fn run_analyze_slots(
                     crate::Role::Analyst,
                     &ws,
                     None,
-                    if has_session { "" } else { task.as_str() },
+                    &[if has_session { "" } else { task.as_str() }],
                     String::new(),
                     String::new(),
                     false,

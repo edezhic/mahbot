@@ -100,9 +100,15 @@ pub enum ControlInput {
 
 /// Which control-plane input an inbound message carries, or `None` when the agent
 /// path handles it. A bot command counts only on Telegram: other channels route
-/// `/`-prefixed text as ordinary text.
+/// `/`-prefixed text as ordinary text. A message that opened with the urgent mark
+/// is never a command, whatever its consumed content reads.
 #[must_use]
 pub fn control_input(msg: &ChannelMessage) -> Option<ControlInput> {
+    // The mark was consumed from text that began with it, so `!/clear` arrives
+    // here as `/clear`; removing the mark must not turn it into a command.
+    if msg.urgent {
+        return None;
+    }
     if let Some(action) = decode_action(&msg.content) {
         return Some(ControlInput::Action(action));
     }
@@ -132,6 +138,8 @@ struct IncomingAttachment {
     caption: Option<String>,
     kind: IncomingAttachmentKind,
     mime_type: Option<String>,
+    /// The caption opened with the urgent mark, which was consumed from it.
+    urgent: bool,
 }
 
 /// The kind of incoming attachment (document, photo, video, audio, or recorded
@@ -365,6 +373,7 @@ impl MessageContext {
             forwarded: self.forwarded,
             update_ids: Vec::new(),
             dictated: false,
+            urgent: false,
         }
     }
 
@@ -2565,10 +2574,15 @@ impl TelegramChannel {
             .and_then(serde_json::Value::as_str)
             .map(String::from);
         let file_size = sub_obj.get("file_size").and_then(serde_json::Value::as_u64);
-        let caption = message
-            .get("caption")
-            .and_then(serde_json::Value::as_str)
-            .map(String::from);
+        // The caption is the text the user typed for an attachment, so this is
+        // where the urgent mark is read and consumed.
+        let (caption, urgent) = match message.get("caption").and_then(serde_json::Value::as_str) {
+            Some(caption) => {
+                let (caption, urgent) = crate::channels::take_urgent(caption);
+                (Some(caption.into_owned()), urgent)
+            }
+            None => (None, false),
+        };
         let mime_type = sub_obj
             .get("mime_type")
             .and_then(serde_json::Value::as_str)
@@ -2580,6 +2594,7 @@ impl TelegramChannel {
             caption,
             kind,
             mime_type,
+            urgent,
         })
     }
 
@@ -2633,7 +2648,7 @@ impl TelegramChannel {
         #[cfg(not(target_os = "macos"))]
         if attachment.kind == IncomingAttachmentKind::Voice {
             return Ok(Some(
-                self.reject_voice_message(ctx, attachment.caption.as_deref())
+                self.reject_voice_message(ctx, attachment.caption.as_deref(), attachment.urgent)
                     .await,
             ));
         }
@@ -2729,7 +2744,9 @@ impl TelegramChannel {
             let _ = write!(content, "\n\n{caption}");
         }
 
-        Ok(Some(ctx.into_attachment_message(content, staging_dir)))
+        let mut msg = ctx.into_attachment_message(content, staging_dir);
+        msg.urgent = attachment.urgent;
+        Ok(Some(msg))
     }
 
     /// Tell the user an attachment could not be taken and return the
@@ -2755,7 +2772,9 @@ impl TelegramChannel {
             reason,
             attachment.caption.as_deref(),
         );
-        self.refuse_with_notice(ctx, &notice, content).await
+        let mut msg = self.refuse_with_notice(ctx, &notice, content).await;
+        msg.urgent = attachment.urgent;
+        msg
     }
 
     /// Send the user-visible refusal `notice` — best-effort, a send failure is
@@ -2788,11 +2807,14 @@ impl TelegramChannel {
         &self,
         ctx: MessageContext,
         caption: Option<&str>,
+        urgent: bool,
     ) -> ChannelMessage {
         let notice = format!("Could not process the voice message: {VOICE_UNSUPPORTED_REASON}.");
         let content =
             attachment_rejection_content(None, NOT_RECEIVED, VOICE_UNSUPPORTED_REASON, caption);
-        self.refuse_with_notice(ctx, &notice, content).await
+        let mut msg = self.refuse_with_notice(ctx, &notice, content).await;
+        msg.urgent = urgent;
+        msg
     }
 
     /// What Telegram says about a message being forwarded content.
@@ -2876,9 +2898,12 @@ impl TelegramChannel {
             text
         };
 
-        let content = text.to_string();
-
-        Ok(Some(ctx.into_channel_message(content, None)))
+        // Read on the text the user typed, before the forward attribution is
+        // composed onto the content (see `MessageContext::into_channel_message`).
+        let (text, urgent) = crate::channels::take_urgent(text);
+        let mut msg = ctx.into_channel_message(text.into_owned(), None);
+        msg.urgent = urgent;
+        Ok(Some(msg))
     }
 
     /// POST a JSON body to a Telegram API method; returns the response on 2xx
@@ -4036,6 +4061,8 @@ fn merge_album_member(album: Option<ChannelMessage>, member: ChannelMessage) -> 
             album.attachment_dirs.extend(member.attachment_dirs);
             album.update_ids.extend(member.update_ids);
             album.forwarded |= member.forwarded;
+            // An album is one message: it is urgent when any of its members is.
+            album.urgent |= member.urgent;
             album
         }
         None => member,

@@ -2010,6 +2010,7 @@ fn local_attachment_name_uses_sanitized_sender_name_or_fallback() {
         caption: None,
         kind: IncomingAttachmentKind::Document,
         mime_type: None,
+        urgent: false,
     };
     assert_eq!(local_attachment_name(&attachment, "123", 7, None), "passwd");
     // Telegram often sends no file_name (photo/video_note/voice) — the
@@ -2068,6 +2069,7 @@ fn local_attachment_name_sanitizes_remote_extension_fallback() {
         caption: None,
         kind: IncomingAttachmentKind::Document,
         mime_type: None,
+        urgent: false,
     };
     // Telegram reports no file_name for many kinds, so the fallback's
     // extension comes from `getFile` — remote input that must not survive
@@ -2283,6 +2285,114 @@ fn is_control_message_covers_commands_and_callbacks() {
         "telegram",
         "chat"
     )));
+
+    // A message that opened with the urgent mark is never a command: the mark
+    // was consumed, so its content reads as one, but it must reach the agent.
+    let mut urgent_command = test_msg("alice", "/clear", "telegram", "chat");
+    urgent_command.urgent = true;
+    assert!(!is_control_message(&urgent_command));
+    assert!(control_input(&urgent_command).is_none());
+}
+
+// ── Urgent mark tests ───────────────────────────────────────────
+
+/// The mark is consumed with the whitespace around it, and what is left reaches
+/// the agent even when it reads as a command.
+#[tokio::test]
+async fn a_leading_mark_is_consumed_from_a_typed_message() {
+    let ch = test_channel().await;
+    let update = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 44,
+            "text": "  !/clear",
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": -100_200_300 }
+        }),
+    )]);
+
+    let msg = parsed_message(&ch, &update).await;
+
+    assert_eq!(msg.content, "/clear");
+    assert!(msg.urgent);
+    assert!(control_input(&msg).is_none());
+    assert!(!is_control_message(&msg));
+}
+
+/// Only the start of the typed text counts; a mark anywhere else is ordinary
+/// text and leaves the message and its urgency as written.
+#[tokio::test]
+async fn a_mark_is_read_only_at_the_start_of_the_typed_text() {
+    let ch = test_channel().await;
+    for (typed, content, urgent) in [
+        ("!hello", "hello", true),
+        ("hello!", "hello!", false),
+        ("what? !", "what? !", false),
+    ] {
+        let update = test_update(&[(
+            "message",
+            serde_json::json!({
+                "message_id": 45,
+                "text": typed,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300 }
+            }),
+        )]);
+        let msg = parsed_message(&ch, &update).await;
+        assert_eq!(msg.content, content, "{typed}");
+        assert_eq!(msg.urgent, urgent, "{typed}");
+    }
+}
+
+/// A caption is text the user typed, so it carries the mark like any message
+/// does; the album its parts fold into keeps it.
+#[test]
+fn a_caption_carries_the_mark_and_the_album_keeps_it() {
+    let attachment = |caption: &str| {
+        TelegramChannel::build_attachment(
+            &serde_json::json!({ "file_id": "x" }),
+            &serde_json::json!({ "caption": caption }),
+            IncomingAttachmentKind::Photo,
+        )
+        .expect("a photo attachment")
+    };
+
+    let marked = attachment("!\tsee this");
+    assert_eq!(marked.caption.as_deref(), Some("see this"));
+    assert!(marked.urgent);
+
+    let plain = attachment("see this");
+    assert_eq!(plain.caption.as_deref(), Some("see this"));
+    assert!(!plain.urgent);
+
+    // An album is one message: it is urgent when any member is, and its parts
+    // are joined so the whole album reads as one.
+    let album = merge_album_member(
+        Some(ChannelMessage {
+            content: "a".into(),
+            ..ChannelMessage::default()
+        }),
+        ChannelMessage {
+            content: "b".into(),
+            urgent: true,
+            ..ChannelMessage::default()
+        },
+    );
+    assert_eq!(album.content, "a\nb");
+    assert!(album.urgent);
+
+    let album = merge_album_member(
+        Some(ChannelMessage {
+            content: "a".into(),
+            ..ChannelMessage::default()
+        }),
+        ChannelMessage {
+            content: "b".into(),
+            ..ChannelMessage::default()
+        },
+    );
+    assert_eq!(album.content, "a\nb");
+    assert!(!album.urgent);
 }
 
 // ── Forwarded message tests ─────────────────────────────────────
@@ -2662,6 +2772,7 @@ fn test_msg(user_name: &str, content: &str, channel: &str, reply_target: &str) -
         forwarded: false,
         update_ids: Vec::new(),
         dictated: false,
+        urgent: false,
     }
 }
 
