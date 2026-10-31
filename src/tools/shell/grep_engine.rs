@@ -149,13 +149,6 @@ pub(super) mod windows;
 /// the engine agrees with the real search for the member's shape.
 mod parity;
 
-/// The subprocess differential against this platform's own grep: the rewrite run
-/// by a real `sh` with the shipped binary as the hidden engine subcommand, diffed
-/// byte-for-byte against the real `grep`. macOS-only, because that is the grep it
-/// is compared against; ignored by default, because it needs the built binary.
-#[cfg(all(test, target_os = "macos"))]
-mod subprocess_matrix;
-
 /// The parity hooks the owner-environment reader drives (see [`parity`]): the
 /// reader is what changes the environment — and so the locale — an agent's
 /// commands get.
@@ -519,8 +512,6 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> GrepSer
         // The probe is deferred to the point where a member is servable (see
         // `serve_command`), so a shell call carrying no search never spawns it.
         engine_available,
-        // No program handed in: the rendered member names this process's own image.
-        None,
     )
 }
 
@@ -567,26 +558,21 @@ fn demoted(platform: ShellPlatform, mut outcomes: Vec<GrepOutcome>, reason: &str
 /// means nothing that could resolve `~` is served — except on Windows, where
 /// nothing expands `~` at all and no analysis decision consults it, so the
 /// analysis proceeds without one.
-///
-/// `exe` is the program the rendered engine member names. `None` means this
-/// process's own image (`current_exe()`), resolved at the rendering step below —
-/// the lookup stays deferred to there, so a command carrying no search never pays
-/// for it. The subprocess differential passes the built binary it drives, so the
-/// rewrite names the shipped path rather than a test binary.
 fn serve_command(
     command: &str,
     workspace_root: &Path,
     home: Option<&Path>,
     platform: ShellPlatform,
     engine_ready: impl Fn() -> bool,
-    exe: Option<&Path>,
 ) -> GrepServe {
     let windows = platform == ShellPlatform::Windows;
     let home = match home {
         Some(home) => home,
         // `resolve_operand`/`resolve_cd` never read `home` on Windows (their
         // `~` arms are unix-only), so an empty placeholder is never consulted —
-        // the routing pin `windows_serves_without_a_home` holds this.
+        // the `home: false` row of
+        // `refusal_pins::windows_verdicts_are_served_refused_or_exempt` holds
+        // this.
         None if windows => Path::new(""),
         None => return GrepServe::not_rewritten(Vec::new(), None),
     };
@@ -659,22 +645,14 @@ fn serve_command(
     }
     // Only now — every analysis decision made, the whole command servable — is
     // the rewrite rendered, so the Windows hand-off's scratch files cannot be
-    // created and then abandoned by a later demotion. The engine's own path is
+    // created and then abandoned by a later demotion. This process's own image is
     // part of that rendering: without it there is no rewrite, so a runtime doubt
     // demotes the command (unix runs the original, Windows refuses the call)
-    // rather than panicking. `exe` is that program when the caller names one (the
-    // subprocess differential drives the built binary); otherwise it is this
-    // process's own image — which the probe and the plan's own dispatch look up
-    // for themselves too, all of them reading the same process, so they cannot
-    // name different programs.
-    let exe = match exe {
-        Some(exe) => Ok(exe.to_string_lossy().into_owned()),
-        None => std::env::current_exe()
-            .map(|path| path.to_string_lossy().into_owned())
-            .map_err(|e| Fallback::Handoff(format!("no own executable path: {e}"))),
-    };
-    let rendered =
-        exe.and_then(|exe| join_rewritten(&segments, &specs, &jsons, platform, &exe, &root_cwd));
+    // rather than panicking.
+    let rendered = std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|e| Fallback::Handoff(format!("no own executable path: {e}")))
+        .and_then(|exe| join_rewritten(&segments, &specs, &jsons, platform, &exe, &root_cwd));
     let Joined {
         text: rewritten,
         spec_files,
@@ -800,14 +778,10 @@ fn lightweight_scan(command: &str) -> (bool, usize, String) {
 /// (`-r`/`-R` with at least one directory operand). Cross-file worker ordering
 /// is non-deterministic for such rows, so parity comparisons relax to sorted
 /// line-sets; in-file ordering stays stable. Only the macOS-gated parity matrix
-/// and the subprocess differential use this, so every other lane leaves it
-/// unused.
+/// uses this, so every other lane leaves it unused.
 #[cfg_attr(
     not(all(test, target_os = "macos")),
-    expect(
-        dead_code,
-        reason = "used only by the macOS-gated differential matrices"
-    )
+    expect(dead_code, reason = "used only by the macOS-gated parity matrix")
 )]
 fn spec_uses_parallel_walk(spec: &EngineSpec) -> bool {
     spec.flags.r
@@ -4861,8 +4835,7 @@ mod parity_tests {
     }
 
     /// Run the real grep with the spec's fallback argv (the grep member only —
-    /// used for pipeline rows, whose head member the subprocess differential
-    /// covers end-to-end).
+    /// used for pipeline rows, whose head member is covered end-to-end).
     fn real_run_fallback(spec: &EngineSpec) -> (Vec<u8>, Vec<u8>, i32) {
         real_run_fallback_with_stdin(spec, &[])
     }
@@ -5116,9 +5089,9 @@ mod parity_tests {
     /// `unix_operator_pins`), and stderr-free rows, so a merged `&>` file is the
     /// member's stdout alone. This reproduces the shell's own write only while
     /// the row's result stays below [`OUTPUT_CAP`]; a redirected result above it
-    /// is pinned by the subprocess differential (`grep_engine::subprocess_matrix`),
-    /// not here (the in-process harness can never select [`StdoutDest::File`], so
-    /// an oversized row would compare a capped stream against the whole file).
+    /// is not pinned here (the in-process harness can never select
+    /// [`StdoutDest::File`], so an oversized row would compare a capped stream
+    /// against the whole file).
     fn assert_redirect_parity(command: &str, target: &str, ws: &Path, home: &Path) {
         let (specs, _, rewritten, _) = analyze_joined(command, ws, home, false)
             .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
@@ -5139,9 +5112,8 @@ mod parity_tests {
             .unwrap_or_else(|e| panic!("{command}: the original's shell wrote {target}: {e}"));
         assert!(
             eout.len() < OUTPUT_CAP && written.len() < OUTPUT_CAP,
-            "{command}: a result at or above OUTPUT_CAP is pinned by the subprocess \
-             differential in grep_engine::subprocess_matrix, not this capped in-process \
-             harness"
+            "{command}: a result at or above OUTPUT_CAP is not pinned by this capped \
+             in-process harness"
         );
         if spec_uses_parallel_walk(&specs[0]) {
             assert_eq!(
@@ -5176,8 +5148,8 @@ mod parity_tests {
         assert_eq!(err.reason.to_string(), reason, "{command}");
     }
 
-    #[test]
     #[expect(clippy::too_many_lines)] // differential parity matrix
+    #[test]
     fn differential_parity_matrix() {
         let (_tmp, ws, home) = fixture();
         let rows: &[&str] = &[
@@ -5428,14 +5400,12 @@ mod parity_tests {
             "grep -rn needle '~/htree'", // literal path, no such file (stderr row)
             "grep -rn needle '~user'",   // literal path, no such file (stderr row)
             "grep -rn needle ~/\"htree\"", // mixed form: `~/` expands, quoted rest joins
-            // ── any-length pipelines: any tail is served verbatim (grep
-            //    member parity; full-pipeline parity lives in the subprocess
-            //    differential).
-            //    The 2>&1 row covers the benign ordering only — engine stderr
-            //    is buffered to finish while BSD emits at operand-open, so
-            //    missing-first or order-sensitive tails diverge (accepted
-            //    residual). Tails are never analyzed: second greps, grep
-            //    introducers (xargs grep) and 3+ members are preserved ──
+            // ── any-length pipelines: any tail is served verbatim, with grep
+            //    member parity. The 2>&1 row covers the benign ordering only —
+            //    engine stderr is buffered to finish while BSD emits at
+            //    operand-open, so missing-first or order-sensitive tails diverge
+            //    (accepted residual). Tails are never analyzed: second greps,
+            //    grep introducers (xargs grep) and 3+ members are preserved ──
             "grep -rn x plain | wc -l",
             "grep -rn x plain | tail -2",
             "grep -rn x plain | sort",
@@ -6059,97 +6029,122 @@ mod handoff_pins {
     use super::super::SpecFiles;
     use super::*;
 
-    /// The Windows rewrite quotes the executable in place, and cmd.exe keeps
+    /// What the hand-off makes of one executable spelling.
+    enum HandOff {
+        /// A fragment quoting the executable in place, backed by one scratch
+        /// spec file.
+        Served,
+        /// A refusal naming what cmd.exe would rewrite inside the quotes.
+        Refused,
+    }
+
+    struct HandOffCase {
+        name: &'static str,
+        exe: &'static str,
+        verdict: HandOff,
+    }
+
+    /// The scratch-file transport's read half: what [`read_spec`] makes of one
+    /// argv.
+    enum SpecRead {
+        Reads(&'static str),
+        Unreadable,
+    }
+
+    /// The Windows hand-off, both halves as data: the executable quoting (and
+    /// the spellings cmd.exe rewrites even inside quotes) and the scratch file's
+    /// reading. The rewrite quotes the executable in place, and cmd.exe keeps
     /// every metacharacter literal inside that quoting — an installation under
-    /// `C:\Program Files (x86)\…` is served, not disabled machine-wide. A path
-    /// carrying what cmd.exe rewrites even inside quotes is refused instead of
-    /// written out as a line cmd would read differently.
+    /// `C:\Program Files (x86)\…` is served, not disabled machine-wide.
     #[test]
-    fn windows_hand_off_quotes_the_executable_and_refuses_only_what_cmd_rewrites() {
+    #[expect(clippy::too_many_lines)] // two cohesive tables over the hand-off
+    fn the_windows_hand_off_round_trips() {
         let spec = render_only_json();
-        let mut files = Vec::new();
-        let ServedMember { text, argv } = render_served(
-            &spec,
-            &[],
-            ShellPlatform::Windows,
-            r"C:\Program Files (x86)\MahBot\mahbot.exe",
-            &mut files,
-        )
-        .expect("a programme path cmd.exe reads literally inside quotes");
-        assert!(
-            text.starts_with(r#""C:\Program Files (x86)\MahBot\mahbot.exe" "#),
-            "{text}"
-        );
-        assert!(text.contains(windows::SPEC_FILE_FLAG), "{text}");
-        // The same member's argv — what the runner spawns the image with — names
-        // the same words the fragment spells, with the spec's own path bare
-        // (argv needs no quoting) and cmd.exe's own text out of the way.
-        assert_eq!(
-            argv.as_deref(),
-            Some(
-                [
-                    ENGINE_VERB.to_string(),
-                    windows::SPEC_FILE_FLAG.to_string(),
-                    files[0].to_string_lossy().into_owned(),
-                ]
-                .as_slice()
-            ),
-            "the plan's argv names the scratch file the fragment does"
-        );
-        assert_eq!(files.len(), 1, "the spec rides a scratch file");
-        assert!(files[0].exists(), "{:?}", files[0]);
-        let file = files[0].clone();
-        drop(SpecFiles(files));
-        assert!(!file.exists(), "the call's guard removes it: {file:?}");
-
-        for bad in [r"C:\Users\a%b\mahbot.exe", r"C:\Users\a!b\mahbot.exe"] {
-            let err = render_served(&spec, &[], ShellPlatform::Windows, bad, &mut Vec::new())
-                .err()
-                .expect("a path cmd.exe rewrites even inside quotes");
-            assert!(err.to_string().contains("hand-off refused"), "{err}");
+        let cases: &[HandOffCase] = &[
+            HandOffCase {
+                name: "a program files path is quoted in place",
+                exe: r"C:\Program Files (x86)\MahBot\mahbot.exe",
+                verdict: HandOff::Served,
+            },
+            HandOffCase {
+                name: "a percent in the path is rewritten by cmd",
+                exe: r"C:\Users\a%b\mahbot.exe",
+                verdict: HandOff::Refused,
+            },
+            HandOffCase {
+                name: "a bang in the path is rewritten by cmd",
+                exe: r"C:\Users\a!b\mahbot.exe",
+                verdict: HandOff::Refused,
+            },
+        ];
+        for case in cases {
+            let mut files = Vec::new();
+            match case.verdict {
+                HandOff::Served => {
+                    let ServedMember { text, argv } =
+                        render_served(&spec, &[], ShellPlatform::Windows, case.exe, &mut files)
+                            .expect("a programme path cmd.exe reads literally inside quotes");
+                    // cmd.exe keeps the quoting's content literal, so the quoted
+                    // executable is the prefix of the fragment.
+                    assert!(
+                        text.starts_with(&format!("\"{}\" ", case.exe)),
+                        "{}: {text}",
+                        case.name
+                    );
+                    assert!(
+                        text.contains(windows::SPEC_FILE_FLAG),
+                        "{}: {text}",
+                        case.name
+                    );
+                    // The same member's argv names the same words the fragment
+                    // spells, with the spec's own path bare (argv needs no
+                    // quoting).
+                    assert_eq!(
+                        argv.as_deref(),
+                        Some(
+                            [
+                                ENGINE_VERB.to_string(),
+                                windows::SPEC_FILE_FLAG.to_string(),
+                                files[0].to_string_lossy().into_owned(),
+                            ]
+                            .as_slice()
+                        ),
+                        "{}: the plan's argv names the scratch file the fragment does",
+                        case.name
+                    );
+                    assert_eq!(
+                        files.len(),
+                        1,
+                        "{}: the spec rides a scratch file",
+                        case.name
+                    );
+                    assert!(files[0].exists(), "{}: {:?}", case.name, files[0]);
+                    let file = files[0].clone();
+                    drop(SpecFiles(files));
+                    assert!(
+                        !file.exists(),
+                        "{}: the call's guard removes it: {file:?}",
+                        case.name
+                    );
+                }
+                HandOff::Refused => {
+                    let err =
+                        render_served(&spec, &[], ShellPlatform::Windows, case.exe, &mut files)
+                            .err()
+                            .expect("a path cmd.exe rewrites even inside quotes");
+                    assert!(
+                        err.to_string().contains("hand-off refused"),
+                        "{}: {err}",
+                        case.name
+                    );
+                    assert!(files.is_empty(), "{}: nothing is written", case.name);
+                }
+            }
         }
-    }
 
-    /// On unix the executable's path is single-quoted for `sh` and the spec
-    /// rides the command line. The member carries no argv: nothing spawns it
-    /// there, and the spec — a word on the line, not a file — would be an
-    /// argument the runner never needs.
-    #[test]
-    fn unix_hand_off_keeps_the_argv_transport() {
-        let mut files = Vec::new();
-        let member = render_served(
-            &render_only_json(),
-            &["2>&1".into()],
-            ShellPlatform::Unix,
-            "/opt/it's here/mahbot",
-            &mut files,
-        )
-        .expect("unix hand-off");
-        assert!(member.argv.is_none(), "unix builds no own-image argv");
-        let text = member.text;
-        assert!(files.is_empty(), "no scratch file on unix");
-        assert!(text.starts_with("'/opt/it'\\''s here/mahbot' "), "{text}");
-        assert!(text.contains(ENGINE_VERB), "{text}");
-        assert!(text.ends_with(" 2>&1"), "redirects stay verbatim: {text}");
-    }
-
-    /// The scratch-file transport's read half: the flag arm of [`read_spec`]
-    /// takes the file's contents (the flag itself is never parsed as JSON), the
-    /// argv arm still passes a bare spec straight through, and a path with
-    /// nothing behind it is an error — the member the engine refuses, and the
-    /// parent then refuses the call on.
-    ///
-    /// Driven at [`read_spec`] rather than through `run_engine`, which is not
-    /// callable from this lane at all: it puts the process-wide SIGPIPE
-    /// disposition back to its default, which this binary shares with tests
-    /// whose producer writes into a child pipe expecting `EPIPE` (a sibling
-    /// thread inside that window would be killed by SIGPIPE and take the whole
-    /// test run down with it), and on a cannot-serve path it replaces this
-    /// process with the real `grep`. Both forms reach `serve` as the same JSON
-    /// string, which the parity tests drive directly; the end-to-end transport
-    /// is covered by the manual smoke run of the built binary instead.
-    #[test]
-    fn the_spec_file_flag_reads_the_scratch_file() {
+        // The scratch-file transport's read half: the flag arm takes the file's
+        // contents (the flag itself is never parsed as JSON), an unreadable path
+        // is an error, and the argv arm passes a bare spec through.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("spec.json");
         fs::write(&path, r#"{"version":1}"#).expect("spec file");
@@ -6160,19 +6155,36 @@ mod handoff_pins {
                 "grep".to_string(),
             ]
         };
-
-        assert_eq!(
-            read_spec(&file_args(&path)).expect("the flag reads the file"),
-            r#"{"version":1}"#
-        );
-        assert!(
-            read_spec(&file_args(&tmp.path().join("no-such-spec.json"))).is_err(),
-            "an unreadable spec file is an error, never a parse of the flag"
-        );
-        assert_eq!(
-            read_spec(&[r#"{"version":2}"#.to_string()]).expect("the argv arm passes it through"),
-            r#"{"version":2}"#
-        );
+        let cases: Vec<(&str, Vec<String>, SpecRead)> = vec![
+            (
+                "the flag reads the scratch file",
+                file_args(&path),
+                SpecRead::Reads(r#"{"version":1}"#),
+            ),
+            (
+                "an unreadable spec file is an error",
+                file_args(&tmp.path().join("no-such-spec.json")),
+                SpecRead::Unreadable,
+            ),
+            (
+                "the argv arm passes a bare spec through",
+                vec![r#"{"version":2}"#.to_string()],
+                SpecRead::Reads(r#"{"version":2}"#),
+            ),
+        ];
+        for (name, args, expected) in cases {
+            match expected {
+                SpecRead::Reads(expected) => assert_eq!(
+                    read_spec(&args).expect("the spec is read"),
+                    expected,
+                    "{name}"
+                ),
+                SpecRead::Unreadable => assert!(
+                    read_spec(&args).is_err(),
+                    "{name}: never a parse of the flag"
+                ),
+            }
+        }
     }
 }
 
@@ -6320,8 +6332,7 @@ mod writer_pins {
     /// The destination decides what the result is worth — not the search. A
     /// captured member stops at [`OUTPUT_CAP`] bytes (the parent's pipe reader
     /// caps at the same value); a file the command redirects into gets the whole
-    /// stream. Both are observed here on the engine's own writer; the subprocess
-    /// differential observes the fd-1 reading that picks between them.
+    /// stream. Both are observed here on the engine's own writer.
     #[test]
     fn the_destination_decides_whether_the_result_is_cut() {
         // ~380 KiB of matches in lines far shorter than the cap: long enough to
@@ -6463,7 +6474,7 @@ mod test_support {
         home: &Path,
         platform: ShellPlatform,
     ) -> (String, Vec<PathBuf>) {
-        let mut serve = serve_command(command, ws, Some(home), platform, || true, None);
+        let mut serve = serve_command(command, ws, Some(home), platform, || true);
         assert!(
             serve.refusal.is_none(),
             "{command}: served, not refused: {:?}",
@@ -6663,28 +6674,14 @@ mod read_only_serve_pins {
         let (_tmp, ws, home) = serve_fixture();
         let command = "grep -n needle src/main.rs";
 
-        let windows = serve_command(
-            command,
-            &ws,
-            Some(&home),
-            ShellPlatform::Windows,
-            || true,
-            None,
-        );
+        let windows = serve_command(command, &ws, Some(&home), ShellPlatform::Windows, || true);
         assert!(
             windows.rewritten.is_some(),
             "single-file serving on Windows"
         );
         drop(SpecFiles(windows.spec_files));
 
-        let unix = serve_command(
-            command,
-            &ws,
-            Some(&home),
-            ShellPlatform::Unix,
-            || true,
-            None,
-        );
+        let unix = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
         assert!(unix.rewritten.is_none(), "the unix perf gate stays");
         assert_eq!(unix.outcomes.len(), 1);
         assert_eq!(unix.outcomes[0].reason, "single file");
@@ -6834,14 +6831,7 @@ mod refusal_pins {
     /// message names its cause and says the search did not run. Returns the
     /// cause.
     fn refused(command: &str, ws: &Path, home: &Path) -> String {
-        let mut serve = serve_command(
-            command,
-            ws,
-            Some(home),
-            ShellPlatform::Windows,
-            || true,
-            None,
-        );
+        let mut serve = serve_command(command, ws, Some(home), ShellPlatform::Windows, || true);
         assert!(
             serve.rewritten.is_none(),
             "{command}: expected no rewrite (got {:?})",
@@ -6882,25 +6872,11 @@ mod refusal_pins {
             true
         };
 
-        let no_search = serve_command(
-            "echo hi",
-            &ws,
-            Some(&home),
-            ShellPlatform::Unix,
-            probe,
-            None,
-        );
+        let no_search = serve_command("echo hi", &ws, Some(&home), ShellPlatform::Unix, probe);
         assert!(no_search.rewritten.is_none());
         assert_eq!(asked.get(), 0, "a command with no search must not probe");
 
-        let servable = serve_command(
-            "grep -rn x .",
-            &ws,
-            Some(&home),
-            ShellPlatform::Unix,
-            probe,
-            None,
-        );
+        let servable = serve_command("grep -rn x .", &ws, Some(&home), ShellPlatform::Unix, probe);
         assert_eq!(asked.get(), 1, "a servable member asks exactly once");
         assert!(servable.rewritten.is_some());
 
@@ -6910,7 +6886,6 @@ mod refusal_pins {
             Some(&home),
             ShellPlatform::Unix,
             || false,
-            None,
         );
         assert!(unavailable.rewritten.is_none());
         assert_eq!(unavailable.outcomes.len(), 1, "the member is analysed");
@@ -6918,103 +6893,755 @@ mod refusal_pins {
         assert_eq!(unavailable.outcomes[0].reason, "engine unavailable");
     }
 
-    /// A line that exports a new environment before its search is not served: the
-    /// parity verdict was measured for the environment the product hands commands,
-    /// so the member after such a segment is left to the real `grep`, which answers
-    /// in whatever environment the line built for itself. On Windows there is no
-    /// real search to diverge from, so the same line is served as usual.
-    #[test]
-    fn a_line_that_exports_an_environment_first_is_not_served() {
-        let (_tmp, ws, home) = serve_fixture();
-        for command in [
-            "export LC_ALL=C; grep -rn needle .",
-            "export LC_ALL=C && grep -rn needle .",
-            "unset LANG; grep -rn needle .",
-            "eval \"export LC_ALL=C\"; grep -rn needle .",
-            "source /dev/null; grep -rn needle .",
-            "\"export\" LC_ALL=C; grep -rn needle .",
-            // An escaped builtin: the shell drops the escape before it decides what
-            // the word names, so this runs `export`.
-            "\\export LC_ALL=C; grep -rn needle .",
-            // A subshell group: the change dies with the group, but its body reads
-            // as a compound body's first position — a deliberate over-refusal, like
-            // the assignment prefixed to an ordinary command.
-            "(export LC_ALL=C); grep -rn needle .",
-            // An assignment on its own: a name the environment already exports keeps
-            // its export status, so the search after it runs with another value.
-            "LC_ALL=C; grep -rn needle .",
-            "PATH=/opt/bin:$PATH; grep -rn needle .",
-            // An assignment prefixed to a builtin, which keeps the assignment.
-            "LC_ALL=C export FOO=1; grep -rn needle .",
-            // A builtin inside a compound body, which the splitter hands over with
-            // its keyword.
-            "if true; then export LC_ALL=C; fi; grep -rn needle .",
-        ] {
-            let serve = serve_command(
-                command,
-                &ws,
-                Some(&home),
-                ShellPlatform::Unix,
-                || true,
-                None,
-            );
-            assert!(serve.rewritten.is_none(), "{command}: expected no serve");
-            assert_eq!(serve.outcomes.len(), 1, "{command}: the member is analysed");
-            assert!(
-                !serve.outcomes[0].served,
-                "{command}: the member falls back"
-            );
-            assert_eq!(
-                serve.outcomes[0].reason,
-                Fallback::EnvironmentChanged.to_string(),
-                "{command}: the cause is named"
-            );
-        }
+    /// What a Windows row's serve decision must produce.
+    enum WindowsVerdict {
+        /// A rewrite naming the engine, with the spec file handed over.
+        Served,
+        /// No rewrite and a refusal whose cause names `needle` (and, when given,
+        /// explains itself with `explains`).
+        Refused {
+            needle: &'static str,
+            explains: Option<&'static str>,
+        },
+        /// Neither served nor refused: the platform's own program runs.
+        Exempt,
+        /// One analysed member left unserved, with the skip's cause when named.
+        Skipped { reason: Option<&'static str> },
+    }
 
-        // A search BEFORE the export runs in the environment the product handed
-        // over; a line that changes nothing about the environment is served as
-        // usual; an argument that merely looks like an assignment is not one; and a
-        // change inside a pipeline member dies with that member's subshell, so the
-        // siblings are served.
-        for command in [
-            "grep -rn needle . ; export LC_ALL=C",
-            "cd . && grep -rn needle .",
-            "echo hi; grep -rn needle .",
-            "echo KEY=value; grep -rn needle .",
-            "grep -rn KEY=value .",
-            "export LC_ALL=C | grep needle",
-            "LC_ALL=C echo hi | grep needle",
-        ] {
-            let serve = serve_command(
-                command,
-                &ws,
-                Some(&home),
-                ShellPlatform::Unix,
-                || true,
-                None,
-            );
+    struct WindowsCase {
+        name: &'static str,
+        command: &'static str,
+        /// Whether the analysis is handed a home tree. A row without one pins the
+        /// Windows routing's no-home arm.
+        home: bool,
+        verdict: WindowsVerdict,
+        /// The trailing component the rewrite's tracked cwd must end with.
+        cwd_ends: Option<&'static str>,
+    }
+
+    /// Every Windows verdict as one table: the shapes served, the shapes
+    /// refused (with their cause), and the shapes the platform leaves alone.
+    /// Cosmetic variants of one rule are rows here rather than tests.
+    #[test]
+    #[expect(clippy::too_many_lines)] // one cohesive table over the Windows verdicts
+    fn windows_verdicts_are_served_refused_or_exempt() {
+        let (_tmp, ws, home) = serve_fixture();
+        // The image and the file name of this process's own path: the launcher
+        // rows compare against the name this test binary actually has.
+        let exe = std::env::current_exe().expect("this process's own path");
+        let image = exe.display().to_string();
+        let name = exe
+            .file_name()
+            .expect("an executable has a file name")
+            .to_string_lossy()
+            .to_string();
+        let cases: &[WindowsCase] = &[
+            // A line that exports a new environment first is served on Windows:
+            // the engine is the only search there, so the line's own environment
+            // is not a parity question.
+            WindowsCase {
+                name: "a line that exports an environment first",
+                command: "export LC_ALL=C && grep -rn needle .",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            // A lone `%` and every `!` are ordinary characters to the interpreter
+            // this process spawns (`cmd /C` with `/V:OFF`).
+            WindowsCase {
+                name: "a lone bang in a pattern",
+                command: r#"grep -rn "!=" src/main.rs"#,
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a lone percent in a pattern",
+                command: r#"grep -n "50%" src/main.rs"#,
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a lone bang in a css-ish word",
+                command: r#"grep -rn "!important" ."#,
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            // The redirect shapes the runner applies by itself.
+            WindowsCase {
+                name: "a > with its own target word",
+                command: "grep -n needle f.txt > out.txt",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "an append with its own target word",
+                command: "grep -n needle f.txt >> out.txt",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a stderr redirect with its own target word",
+                command: "grep -n needle f.txt 2> err.txt",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "an stdin redirect with its own target word",
+                command: "grep -n needle f.txt < f.txt",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "the stdout merge",
+                command: "grep -n needle f.txt 2>&1",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "the stdout merge in a pipeline",
+                command: "grep -n needle f.txt 2>&1 | head -2",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a > inside quotes",
+                command: r#"grep -n "a>b" f.txt"#,
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a glued > target",
+                command: "grep -n needle f.txt >out.txt",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a glued append target",
+                command: "grep -n needle f.txt >>log.txt",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a glued stderr target",
+                command: "grep -n needle f.txt 2>err.txt",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a glued stderr append target",
+                command: "grep -n needle f.txt 2>>log.txt",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a glued stdin target",
+                command: "grep -n needle f.txt <in.txt",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a self-contained fd redirect",
+                command: "grep -n needle f.txt 1>0",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            // The double-quoted caret spelling is readable: the caret is inside
+            // quotes.
+            WindowsCase {
+                name: "a quoted caret spelling",
+                command: "grep \"^fn \" src/main.rs",
+                home: true,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: None,
+            },
+            // The analysis needs no home on Windows: the tracked cwd resolves
+            // statically.
+            WindowsCase {
+                name: "a served line without a home",
+                command: "cd src && grep -n needle main.rs",
+                home: false,
+                verdict: WindowsVerdict::Served,
+                cwd_ends: Some("src"),
+            },
+            // A member in grep-verb position the serve decision rejected.
+            WindowsCase {
+                name: "an unsupported flag",
+                command: "grep -P x f.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "unsupported flag -P",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            // A `;` outside quotes: cmd.exe reads it as an argument delimiter.
+            WindowsCase {
+                name: "an unquoted semicolon",
+                command: "echo a; grep x f.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "unquoted `;`",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            // A caret outside quotes is unmodellable, and a search is present.
+            WindowsCase {
+                name: "a line-wide caret",
+                command: "grep ^fn src/main.rs",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "the whole line",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            // A nested member the engine never claims.
+            WindowsCase {
+                name: "an xargs-wrapped search",
+                command: "xargs grep x f.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "nested grep",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            // A `cd` the tracked-cwd model cannot resolve.
+            WindowsCase {
+                name: "a switch-shaped cd target",
+                command: "cd /x && grep x f.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "cd untrackable",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a popd before a search",
+                command: "popd && grep -rn x .",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "cd untrackable",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a bare pushd before a search",
+                command: "pushd && grep -rn x .",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "cd untrackable",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            // A command group cmd.exe parses itself.
+            WindowsCase {
+                name: "a command group",
+                command: "(grep x f.txt)",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "the whole line",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            // One servable member plus one the engine cannot serve.
+            WindowsCase {
+                name: "a servable member beside a nested search",
+                command: "grep -rn needle . && xargs grep x f.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "nested grep",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a second grep in a pipeline",
+                command: "grep -rn needle . | grep -v skip",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "nested grep",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            // A grep inside another interpreter's command line, in every
+            // spelling of the verb (case and `.exe` folded).
+            WindowsCase {
+                name: "a cmd /c wrapped search",
+                command: "cmd /c grep -rn x .",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "nested grep",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "an upper-case cmd-wrapped search",
+                command: "CMD /C GREP -rn x .",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "nested grep",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a cmd.exe-wrapped search",
+                command: "cmd.exe /c grep -rn x .",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "nested grep",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a quoted cmd payload",
+                command: r#"cmd /c "grep -rn x .""#,
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "nested grep",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a powershell payload search",
+                command: "powershell -c \"git log | grep x\"",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "nested grep",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            // A redirect glued to a word: cmd.exe splits `x>out.txt` into an
+            // argument plus a redirect, while the token classifier reads an
+            // operator only where it OPENS the word.
+            WindowsCase {
+                name: "a redirect glued to the search pattern",
+                command: "grep -n x>out.txt f.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "redirect in `x>out.txt`",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a redirect glued to a pattern in a walk",
+                command: "grep -rn x>log .",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "redirect in `x>log`",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a >& redirect glued to a pattern",
+                command: "grep a>&echo done",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "redirect in `a>&echo`",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            // `%…%` is expanded by cmd.exe before any program sees its argv.
+            WindowsCase {
+                name: "a percent pair in a pattern",
+                command: "grep -n %TEMP% f.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "two `%` in %TEMP%",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a percent pair in an include filter",
+                command: "grep -n x --include=%x% f.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "two `%` in --include=%x%",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a doubled percent pair",
+                command: "grep -n 100%% f.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "two `%` in 100%%",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            // A redirect spelling the runner cannot apply.
+            WindowsCase {
+                name: "a stderr dup to the console",
+                command: "grep -n needle f.txt >&2",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "`>&2`",
+                    explains: Some("cannot apply the redirection"),
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "an explicit stderr dup",
+                command: "grep -n needle f.txt 1>&2",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "`1>&2`",
+                    explains: Some("cannot apply the redirection"),
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a third-descriptor dup",
+                command: "grep -n needle f.txt 3>&1",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "`3>&1`",
+                    explains: Some("cannot apply the redirection"),
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a multi-digit fd redirect with a spaced target",
+                command: "grep -n needle f.txt 10> out.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "`10>`",
+                    explains: Some("cannot apply the redirection"),
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a multi-digit fd redirect with a glued target",
+                command: "grep -n needle f.txt 10>out.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "`10>out.txt`",
+                    explains: Some("cannot apply the redirection"),
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a read-write redirect",
+                command: "grep -n needle f.txt <>f.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "`<>f.txt`",
+                    explains: Some("cannot apply the redirection"),
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a bare >& dup",
+                command: "grep -n needle f.txt >& out.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "`>&`",
+                    explains: Some("cannot apply the redirection"),
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "an append dup",
+                command: "grep -n needle f.txt 2>>&1",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "`2>>&1`",
+                    explains: Some("cannot apply the redirection"),
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a redirect with no target",
+                command: "grep -n needle f.txt >",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "its target word is missing",
+                    explains: Some("cannot apply the redirection"),
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a percent-expanded redirect target",
+                command: "grep -n needle f.txt > %TMPOUT%",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "`%TMPOUT%`",
+                    explains: Some("cannot apply the redirection"),
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a drive-relative redirect target",
+                command: "grep -n needle f.txt > C:out.txt",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "`C:out.txt`",
+                    explains: Some("cannot apply the redirection"),
+                },
+                cwd_ends: None,
+            },
+            // A directory change cmd.exe reads and the tracking cannot follow.
+            WindowsCase {
+                name: "a fused cd target",
+                command: "cd.. && grep -rn needle .",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "`cd` member",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a cd inside a keyword form",
+                command: "if exist x cd sub && grep -rn needle .",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "keyword form",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a drive-relative cd target",
+                command: "cd C:ws && grep -rn needle .",
+                home: true,
+                verdict: WindowsVerdict::Refused {
+                    needle: "cd untrackable",
+                    explains: None,
+                },
+                cwd_ends: None,
+            },
+            // A grep word in argument position is not the search the class
+            // refuses.
+            WindowsCase {
+                name: "a grep word in an argument",
+                command: "echo hi & echo (grep is a tool)",
+                home: true,
+                verdict: WindowsVerdict::Exempt,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a grep word in a parenthesised argument",
+                command: "echo (grep x f.txt)",
+                home: true,
+                verdict: WindowsVerdict::Exempt,
+                cwd_ends: None,
+            },
+            // The Windows exemption list: the shapes left to the platform as
+            // written — neither served nor refused.
+            WindowsCase {
+                name: "a line with no search",
+                command: "echo hi",
+                home: true,
+                verdict: WindowsVerdict::Exempt,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a git commit message mentioning grep",
+                command: "git commit -m \"grep fix\"",
+                home: true,
+                verdict: WindowsVerdict::Exempt,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "an echoed grep word",
+                command: "echo grep",
+                home: true,
+                verdict: WindowsVerdict::Exempt,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a relative path to a grep file",
+                command: r".\grep -n x f.txt",
+                home: true,
+                verdict: WindowsVerdict::Exempt,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "an absolute path to a grep file",
+                command: r"C:\tools\grep.exe -rn x .",
+                home: true,
+                verdict: WindowsVerdict::Exempt,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "an upper-case git grep word",
+                command: "GIT GREP x",
+                home: true,
+                verdict: WindowsVerdict::Exempt,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a grep word glued to a leading brace",
+                command: "{grep x f.txt",
+                home: true,
+                verdict: WindowsVerdict::Exempt,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a redirect glued to the verb",
+                command: "grep>x f.txt",
+                home: true,
+                verdict: WindowsVerdict::Exempt,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "an unlisted program's argument",
+                command: "foo grep x",
+                home: true,
+                verdict: WindowsVerdict::Exempt,
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "a find -exec grep with an escaped semicolon",
+                command: r"find . -exec grep x {} \;",
+                home: true,
+                verdict: WindowsVerdict::Exempt,
+                cwd_ends: None,
+            },
+            // git's own search and another machine's are recorded as skipped
+            // members, deliberately unserved rather than refused.
+            WindowsCase {
+                name: "a git grep is a skipped member",
+                command: "git grep x",
+                home: true,
+                verdict: WindowsVerdict::Skipped { reason: None },
+                cwd_ends: None,
+            },
+            WindowsCase {
+                name: "an ssh search is a skipped member",
+                command: "ssh host grep -rn x /srv",
+                home: true,
+                verdict: WindowsVerdict::Skipped { reason: None },
+                cwd_ends: None,
+            },
+        ];
+        let windows = ShellPlatform::Windows;
+        for case in cases {
+            let case_home = case.home.then_some(home.as_path());
+            if let WindowsVerdict::Refused { needle, explains } = &case.verdict {
+                let cause = refused(
+                    case.command,
+                    &ws,
+                    case_home.expect("a refused row hands over a home"),
+                );
+                assert!(
+                    cause.contains(needle),
+                    "{}: reason {cause:?} lacks {needle:?}",
+                    case.name
+                );
+                if let Some(explains) = explains {
+                    assert!(
+                        cause.contains(explains),
+                        "{}: the cause explains the refusal: {cause:?}",
+                        case.name
+                    );
+                }
+                continue;
+            }
+            let mut serve = serve_command(case.command, &ws, case_home, windows, || true);
             assert!(
-                serve.rewritten.is_some(),
-                "{command}: expected to be served, got {:?}",
+                serve.refusal.is_none(),
+                "{}: must not be refused: {:?}",
+                case.name,
                 serve.refusal
             );
+            match &case.verdict {
+                WindowsVerdict::Served => {
+                    let rewritten = serve
+                        .rewritten
+                        .take()
+                        .unwrap_or_else(|| panic!("{}: expected a rewrite", case.name));
+                    assert!(
+                        rewritten.contains(ENGINE_VERB),
+                        "{}: {rewritten}",
+                        case.name
+                    );
+                    if let Some(suffix) = case.cwd_ends {
+                        let cwd = spec_cwd(&serve.spec_files);
+                        assert!(
+                            cwd.ends_with(suffix),
+                            "{}: tracked cwd {cwd:?} does not end with {suffix:?}",
+                            case.name
+                        );
+                    }
+                    drop(SpecFiles(serve.spec_files));
+                }
+                WindowsVerdict::Skipped { reason } => {
+                    assert!(serve.rewritten.is_none(), "{}: nothing to serve", case.name);
+                    assert_eq!(
+                        serve.outcomes.len(),
+                        1,
+                        "{}: recorded as a skipped member",
+                        case.name
+                    );
+                    assert!(!serve.outcomes[0].served, "{}: left unserved", case.name);
+                    if let Some(reason) = reason {
+                        assert_eq!(
+                            serve.outcomes[0].reason, *reason,
+                            "{}: the skip is named",
+                            case.name
+                        );
+                    }
+                }
+                // Nothing to serve: Exempt, and Refused rows left the loop above.
+                _ => assert!(serve.rewritten.is_none(), "{}: nothing to serve", case.name),
+            }
         }
 
-        // Windows: the engine is the only search there, so the line's own
-        // environment is not a parity question.
-        let serve = serve_command(
-            "export LC_ALL=C && grep -rn needle .",
-            &ws,
-            Some(&home),
-            ShellPlatform::Windows,
-            || true,
-            None,
-        );
-        assert!(
-            serve.refusal.is_none(),
-            "windows must still serve: {:?}",
-            serve.refusal
-        );
+        // Two spellings of this process's own image cannot be literal rows: each
+        // names the file this test binary actually has. Both are a member the
+        // runner cannot run as one plain call of the image.
+        for (command, needle) in [
+            (
+                format!("start {image} -V && grep -rn needle ."),
+                "runs `mahbot` itself",
+            ),
+            (
+                format!(r".\{name} -V && grep -rn needle ."),
+                "names `mahbot`'s file name",
+            ),
+        ] {
+            let cause = refused(&command, &ws, &home);
+            assert!(
+                cause.contains(needle),
+                "{command}: reason {cause:?} lacks {needle:?}"
+            );
+        }
     }
 
     /// A line that runs this service's own program beside a search is served like
@@ -7034,14 +7661,8 @@ mod refusal_pins {
             format!("{image} -V | grep needle"),
             format!("echo hi && {image} -V && grep -rn needle ."),
         ] {
-            let mut serve = serve_command(
-                &command,
-                &ws,
-                Some(&home),
-                ShellPlatform::Windows,
-                || true,
-                None,
-            );
+            let mut serve =
+                serve_command(&command, &ws, Some(&home), ShellPlatform::Windows, || true);
             assert!(
                 serve.refusal.is_none(),
                 "{command}: must be served, not refused: {:?}",
@@ -7060,481 +7681,324 @@ mod refusal_pins {
         drop(SpecFiles(files));
     }
 
+    /// What a Unix row's serve decision must produce. Unix never refuses: an
+    /// unserved member keeps running the real `grep`.
+    enum UnixVerdict {
+        /// A rewrite naming the engine; `keeps` is a sibling the rewrite must
+        /// carry verbatim.
+        Served { keeps: Option<&'static str> },
+        /// One analysed member left unserved with this named cause.
+        Fallback(&'static str),
+        /// Nothing served, with no member analysis asserted.
+        Exempt,
+        /// One analysed member skipped with this named cause.
+        Skipped(&'static str),
+    }
+
+    struct UnixCase {
+        name: &'static str,
+        command: &'static str,
+        home: bool,
+        verdict: UnixVerdict,
+    }
+
+    /// The Unix half of the verdict table: never a refusal, the fallback and the
+    /// served siblings both pinned per spelling.
     #[test]
-    fn windows_refuses_every_version_of_an_unserved_search() {
+    #[expect(clippy::too_many_lines)] // one cohesive table over the Unix verdicts
+    fn unix_never_refuses_and_keeps_the_fallback() {
         let (_tmp, ws, home) = serve_fixture();
-        let rows: &[(&str, &str)] = &[
-            // A member in grep-verb position the serve decision rejected.
-            ("grep -P x f.txt", "unsupported flag -P"),
-            // A `;` outside quotes: cmd.exe reads it as an argument delimiter,
-            // so the cmd.exe model refuses the line before any member exists.
-            ("echo a; grep x f.txt", "unquoted `;`"),
-            // A caret outside quotes: unmodellable, and a search is present.
-            ("grep ^fn src/main.rs", "the whole line"),
-            // A nested/compound member the engine never claims.
-            ("xargs grep x f.txt", "nested grep"),
-            // A `cd` the tracked-cwd model cannot resolve (`/x` is switch-shaped
-            // to cmd.exe; a `-x` target would be an ordinary directory name
-            // there, served statically and diverging only at runtime, where the
-            // engine's own sentinel refuses).
-            ("cd /x && grep x f.txt", "cd untrackable"),
-            // The family's untrackable halves: `popd` returns to a directory
-            // only the pushed stack knows, and a bare `pushd` is not `cd`'s
-            // no-op. Neither is modelled, so the cwd after them is unknown.
-            ("popd && grep -rn x .", "cd untrackable"),
-            ("pushd && grep -rn x .", "cd untrackable"),
-            // A command group, which cmd.exe parses itself (and which the
-            // group tracking below never sees: the line is unreadable first).
-            ("(grep x f.txt)", "the whole line"),
-            // One servable member plus one the engine cannot serve: the whole
-            // command is refused rather than half-served.
-            ("grep -rn needle . && xargs grep x f.txt", "nested grep"),
-            // A second grep in a pipeline consumes the engine's stream through
-            // a program this platform does not have.
-            ("grep -rn needle . | grep -v skip", "nested grep"),
-            // A grep inside another interpreter's command line: that
-            // interpreter's own reading of the payload, which the engine can
-            // neither serve nor hand back to a real `grep` on this platform.
-            // Every spelling of a verb is one verb (case and `.exe` folded):
-            // the switch's spelling does not decide whether the search is seen.
-            ("cmd /c grep -rn x .", "nested grep"),
-            ("CMD /C GREP -rn x .", "nested grep"),
-            ("cmd.exe /c grep -rn x .", "nested grep"),
-            // A wrapped interpreter receives its payload as ONE quoted word:
-            // the quoted content is the command line it will read, so a search
-            // there is the same nested search however the quotes are placed.
-            (r#"cmd /c "grep -rn x .""#, "nested grep"),
-            ("powershell -c \"git log | grep x\"", "nested grep"),
-            // A redirect glued to a word: cmd.exe splits `x>out.txt` into the
-            // argument `x` plus a redirect, while the shared token classifier
-            // reads an operator only where it OPENS the word — so serving it
-            // would search for different text and drop the redirect. The
-            // segmenter's `>&` reading (`a>&echo`) lands in the same class.
-            ("grep -n x>out.txt f.txt", "redirect in `x>out.txt`"),
-            ("grep -rn x>log .", "redirect in `x>log`"),
-            ("grep a>&echo done", "redirect in `a>&echo`"),
-            // `%…%` is expanded by cmd.exe before any program sees its argv —
-            // an undefined name expands to nothing — so a pattern or a filter
-            // spelling a pair cannot be served literally either. The reading is
-            // per word and counts `%` characters, so `100%%` is refused too.
-            ("grep -n %TEMP% f.txt", "two `%` in %TEMP%"),
-            ("grep -n x --include=%x% f.txt", "two `%` in --include=%x%"),
-            ("grep -n 100%% f.txt", "two `%` in 100%%"),
+        let cases: &[UnixCase] = &[
+            // A line that exports a new environment before its search is left to
+            // the real `grep`, which answers in the environment the line built.
+            UnixCase {
+                name: "an export before a search",
+                command: "export LC_ALL=C; grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Fallback("the line changes the environment first"),
+            },
+            UnixCase {
+                name: "an export joined by &&",
+                command: "export LC_ALL=C && grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Fallback("the line changes the environment first"),
+            },
+            UnixCase {
+                name: "an unset before a search",
+                command: "unset LANG; grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Fallback("the line changes the environment first"),
+            },
+            UnixCase {
+                name: "an eval export before a search",
+                command: "eval \"export LC_ALL=C\"; grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Fallback("the line changes the environment first"),
+            },
+            UnixCase {
+                name: "a source before a search",
+                command: "source /dev/null; grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Fallback("the line changes the environment first"),
+            },
+            UnixCase {
+                name: "a quoted builtin before a search",
+                command: "\"export\" LC_ALL=C; grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Fallback("the line changes the environment first"),
+            },
+            UnixCase {
+                name: "an escaped builtin before a search",
+                command: "\\export LC_ALL=C; grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Fallback("the line changes the environment first"),
+            },
+            UnixCase {
+                name: "a subshell export before a search",
+                command: "(export LC_ALL=C); grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Fallback("the line changes the environment first"),
+            },
+            UnixCase {
+                name: "a lone assignment before a search",
+                command: "LC_ALL=C; grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Fallback("the line changes the environment first"),
+            },
+            UnixCase {
+                name: "a path assignment before a search",
+                command: "PATH=/opt/bin:$PATH; grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Fallback("the line changes the environment first"),
+            },
+            UnixCase {
+                name: "an assignment prefixed to a builtin",
+                command: "LC_ALL=C export FOO=1; grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Fallback("the line changes the environment first"),
+            },
+            UnixCase {
+                name: "an export inside a compound body",
+                command: "if true; then export LC_ALL=C; fi; grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Fallback("the line changes the environment first"),
+            },
+            // A search before the export runs in the environment the product
+            // handed over; a line changing nothing about it is served as usual.
+            UnixCase {
+                name: "a search before an export",
+                command: "grep -rn needle . ; export LC_ALL=C",
+                home: true,
+                verdict: UnixVerdict::Served { keeps: None },
+            },
+            UnixCase {
+                name: "a search after a cd",
+                command: "cd . && grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Served { keeps: None },
+            },
+            UnixCase {
+                name: "a search after an unrelated command",
+                command: "echo hi; grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Served { keeps: None },
+            },
+            UnixCase {
+                name: "an assignment-looking argument before a search",
+                command: "echo KEY=value; grep -rn needle .",
+                home: true,
+                verdict: UnixVerdict::Served { keeps: None },
+            },
+            UnixCase {
+                name: "a KEY=value pattern",
+                command: "grep -rn KEY=value .",
+                home: true,
+                verdict: UnixVerdict::Served { keeps: None },
+            },
+            UnixCase {
+                name: "an export in a pipeline head",
+                command: "export LC_ALL=C | grep needle",
+                home: true,
+                verdict: UnixVerdict::Served { keeps: None },
+            },
+            UnixCase {
+                name: "an assignment in a pipeline head",
+                command: "LC_ALL=C echo hi | grep needle",
+                home: true,
+                verdict: UnixVerdict::Served { keeps: None },
+            },
+            // The servable member is still served while the rejected sibling
+            // runs the real `grep`.
+            UnixCase {
+                name: "a served sibling of a rejected member",
+                command: "grep -rn needle . && xargs grep x f.txt",
+                home: true,
+                verdict: UnixVerdict::Served {
+                    keeps: Some("xargs grep x f.txt"),
+                },
+            },
+            // The `%…%` reading is the cmd.exe one alone.
+            UnixCase {
+                name: "a percent pair on unix",
+                command: "grep -rn %TEMP% .",
+                home: true,
+                verdict: UnixVerdict::Served { keeps: None },
+            },
+            UnixCase {
+                name: "a percent pair in an include filter on unix",
+                command: "grep -rn x --include=%x% .",
+                home: true,
+                verdict: UnixVerdict::Served { keeps: None },
+            },
+            UnixCase {
+                name: "a bang in a quoted pattern on unix",
+                command: "grep -rn \"a!b\" .",
+                home: true,
+                verdict: UnixVerdict::Served { keeps: None },
+            },
+            // The rows Windows refuses are the unix fallback: the real `grep`
+            // keeps running.
+            UnixCase {
+                name: "an unsupported flag",
+                command: "grep -P x f.txt",
+                home: true,
+                verdict: UnixVerdict::Exempt,
+            },
+            UnixCase {
+                name: "an unquoted semicolon",
+                command: "echo a; grep x f.txt",
+                home: true,
+                verdict: UnixVerdict::Exempt,
+            },
+            UnixCase {
+                name: "a line-wide caret",
+                command: "grep ^fn src/main.rs",
+                home: true,
+                verdict: UnixVerdict::Exempt,
+            },
+            UnixCase {
+                name: "an xargs-wrapped search",
+                command: "xargs grep x f.txt",
+                home: true,
+                verdict: UnixVerdict::Exempt,
+            },
+            UnixCase {
+                name: "a cd the tracking cannot follow",
+                command: "cd /x && grep x f.txt",
+                home: true,
+                verdict: UnixVerdict::Exempt,
+            },
+            UnixCase {
+                name: "a command group",
+                command: "(grep x f.txt)",
+                home: true,
+                verdict: UnixVerdict::Exempt,
+            },
+            UnixCase {
+                name: "a git grep",
+                command: "git grep x",
+                home: true,
+                verdict: UnixVerdict::Exempt,
+            },
+            // Without a home nothing that could expand `~` is served, and
+            // nothing is refused either.
+            UnixCase {
+                name: "a search without a home",
+                command: "grep -rn needle .",
+                home: false,
+                verdict: UnixVerdict::Exempt,
+            },
+            // A wrapped interpreter is a skipped member on unix too.
+            UnixCase {
+                name: "a cmd-wrapped search",
+                command: "cmd /c grep x f.txt",
+                home: true,
+                verdict: UnixVerdict::Skipped("nested grep"),
+            },
         ];
-        for (command, cause) in rows {
-            let reason = refused(command, &ws, &home);
-            assert!(
-                reason.contains(cause),
-                "{command}: reason {reason:?} lacks {cause:?}"
-            );
-        }
-        // A member that names this service's own program in a shape the runner
-        // cannot run as one plain call of it refuses the whole line too, so a
-        // search beside it is never run without it: a launcher spelling, and a
-        // relative spelling of this image's own file name. Both are built from
-        // this process's path — the name the comparison rests on is the one this
-        // test binary actually has.
-        let exe = std::env::current_exe().expect("this process's own path");
-        let name = exe
-            .file_name()
-            .expect("an executable has a file name")
-            .to_string_lossy()
-            .to_string();
-        for (command, cause) in [
-            (
-                format!("start {} -V && grep -rn needle .", exe.display()),
-                "runs `mahbot` itself",
-            ),
-            (
-                format!(r".\{name} -V && grep -rn needle ."),
-                "names `mahbot`'s file name",
-            ),
-        ] {
-            let reason = refused(&command, &ws, &home);
-            assert!(
-                reason.contains(cause),
-                "{command}: reason {reason:?} lacks {cause:?}"
-            );
-        }
-    }
-
-    /// The narrowing: a lone `%` and every `!` are ordinary characters to the
-    /// interpreter this process spawns (`cmd /C` with `/V:OFF`), so the searches
-    /// they appear in are served rather than refused.
-    #[test]
-    fn windows_serves_the_lone_percent_and_bang_searches() {
-        let (_tmp, ws, home) = serve_fixture();
-        for command in [
-            r#"grep -rn "!=" src/main.rs"#,
-            r#"grep -n "50%" src/main.rs"#,
-            r#"grep -rn "!important" ."#,
-        ] {
-            let (_rewritten, files) = served(command, &ws, &home, ShellPlatform::Windows);
-            drop(SpecFiles(files));
-        }
-    }
-
-    /// The redirect shapes the runner applies by itself are served: a `>`
-    /// target word of its own is kept verbatim (the runner opens the file the
-    /// shell would have opened), a target glued to its operator is the same
-    /// redirect, a `2>&1` is the merge it performs at the member's stdout
-    /// destination, and a `>` inside quotes is ordinary text to the program that
-    /// receives the word — the served member's text rides the spec file, never
-    /// this command line. A redirect the runner cannot apply is refused instead;
-    /// [`windows_refuses_a_redirect_the_runner_cannot_apply`] holds that half.
-    #[test]
-    fn windows_serves_the_readable_redirect_shapes() {
-        let (_tmp, ws, home) = serve_fixture();
-        for command in [
-            "grep -n needle f.txt > out.txt",
-            "grep -n needle f.txt >> out.txt",
-            "grep -n needle f.txt 2> err.txt",
-            "grep -n needle f.txt < f.txt",
-            "grep -n needle f.txt 2>&1",
-            "grep -n needle f.txt 2>&1 | head -2",
-            r#"grep -n "a>b" f.txt"#,
-            // The glued spellings: cmd.exe splits neither the operator from its
-            // target nor the word they follow.
-            "grep -n needle f.txt >out.txt",
-            "grep -n needle f.txt >>log.txt",
-            "grep -n needle f.txt 2>err.txt",
-            "grep -n needle f.txt 2>>log.txt",
-            "grep -n needle f.txt <in.txt",
-            "grep -n needle f.txt 1>0",
-        ] {
-            let (rewritten, files) = served(command, &ws, &home, ShellPlatform::Windows);
-            assert!(rewritten.contains(ENGINE_VERB), "{command}: {rewritten}");
-            drop(SpecFiles(files));
-        }
-    }
-
-    /// A served member's redirect spelling the runner cannot apply to a member it
-    /// spawns itself refuses the whole command on Windows — never a member run
-    /// under a stream the runner has silently approximated. The refusal names the
-    /// spelling, and no rewrite is produced (so no spec file is either).
-    #[test]
-    fn windows_refuses_a_redirect_the_runner_cannot_apply() {
-        let (_tmp, ws, home) = serve_fixture();
-        let rows: &[(&str, &str)] = &[
-            ("grep -n needle f.txt >&2", "`>&2`"),
-            ("grep -n needle f.txt 1>&2", "`1>&2`"),
-            ("grep -n needle f.txt 3>&1", "`3>&1`"),
-            ("grep -n needle f.txt 10> out.txt", "`10>`"),
-            ("grep -n needle f.txt 10>out.txt", "`10>out.txt`"),
-            ("grep -n needle f.txt <>f.txt", "`<>f.txt`"),
-            // The rest of the runner's closed set's refusals: descriptor dups that
-            // are not the stdout merge, a redirect with no target word, and a target
-            // cmd.exe would have expanded before the member ran — refused, never
-            // expanded.
-            ("grep -n needle f.txt >& out.txt", "`>&`"),
-            ("grep -n needle f.txt 2>>&1", "`2>>&1`"),
-            ("grep -n needle f.txt >", "its target word is missing"),
-            ("grep -n needle f.txt > %TMPOUT%", "`%TMPOUT%`"),
-            // A drive-relative target names the current directory of another
-            // drive, which the runner does not track.
-            ("grep -n needle f.txt > C:out.txt", "`C:out.txt`"),
-        ];
-        for (command, cause) in rows {
-            let reason = refused(command, &ws, &home);
-            assert!(
-                reason.contains(cause),
-                "{command}: reason {reason:?} lacks {cause:?}"
-            );
-            assert!(
-                reason.contains("cannot apply the redirection"),
-                "{command}: the cause explains the refusal: {reason:?}"
-            );
-        }
-    }
-
-    /// A directory change cmd.exe reads and the tracking cannot follow refuses the
-    /// whole command on Windows: the search after it would otherwise run in the
-    /// directory the line was in before that change — the runner spawns every step
-    /// itself, so nothing downstream could still notice the divergence. Two rows
-    /// pin the served path's own wiring; the family's spellings, and the pipeline
-    /// case, are pinned once in the plan module's own refusal test.
-    #[test]
-    fn windows_refuses_a_cd_the_runner_cannot_follow() {
-        let (_tmp, ws, home) = serve_fixture();
-        let rows: &[(&str, &str)] = &[
-            // cmd.exe's own spelling of the builtin with its target or switch fused
-            // to the name: the plan's own reading refuses it, naming the member.
-            ("cd.. && grep -rn needle .", "`cd` member"),
-            // A `cd` inside one of the shell's own keyword forms: whether it runs is
-            // the keyword's condition to decide, which the plan refuses.
-            ("if exist x cd sub && grep -rn needle .", "keyword form"),
-            // A target the shared resolver refuses, before any plan is built.
-            ("cd C:ws && grep -rn needle .", "cd untrackable"),
-        ];
-        for (command, cause) in rows {
-            let reason = refused(command, &ws, &home);
-            assert!(
-                reason.contains(cause),
-                "{command}: reason {reason:?} lacks {cause:?}"
-            );
-        }
-    }
-
-    /// The tolerant command-position scan reads command separators and a
-    /// leading group opener, so a grep word in ARGUMENT position (`echo (grep
-    /// is a tool)`) is not the search the class refuses.
-    #[test]
-    fn windows_does_not_refuse_a_grep_word_in_argument_position() {
-        let (_tmp, ws, home) = serve_fixture();
-        for command in ["echo hi & echo (grep is a tool)", "echo (grep x f.txt)"] {
-            let serve = serve_command(
-                command,
-                &ws,
-                Some(&home),
-                ShellPlatform::Windows,
-                || true,
-                None,
-            );
+        for case in cases {
+            let case_home = case.home.then_some(home.as_path());
+            let mut serve =
+                serve_command(case.command, &ws, case_home, ShellPlatform::Unix, || true);
             assert!(
                 serve.refusal.is_none(),
-                "{command}: must not be refused: {:?}",
+                "{}: unix never refuses: {:?}",
+                case.name,
                 serve.refusal
             );
-            assert!(serve.rewritten.is_none(), "{command}: nothing to serve");
-        }
-    }
-
-    /// The double-quoted spelling of the same search is readable (the caret is
-    /// inside quotes), so it is served, not refused.
-    #[test]
-    fn windows_serves_the_quoted_caret_spelling() {
-        let (_tmp, ws, home) = serve_fixture();
-        let mut serve = serve_command(
-            "grep \"^fn \" src/main.rs",
-            &ws,
-            Some(&home),
-            ShellPlatform::Windows,
-            || true,
-            None,
-        );
-        assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
-        assert!(serve.rewritten.is_some(), "a serveable search");
-        drop(SpecFiles(std::mem::take(&mut serve.spec_files)));
-    }
-
-    /// The Windows exemption list of the module header: the shapes left to the
-    /// platform as written — neither served nor refused, so the platform's own
-    /// program is what runs.
-    #[test]
-    fn windows_leaves_every_exempt_shape_alone() {
-        let (_tmp, ws, home) = serve_fixture();
-        for command in [
-            "echo hi",
-            "git commit -m \"grep fix\"",
-            "echo grep",
-            // A program spelled with a path is a file, not this platform's
-            // `grep` verb, so the segment runs as written — the reading unix
-            // gives `./grep` (the engine cannot tell whether such a program
-            // exists, and the interpreter's own error names it if it does not).
-            r".\grep -n x f.txt",
-            r"C:\tools\grep.exe -rn x .",
-            // The search-owning list is folded like every other verb list, so
-            // the exemption holds for any spelling of the program.
-            "GIT GREP x",
-            // A grep word glued to a leading `{`: `{grep` names no command on
-            // either platform, so the line carries no invocation to claim.
-            "{grep x f.txt",
-            // A redirect glued to the verb extends the command word (`grep>x`),
-            // which names no search either.
-            "grep>x f.txt",
-            // An unlisted program's argument list is data to this reading.
-            "foo grep x",
-            // The `\;` spelling stops the cmd reading before any member exists;
-            // the `+` spelling of the same `find` refuses instead.
-            r"find . -exec grep x {} \;",
-        ] {
-            let serve = serve_command(
-                command,
-                &ws,
-                Some(&home),
-                ShellPlatform::Windows,
-                || true,
-                None,
-            );
-            assert!(
-                serve.refusal.is_none(),
-                "{command}: must not be refused: {:?}",
-                serve.refusal
-            );
-            assert!(serve.rewritten.is_none(), "{command}: nothing to serve");
-        }
-
-        // `git grep x` is git's own search: recorded as a skipped member, and
-        // deliberately left unserved-but-allowed rather than refused.
-        let serve = serve_command(
-            "git grep x",
-            &ws,
-            Some(&home),
-            ShellPlatform::Windows,
-            || true,
-            None,
-        );
-        assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
-        assert!(serve.rewritten.is_none());
-        assert_eq!(serve.outcomes.len(), 1, "recorded as a skipped member");
-        assert!(!serve.outcomes[0].served);
-
-        // `ssh host grep …` searches another machine: again no member to serve
-        // and, crucially, nothing to refuse — this platform can run the command
-        // as written.
-        let serve = serve_command(
-            "ssh host grep -rn x /srv",
-            &ws,
-            Some(&home),
-            ShellPlatform::Windows,
-            || true,
-            None,
-        );
-        assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
-        assert!(serve.rewritten.is_none());
-        assert_eq!(serve.outcomes.len(), 1, "recorded as a skipped member");
-    }
-
-    /// Unix never refuses and never produces a rewrite for these rows: the
-    /// member the engine cannot serve keeps running the real `grep`.
-    #[test]
-    fn unix_keeps_the_fallback_and_never_refuses() {
-        let (_tmp, ws, home) = serve_fixture();
-        let rows = [
-            "grep -P x f.txt",
-            "echo a; grep x f.txt",
-            "grep ^fn src/main.rs",
-            "xargs grep x f.txt",
-            "cd /x && grep x f.txt",
-            "(grep x f.txt)",
-            "git grep x",
-        ];
-        for command in rows {
-            let serve = serve_command(
-                command,
-                &ws,
-                Some(&home),
-                ShellPlatform::Unix,
-                || true,
-                None,
-            );
-            assert!(
-                serve.refusal.is_none(),
-                "{command}: unix keeps the fallback: {:?}",
-                serve.refusal
-            );
-            assert!(
-                serve.rewritten.is_none(),
-                "{command}: nothing to serve (got {:?})",
-                serve.rewritten
-            );
-        }
-    }
-
-    /// The routing hands the analysis no home on Windows — nothing there
-    /// expands `~`, so the `home` arms of `resolve_operand`/`resolve_cd` are
-    /// unreachable — and the placeholder it substitutes for the one the analysis
-    /// takes must therefore never be consulted: a member whose cwd tracking and
-    /// operands resolve statically is served with no home at all. Unix keeps its
-    /// documented reading of the same absence (nothing that could expand `~` is
-    /// served, and nothing is refused either).
-    #[test]
-    fn windows_serves_without_a_home() {
-        let (_tmp, ws, _home) = serve_fixture();
-        let mut windows = serve_command(
-            "cd src && grep -n needle main.rs",
-            &ws,
-            None,
-            ShellPlatform::Windows,
-            || true,
-            None,
-        );
-        assert!(windows.refusal.is_none(), "{:?}", windows.refusal);
-        let rewritten = windows.rewritten.take().expect("served with no home");
-        assert!(rewritten.contains(ENGINE_VERB), "{rewritten}");
-        let cwd = spec_cwd(&windows.spec_files);
-        assert!(cwd.ends_with("src"), "tracked cwd: {cwd}");
-        drop(SpecFiles(windows.spec_files));
-
-        let unix = serve_command(
-            "grep -rn needle .",
-            &ws,
-            None,
-            ShellPlatform::Unix,
-            || true,
-            None,
-        );
-        assert!(unix.rewritten.is_none(), "unix demotes without a home");
-        assert!(unix.refusal.is_none(), "and refuses nothing there");
-    }
-
-    /// The interpreter names `cmd`, `powershell` and `pwsh` are list entries on
-    /// unix too: a `cmd /c grep …` line records a skipped member there and still
-    /// refuses nothing, since nothing about its serve decision or its text
-    /// changes.
-    #[test]
-    fn unix_records_a_wrapped_interpreter_as_a_skip_without_refusing() {
-        let (_tmp, ws, home) = serve_fixture();
-        let serve = serve_command(
-            "cmd /c grep x f.txt",
-            &ws,
-            Some(&home),
-            ShellPlatform::Unix,
-            || true,
-            None,
-        );
-        assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
-        assert!(serve.rewritten.is_none());
-        assert_eq!(serve.outcomes.len(), 1);
-        assert!(!serve.outcomes[0].served);
-        assert_eq!(serve.outcomes[0].reason, "nested grep");
-    }
-
-    /// The unix twin of the mixed row above: the servable member is still
-    /// served while the rejected sibling runs the real `grep`.
-    #[test]
-    fn unix_still_serves_a_sibling_of_a_rejected_member() {
-        let (_tmp, ws, home) = serve_fixture();
-        let mut serve = serve_command(
-            "grep -rn needle . && xargs grep x f.txt",
-            &ws,
-            Some(&home),
-            ShellPlatform::Unix,
-            || true,
-            None,
-        );
-        assert!(serve.refusal.is_none(), "{:?}", serve.refusal);
-        let rewritten = serve.rewritten.take().expect("the sibling is served");
-        assert!(rewritten.contains(ENGINE_VERB), "{rewritten}");
-        assert!(rewritten.contains("xargs grep x f.txt"), "{rewritten}");
-    }
-
-    /// The `%…%` reading is the cmd.exe one alone: on unix a `%` and a `!`
-    /// are ordinary characters, so every one of these is served — including the
-    /// rows Windows still refuses for their `%` pair.
-    #[test]
-    fn unix_serves_the_percent_and_bang_searches() {
-        let (_tmp, ws, home) = serve_fixture();
-        for command in [
-            "grep -rn %TEMP% .",
-            "grep -rn x --include=%x% .",
-            "grep -rn \"a!b\" .",
-        ] {
-            let mut serve = serve_command(
-                command,
-                &ws,
-                Some(&home),
-                ShellPlatform::Unix,
-                || true,
-                None,
-            );
-            assert!(serve.refusal.is_none(), "{command}: {:?}", serve.refusal);
-            assert!(
-                serve.rewritten.is_some(),
-                "{command}: served on unix (got {:?})",
-                serve.rewritten
-            );
-            drop(SpecFiles(std::mem::take(&mut serve.spec_files)));
+            match &case.verdict {
+                UnixVerdict::Served { keeps } => {
+                    let rewritten = serve
+                        .rewritten
+                        .take()
+                        .unwrap_or_else(|| panic!("{}: expected a rewrite", case.name));
+                    assert!(
+                        rewritten.contains(ENGINE_VERB),
+                        "{}: {rewritten}",
+                        case.name
+                    );
+                    if let Some(keeps) = keeps {
+                        assert!(
+                            rewritten.contains(keeps),
+                            "{}: the sibling is kept verbatim: {rewritten}",
+                            case.name
+                        );
+                    }
+                    drop(SpecFiles(serve.spec_files));
+                }
+                UnixVerdict::Fallback(reason) => {
+                    assert!(
+                        serve.rewritten.is_none(),
+                        "{}: nothing to serve (got {:?})",
+                        case.name,
+                        serve.rewritten
+                    );
+                    assert_eq!(
+                        serve.outcomes.len(),
+                        1,
+                        "{}: the member is analysed",
+                        case.name
+                    );
+                    assert!(
+                        !serve.outcomes[0].served,
+                        "{}: the member falls back",
+                        case.name
+                    );
+                    assert_eq!(
+                        serve.outcomes[0].reason, *reason,
+                        "{}: the cause is named",
+                        case.name
+                    );
+                }
+                UnixVerdict::Exempt => {
+                    assert!(
+                        serve.rewritten.is_none(),
+                        "{}: nothing to serve (got {:?})",
+                        case.name,
+                        serve.rewritten
+                    );
+                }
+                UnixVerdict::Skipped(reason) => {
+                    assert!(
+                        serve.rewritten.is_none(),
+                        "{}: nothing to serve (got {:?})",
+                        case.name,
+                        serve.rewritten
+                    );
+                    assert_eq!(
+                        serve.outcomes.len(),
+                        1,
+                        "{}: recorded as a skipped member",
+                        case.name
+                    );
+                    assert!(!serve.outcomes[0].served, "{}: left unserved", case.name);
+                    assert_eq!(
+                        serve.outcomes[0].reason, *reason,
+                        "{}: the skip is named",
+                        case.name
+                    );
+                }
+            }
         }
     }
 }
@@ -7555,14 +8019,7 @@ mod plan_pins {
     /// Windows, with the engine probe bypassed. The platform and the probe are
     /// arguments, so the whole decomposition is drivable from this host.
     fn served_with_plan(command: &str, ws: &Path, home: &Path) -> (String, Plan, Vec<PathBuf>) {
-        let mut serve = serve_command(
-            command,
-            ws,
-            Some(home),
-            ShellPlatform::Windows,
-            || true,
-            None,
-        );
+        let mut serve = serve_command(command, ws, Some(home), ShellPlatform::Windows, || true);
         assert!(
             serve.refusal.is_none(),
             "{command}: served, not refused: {:?}",
@@ -7622,11 +8079,27 @@ mod plan_pins {
         members
     }
 
+    /// A cwd a plan case expects, resolved against the fixture's workspace:
+    /// the tracked root, or its `src` child.
+    #[derive(Clone, Copy)]
+    enum ExpectedCwd {
+        Root,
+        Src,
+    }
+
+    struct PlanCase {
+        name: &'static str,
+        command: String,
+        /// The cwd every step must carry, when the row pins them.
+        cwds: Option<&'static [ExpectedCwd]>,
+    }
+
     /// The drift guard: the rendered rewrite IS the plan, read back with
     /// cmd.exe's own model. Every fold's members are byte-identical to the
     /// rewrite's members, every own-image step's member delivers exactly the argv
-    /// the runner spawns (`[exe] ++ args ++ redirects`), and the connectors
-    /// between the members are the plan's.
+    /// the runner spawns (`[exe] ++ args ++ redirects`), the connectors between
+    /// the members are the plan's, and every step's cwd is the one the analyzer
+    /// tracked for its member.
     ///
     /// One exception, the divergence [`plan`]'s module header names: a member the
     /// rewrite carried verbatim keeps the spelling the agent typed for the image
@@ -7634,8 +8107,11 @@ mod plan_pins {
     /// member the image's word is compared by the file it names, and everything
     /// after it byte for byte.
     #[test]
-    fn the_plan_rejoins_into_the_rewritten_line() {
+    #[expect(clippy::too_many_lines)] // one cohesive table over the rewrite/plan pairs
+    fn the_plan_matches_the_rewritten_line() {
         let (_tmp, ws, home) = serve_fixture();
+        let root = canonical_or_lexical(&ws, ShellPlatform::Windows);
+        let src = root.join("src");
         // The image as this process spells it: the test binary's own file name is
         // what a bare-name call of it would be written with.
         let exe = std::env::current_exe().expect("this process's own path");
@@ -7646,39 +8122,101 @@ mod plan_pins {
             .to_string();
         let bare_call = format!("{name} -V && grep -rn needle .");
         let prefixed_call = format!("@{name} -V && grep -rn needle .");
-        let mut shapes: Vec<&str> = vec![
-            "grep -rn needle .",
-            "grep -rn needle . | head -3",
-            "cd src && grep -rn needle .",
-            "cd src && grep -rn needle . | head -3",
-            "grep needle f.txt && grep needle src/main.rs",
-            "grep -n needle f.txt > out.txt",
-            "grep -n needle f.txt >> out.txt",
-            "grep -n needle f.txt 2>&1",
-            "grep -n needle f.txt 2>&1 | head -2",
-            "type note.txt && grep -n needle f.txt",
+        let cases: Vec<PlanCase> = vec![
+            PlanCase {
+                name: "a lone search",
+                command: "grep -rn needle .".to_string(),
+                cwds: Some(&[ExpectedCwd::Root]),
+            },
+            PlanCase {
+                name: "a pipelined search",
+                command: "grep -rn needle . | head -3".to_string(),
+                cwds: None,
+            },
+            PlanCase {
+                name: "a cd before a search",
+                command: "cd src && grep -rn needle .".to_string(),
+                cwds: Some(&[ExpectedCwd::Root, ExpectedCwd::Src]),
+            },
+            PlanCase {
+                name: "a cd search and tail",
+                command: "cd src && grep -rn needle . | head -3".to_string(),
+                cwds: Some(&[ExpectedCwd::Root, ExpectedCwd::Src, ExpectedCwd::Src]),
+            },
+            // The `cd` is inside the fold that follows the search: the fold runs
+            // the `cd` itself, so it starts in the line's own cwd.
+            PlanCase {
+                name: "a cd in the fold after a search",
+                command: "grep -rn needle . && cd src && echo after".to_string(),
+                cwds: Some(&[ExpectedCwd::Root, ExpectedCwd::Root]),
+            },
+            PlanCase {
+                name: "two searches",
+                command: "grep needle f.txt && grep needle src/main.rs".to_string(),
+                cwds: Some(&[ExpectedCwd::Root, ExpectedCwd::Root]),
+            },
+            PlanCase {
+                name: "a search with a redirect",
+                command: "grep -n needle f.txt > out.txt".to_string(),
+                cwds: None,
+            },
+            PlanCase {
+                name: "a search with an append redirect",
+                command: "grep -n needle f.txt >> out.txt".to_string(),
+                cwds: None,
+            },
+            PlanCase {
+                name: "a search with the stdout merge",
+                command: "grep -n needle f.txt 2>&1".to_string(),
+                cwds: None,
+            },
+            PlanCase {
+                name: "a search with the stdout merge in a pipeline",
+                command: "grep -n needle f.txt 2>&1 | head -2".to_string(),
+                cwds: None,
+            },
+            PlanCase {
+                name: "a shell member before a search",
+                command: "type note.txt && grep -n needle f.txt".to_string(),
+                cwds: Some(&[ExpectedCwd::Root, ExpectedCwd::Root]),
+            },
+            PlanCase {
+                name: "a bare-name call of the image",
+                command: bare_call,
+                cwds: None,
+            },
+            PlanCase {
+                name: "an @-prefixed call of the image",
+                command: prefixed_call,
+                cwds: None,
+            },
         ];
-        shapes.push(&bare_call);
-        shapes.push(&prefixed_call);
-        for command in shapes {
+        for case in cases {
+            let command = case.command.as_str();
             let (rewritten, plan, files) = served_with_plan(command, &ws, &home);
             let written = windows::segment_command(&rewritten).expect("cmd.exe reads the rewrite");
             let planned = planned_members(&plan);
             assert_eq!(
                 written.len(),
                 planned.len(),
-                "{command}: the plan and the rewrite must have the same members \
-                 (rewrite: {rewritten})"
+                "{}: the plan and the rewrite must have the same members \
+                 (rewrite: {rewritten})",
+                case.name
             );
             let plan_exe = plan.exe.to_string_lossy();
             for (at, ((written_text, written_conn), (member, connector))) in
                 written.iter().zip(&planned).enumerate()
             {
-                assert_eq!(written_conn, connector, "{command}: connector before {at}");
+                assert_eq!(
+                    written_conn, connector,
+                    "{}: connector before {at}",
+                    case.name
+                );
                 match member {
                     Planned::Shell(text) => assert_eq!(
                         written_text, text,
-                        "{command}: the fold's member {at} must be verbatim"
+                        "{}: the fold's member {at} must be verbatim",
+                        case.name
                     ),
                     Planned::Own(args, redirects) => {
                         let delivered: Vec<String> = windows::tokenize(written_text)
@@ -7696,92 +8234,53 @@ mod plan_pins {
                             // the absolute path. The word must name the same file —
                             // cmd.exe's `@`/`(` punctuation is not part of it — and
                             // every word after it must be identical.
-                            assert_eq!(delivered.len(), expected.len(), "{command}: member {at}");
-                            assert_eq!(delivered[1..], expected[1..], "{command}: member {at}");
+                            assert_eq!(
+                                delivered.len(),
+                                expected.len(),
+                                "{}: member {at}",
+                                case.name
+                            );
+                            assert_eq!(delivered[1..], expected[1..], "{}: member {at}", case.name);
                             let named = delivered[0]
                                 .trim_start_matches(['@', '('])
                                 .trim_end_matches(')');
                             assert_eq!(
                                 std::path::Path::new(named).file_name(),
                                 std::path::Path::new(&expected[0]).file_name(),
-                                "{command}: member {at} names another file: {written_text}"
+                                "{}: member {at} names another file: {written_text}",
+                                case.name
                             );
                         }
                     }
                 }
             }
+            if let Some(cwds) = case.cwds {
+                let expected: Vec<PathBuf> = cwds
+                    .iter()
+                    .map(|cwd| match cwd {
+                        ExpectedCwd::Root => root.clone(),
+                        ExpectedCwd::Src => src.clone(),
+                    })
+                    .collect();
+                let steps: Vec<&Path> = plan.steps.iter().map(|step| step.cwd.as_path()).collect();
+                assert_eq!(
+                    steps,
+                    expected.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
+                    "{}: step cwds",
+                    case.name
+                );
+            }
             drop(SpecFiles(files));
         }
-    }
-
-    /// Every step's cwd is the one the analyzer tracked for its member: a fold
-    /// starts where the member before it left the line — for the fold after a
-    /// served search, the directory that search's own cwd gate named — and a
-    /// served step carries its search's cwd itself. A member's own plan carries
-    /// the directory its member was tracked at, and the two readings agree on every
-    /// shape the analyzer produces.
-    #[test]
-    fn the_plan_carries_the_tracked_cwd_of_every_member() {
-        let (_tmp, ws, home) = serve_fixture();
-        let root = canonical_or_lexical(&ws, ShellPlatform::Windows);
-        let src = root.join("src");
-        let cases: Vec<(&str, Vec<PathBuf>)> = vec![
-            ("grep -rn needle .", vec![root.clone()]),
-            (
-                "cd src && grep -rn needle .",
-                vec![root.clone(), src.clone()],
-            ),
-            (
-                "cd src && grep -rn needle . | head -3",
-                vec![root.clone(), src.clone(), src.clone()],
-            ),
-            // The `cd` is inside the fold that follows the search: the fold runs
-            // the `cd` itself, so it starts in the line's own cwd.
-            (
-                "grep -rn needle . && cd src && echo after",
-                vec![root.clone(), root.clone()],
-            ),
-            (
-                "type note.txt && grep -n needle f.txt",
-                vec![root.clone(), root.clone()],
-            ),
-            (
-                "grep needle f.txt && grep needle src/main.rs",
-                vec![root.clone(), root.clone()],
-            ),
-        ];
-        for (command, expected) in cases {
-            let (_rewritten, plan, files) = served_with_plan(command, &ws, &home);
-            let steps: Vec<&Path> = plan.steps.iter().map(|step| step.cwd.as_path()).collect();
-            assert_eq!(
-                steps,
-                expected.iter().map(PathBuf::as_path).collect::<Vec<_>>(),
-                "{command}"
-            );
-            drop(SpecFiles(files));
-        }
-    }
-
-    /// The plan exists only where a rewrite does: a demoted command (an
-    /// unavailable engine here) carries none, and on Windows it is refused rather
-    /// than run through the shell.
-    #[test]
-    fn a_demoted_command_carries_no_plan() {
-        let (_tmp, ws, home) = serve_fixture();
-        for command in ["grep -rn needle .", "grep -P needle f.txt"] {
-            let serve = serve_command(
-                command,
-                &ws,
-                Some(&home),
-                ShellPlatform::Windows,
-                || false,
-                None,
-            );
-            assert!(
-                serve.plan.is_none(),
-                "{command}: a demotion carries no plan"
-            );
-            assert!(serve.rewritten.is_none(), "{command}");
+        // A plan exists only where a rewrite does: a demoted command carries
+        // none, and on Windows it is refused rather than run through the shell.
+        for (name, command) in [
+            ("a servable search", "grep -rn needle ."),
+            ("an unservable search", "grep -P needle f.txt"),
+        ] {
+            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Windows, || false);
+            assert!(serve.plan.is_none(), "{name}: a demotion carries no plan");
+            assert!(serve.rewritten.is_none(), "{name}: no rewrite");
         }
         // Nothing is planned on unix either: the shell waits for its children
         // there, so there is nothing to fix.
@@ -7791,18 +8290,16 @@ mod plan_pins {
             Some(&home),
             ShellPlatform::Unix,
             || true,
-            None,
         );
-        assert!(unix.plan.is_none());
-        assert!(unix.rewritten.is_some());
+        assert!(unix.plan.is_none(), "unix carries no plan");
+        assert!(unix.rewritten.is_some(), "unix still serves");
     }
 }
 
 // ── The unix word/operator reading (unix-gated: parsing plus a real `sh` run) ─
 // The reading the module header states, observed from both sides: which text
 // the member is served on, and that the operator is handed back to the shell
-// to perform. The wider differential rows live in the parity matrix and the
-// subprocess differential.
+// to perform. The wider differential rows live in the parity matrix.
 
 #[cfg(all(test, unix))]
 mod unix_operator_pins {
@@ -7834,45 +8331,247 @@ mod unix_operator_pins {
         )
     }
 
-    /// `sh`'s comment, read as the comment it is: an unquoted `#` opening a word
-    /// comments out the rest of its line, so the search before it is served on
-    /// exactly the words the shell would have passed and everything inside the
-    /// comment — a backgrounding `&` included — goes with it, while the lines
-    /// below still run.
+    const ENGINE_OUT: &str = "ENGINE-OUT";
+    const ENGINE_ERR: &str = "ENGINE-ERR";
+    /// The stand-in's own exit status: a row can tell whether the shell waited
+    /// for the member or left it running.
+    const ENGINE_EXIT: i32 = 7;
+
+    /// A stand-in for the engine binary the rewrite names — the renderer takes
+    /// that path as an argument — answering on both streams so a row can see
+    /// which stream the shell routed where.
+    fn engine_stub(dir: &Path) -> String {
+        let path = dir.join("mahbot-engine-stub");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' {ENGINE_OUT}\nprintf '%s\\n' {ENGINE_ERR} >&2\nexit {ENGINE_EXIT}\n"
+            ),
+        )
+        .expect("stub written");
+        let mut perms = fs::metadata(&path).expect("stub").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&path, perms).expect("stub executable");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// One word-reading row: the served member's search, redirects and operands
+    /// as the unix reading hands them back.
+    struct ReadingCase {
+        name: &'static str,
+        command: &'static str,
+        expected: &'static str,
+    }
+
+    /// The unix reading's cases as one table: `sh`'s comment, the glued-operator
+    /// family, the text the engine actually searches, and process substitution.
     #[test]
-    fn the_comment_takes_the_rest_of_its_line_out_of_the_command() {
+    #[expect(clippy::too_many_lines)] // one cohesive table over the reading's cases
+    fn the_unix_word_reading_cases() {
         let (tmp, ws, home) = serve_fixture();
-        // (command, what the member was read as): the comment is neither a word
-        // of the search nor an operator to hand back.
-        let rows: &[(&str, &str)] = &[
-            // The `&` and the echo after the `#` are comment text: what is left
-            // to serve is the search alone.
-            (
-                "grep -rn needle . # note & echo TAIL-RAN",
-                "search=needle redirect= operands=.",
-            ),
-            // An unbalanced quote inside a comment is inert, as it is in `sh`.
-            (
-                "grep -rn needle . # don't",
-                "search=needle redirect= operands=.",
-            ),
+        let cases: &[ReadingCase] = &[
+            // `sh`'s comment: an unquoted `#` opening a word comments out the
+            // rest of its line, so the search before it is served on exactly the
+            // words the shell would have passed.
+            ReadingCase {
+                name: "a comment takes an ampersand and an echo with it",
+                command: "grep -rn needle . # note & echo TAIL-RAN",
+                expected: "search=needle redirect= operands=.",
+            },
+            ReadingCase {
+                name: "an unbalanced quote inside a comment is inert",
+                command: "grep -rn needle . # don't",
+                expected: "search=needle redirect= operands=.",
+            },
             // A `#` that opens no word stays ordinary text: the mid-word, quoted
             // and escaped spellings are all the same word to `sh`.
-            ("grep -rn a#b .", "search=a#b redirect= operands=."),
-            ("grep -rn 'a#b' .", "search=a#b redirect= operands=."),
-            (r"grep -rn a\#b .", "search=a#b redirect= operands=."),
+            ReadingCase {
+                name: "a mid-word hash is ordinary text",
+                command: "grep -rn a#b .",
+                expected: "search=a#b redirect= operands=.",
+            },
+            ReadingCase {
+                name: "a quoted hash is ordinary text",
+                command: "grep -rn 'a#b' .",
+                expected: "search=a#b redirect= operands=.",
+            },
+            ReadingCase {
+                name: "an escaped hash is ordinary text",
+                command: r"grep -rn a\#b .",
+                expected: "search=a#b redirect= operands=.",
+            },
+            // The glued-operator family, read the way `sh` reads it.
+            ReadingCase {
+                name: "a separated > target",
+                command: "grep -rn needle > out.txt .",
+                expected: "search=needle redirect=> out.txt operands=.",
+            },
+            ReadingCase {
+                name: "a separated stderr target",
+                command: "grep -rn needle 2> out.txt .",
+                expected: "search=needle redirect=2> out.txt operands=.",
+            },
+            ReadingCase {
+                name: "a word glued to a > operator",
+                command: "grep -rn needle>out.txt .",
+                expected: "search=needle redirect=>out.txt operands=.",
+            },
+            ReadingCase {
+                name: "a word glued to an append operator",
+                command: "grep -rn needle>>out.txt .",
+                expected: "search=needle redirect=>>out.txt operands=.",
+            },
+            ReadingCase {
+                name: "a word glued to an stdin operator",
+                command: "grep -rn needle<f.txt .",
+                expected: "search=needle redirect=<f.txt operands=.",
+            },
+            ReadingCase {
+                name: "a word glued to a stdout dup",
+                command: "grep -rn needle>&1 .",
+                expected: "search=needle redirect=>&1 operands=.",
+            },
+            // `<&` is the input-side fd dup: one operator too.
+            ReadingCase {
+                name: "a separated input-side dup",
+                command: "grep -rn needle . <&2",
+                expected: "search=needle redirect=<&2 operands=.",
+            },
+            ReadingCase {
+                name: "an fd-prefixed input-side dup",
+                command: "grep -rn 2<&1 needle .",
+                expected: "search=needle redirect=2<&1 operands=.",
+            },
+            // `&>` is one operator, and the word before it stays part of the
+            // search (unlike an fd prefix).
+            ReadingCase {
+                name: "a word glued to a &> operator",
+                command: "grep -rn needle&>out.txt .",
+                expected: "search=needle redirect=&>out.txt operands=.",
+            },
+            ReadingCase {
+                name: "a word glued to an append &> operator",
+                command: "grep -rn needle&>>out.txt .",
+                expected: "search=needle redirect=&>>out.txt operands=.",
+            },
+            // The digits belong to the operator only when everything before it
+            // is digits.
+            ReadingCase {
+                name: "a digit-prefixed redirect",
+                command: "grep -rn 2>out.txt needle .",
+                expected: "search=needle redirect=2>out.txt operands=.",
+            },
+            ReadingCase {
+                name: "a multi-digit-prefixed redirect",
+                command: "grep -rn 10>out.txt needle .",
+                expected: "search=needle redirect=10>out.txt operands=.",
+            },
+            ReadingCase {
+                name: "a digit ending a word before a redirect",
+                command: "grep -rn needle2>out.txt .",
+                expected: "search=needle2 redirect=>out.txt operands=.",
+            },
+            // Quoted and escaped operators are ordinary text.
+            ReadingCase {
+                name: "a single-quoted operator is text",
+                command: "grep -rn 'a>b' .",
+                expected: "search=a>b redirect= operands=.",
+            },
+            ReadingCase {
+                name: "a double-quoted operator is text",
+                command: "grep -rn \"x>log\" .",
+                expected: "search=x>log redirect= operands=.",
+            },
+            ReadingCase {
+                name: "an escaped operator is text",
+                command: r"grep -rn a\>b .",
+                expected: "search=a>b redirect= operands=.",
+            },
         ];
-        for (command, expected) in rows {
-            assert_eq!(reading(command, &ws, &home), *expected, "{command}");
+        for case in cases {
+            assert_eq!(
+                reading(case.command, &ws, &home),
+                case.expected,
+                "{}: {}",
+                case.name,
+                case.command
+            );
         }
 
-        // The other side of the reading, under a real `sh` with a stand-in for
-        // the engine: nothing the comment swallowed is ever run, the `&` inside
-        // it never backgrounds the member — the call reports the member's own
-        // status (`ENGINE_EXIT`) — and the line below the comment still runs.
-        // The middle row is the same line without the comment, where the tail
-        // really does run.
+        // The member searches exactly the text the same search spelled with the
+        // operator separate searches — the words `sh` would have passed to
+        // `grep`, with the operator gone from the argv.
+        let expected = "f.txt:needle\nsrc/main.rs:fn needle() {}\n";
+        for (name, command) in [
+            ("the separated spelling", "grep needle f.txt src/main.rs"),
+            (
+                "a glued > spelling",
+                "grep needle>out.txt f.txt src/main.rs",
+            ),
+            (
+                "a glued append spelling",
+                "grep needle>>out.txt f.txt src/main.rs",
+            ),
+            (
+                "a glued stdin spelling",
+                "grep needle<f.txt f.txt src/main.rs",
+            ),
+            (
+                "a glued &> spelling",
+                "grep needle&>out.txt f.txt src/main.rs",
+            ),
+            (
+                "an fd-prefixed spelling",
+                "grep 2>out.txt needle f.txt src/main.rs",
+            ),
+        ] {
+            let analyzed = analyze_command(command, &ws, &home, ShellPlatform::Unix, false)
+                .unwrap_or_else(|e| panic!("{name}: expected servable, got {}", e.reason));
+            let (out, err, code) = engine_run(&analyzed.specs[0]);
+            assert_eq!(code, 0, "{name}: exit");
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                expected,
+                "{name}: searched text"
+            );
+            assert!(err.is_empty(), "{name}: stderr: {err:?}");
+        }
+
+        // `>(…)`/`<(…)` is process substitution — a word the shell builds from a
+        // command — never a redirection: the member stays on the real `grep`.
+        for (name, command) in [
+            (
+                "a process-substitution input",
+                "grep -rn needle <(cat f.txt) .",
+            ),
+            (
+                "a process-substitution output",
+                "grep -rn needle . >(cat f.txt)",
+            ),
+        ] {
+            let serve = serve_command(command, &ws, Some(&home), ShellPlatform::Unix, || true);
+            assert!(serve.refusal.is_none(), "{name}: unix never refuses");
+            assert!(
+                serve.rewritten.is_none(),
+                "{name}: nothing to serve (got {:?})",
+                serve.rewritten
+            );
+            assert_eq!(serve.outcomes.len(), 1, "{name}: one analyzed member");
+            assert_eq!(serve.outcomes[0].reason, "process substitution", "{name}");
+        }
+        drop(tmp);
+    }
+
+    /// The shell's side of the reading: the operators the member spelled are
+    /// performed by a real `sh`, and the comment's swallowed tail never runs.
+    #[test]
+    #[expect(clippy::too_many_lines)] // one cohesive table over the shell's cases
+    fn the_shell_performs_the_operators() {
+        let (tmp, ws, home) = serve_fixture();
         let engine = engine_stub(tmp.path());
+
+        // The comment's own side: nothing it swallowed is ever run, the `&`
+        // inside it never backgrounds the member, and the line below still runs.
         // (command, stdout, status, whether the swallowed tail survives)
         let rows: &[(&str, &str, i32, bool)] = &[
             (
@@ -7930,145 +8629,9 @@ mod unix_operator_pins {
                 "{command}: status (rewrite: {rewritten})"
             );
         }
-    }
 
-    /// The whole glued-operator family, read the way `sh` reads it: the operator
-    /// ends the word before it (or takes that word's digits as an fd prefix) and
-    /// is handed back to the shell verbatim, while quoted and escaped operators
-    /// stay ordinary text.
-    #[test]
-    fn the_glued_operator_family_is_read_the_way_sh_reads_it() {
-        let (_tmp, ws, home) = serve_fixture();
-        let rows: &[(&str, &str)] = &[
-            // The separated spellings the glued rows must land on.
-            (
-                "grep -rn needle > out.txt .",
-                "search=needle redirect=> out.txt operands=.",
-            ),
-            (
-                "grep -rn needle 2> out.txt .",
-                "search=needle redirect=2> out.txt operands=.",
-            ),
-            (
-                "grep -rn needle>out.txt .",
-                "search=needle redirect=>out.txt operands=.",
-            ),
-            (
-                "grep -rn needle>>out.txt .",
-                "search=needle redirect=>>out.txt operands=.",
-            ),
-            (
-                "grep -rn needle<f.txt .",
-                "search=needle redirect=<f.txt operands=.",
-            ),
-            (
-                "grep -rn needle>&1 .",
-                "search=needle redirect=>&1 operands=.",
-            ),
-            // `<&` is the input-side fd dup: one operator too.
-            (
-                "grep -rn needle . <&2",
-                "search=needle redirect=<&2 operands=.",
-            ),
-            (
-                "grep -rn 2<&1 needle .",
-                "search=needle redirect=2<&1 operands=.",
-            ),
-            // `&>` is one operator, and the word before it stays part of the
-            // search (unlike an fd prefix).
-            (
-                "grep -rn needle&>out.txt .",
-                "search=needle redirect=&>out.txt operands=.",
-            ),
-            (
-                "grep -rn needle&>>out.txt .",
-                "search=needle redirect=&>>out.txt operands=.",
-            ),
-            // The digits belong to the operator only when everything before it
-            // is digits: `2>log` redirects fd 2, `needle2>log` is the word
-            // `needle2` plus a redirect to `log`.
-            (
-                "grep -rn 2>out.txt needle .",
-                "search=needle redirect=2>out.txt operands=.",
-            ),
-            (
-                "grep -rn 10>out.txt needle .",
-                "search=needle redirect=10>out.txt operands=.",
-            ),
-            (
-                "grep -rn needle2>out.txt .",
-                "search=needle2 redirect=>out.txt operands=.",
-            ),
-            // Quoted and escaped operators are ordinary text.
-            ("grep -rn 'a>b' .", "search=a>b redirect= operands=."),
-            ("grep -rn \"x>log\" .", "search=x>log redirect= operands=."),
-            (r"grep -rn a\>b .", "search=a>b redirect= operands=."),
-        ];
-        for (command, expected) in rows {
-            assert_eq!(reading(command, &ws, &home), *expected, "{command}");
-        }
-    }
-
-    /// The member searches exactly the text the same search spelled with the
-    /// operator separate searches — the words `sh` would have passed to `grep`,
-    /// with the operator gone from the argv.
-    #[test]
-    fn the_engine_searches_the_text_the_separated_spelling_searches() {
-        let (_tmp, ws, home) = serve_fixture();
-        let expected = "f.txt:needle\nsrc/main.rs:fn needle() {}\n";
-        for command in [
-            "grep needle f.txt src/main.rs",
-            "grep needle>out.txt f.txt src/main.rs",
-            "grep needle>>out.txt f.txt src/main.rs",
-            "grep needle<f.txt f.txt src/main.rs",
-            "grep needle&>out.txt f.txt src/main.rs",
-            "grep 2>out.txt needle f.txt src/main.rs",
-        ] {
-            let analyzed = analyze_command(command, &ws, &home, ShellPlatform::Unix, false)
-                .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
-            let (out, err, code) = engine_run(&analyzed.specs[0]);
-            assert_eq!(code, 0, "{command}: exit");
-            assert_eq!(
-                String::from_utf8_lossy(&out),
-                expected,
-                "{command}: searched text"
-            );
-            assert!(err.is_empty(), "{command}: stderr: {err:?}");
-        }
-    }
-
-    const ENGINE_OUT: &str = "ENGINE-OUT";
-    const ENGINE_ERR: &str = "ENGINE-ERR";
-    /// The stand-in's own exit status: a row can tell whether the shell waited
-    /// for the member or left it running.
-    const ENGINE_EXIT: i32 = 7;
-
-    /// A stand-in for the engine binary the rewrite names — the renderer takes
-    /// that path as an argument — answering on both streams so a row can see
-    /// which stream the shell routed where.
-    fn engine_stub(dir: &Path) -> String {
-        let path = dir.join("mahbot-engine-stub");
-        fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' {ENGINE_OUT}\nprintf '%s\\n' {ENGINE_ERR} >&2\nexit {ENGINE_EXIT}\n"
-            ),
-        )
-        .expect("stub written");
-        let mut perms = fs::metadata(&path).expect("stub").permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        fs::set_permissions(&path, perms).expect("stub executable");
-        path.to_string_lossy().into_owned()
-    }
-
-    /// The other side of the reading, observed by running the rendered rewrite
-    /// under a real `sh`: the shell performs the operator the command spelled —
-    /// the member's stream lands in the file it named — and a backgrounded
-    /// member leaves the commands after its `&` running.
-    #[test]
-    fn the_shell_performs_the_write_and_keeps_the_backgrounded_tail() {
-        let (tmp, ws, home) = serve_fixture();
-        let engine = engine_stub(tmp.path());
+        // The redirect the command spelled lands in the file it named: the
+        // member's stream is where `sh` would have written it.
         // (command, target, what the target receives, stdout)
         let rows: &[(&str, &str, &str, &str)] = &[
             ("grep -rn needle>out.txt .", "out.txt", "ENGINE-OUT\n", ""),
@@ -8118,75 +8681,39 @@ mod unix_operator_pins {
                 "{command}: stdout (rewrite: {rewritten})"
             );
         }
-    }
 
-    /// A member backgrounded as the last thing in its line: the `&` itself
-    /// reaches the shell, so the call returns on the shell's own status rather
-    /// than the member's — the stand-in exits 7, which a foregrounded member
-    /// would report.
-    #[test]
-    fn a_trailing_ampersand_backgrounds_the_served_member() {
-        let (tmp, ws, home) = serve_fixture();
-        let engine = engine_stub(tmp.path());
+        // A member backgrounded as the last thing in its line: the `&` itself
+        // reaches the shell, so the call returns on the shell's own status
+        // rather than the member's.
         let command = "grep -rn needle . &";
-        let analyzed = analyze_command(command, &ws, &home, ShellPlatform::Unix, false)
-            .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
-        let jsons: Vec<String> = analyzed.specs.iter().map(spec_json).collect();
-        let rewritten = join_rewritten(
-            &analyzed.segments,
-            &analyzed.specs,
-            &jsons,
-            ShellPlatform::Unix,
-            &engine,
-            &analyzed.root_cwd,
-        )
-        .expect("the unix join never refuses")
-        .text;
-        assert!(
-            rewritten.ends_with(" &"),
-            "the `&` rides the rewrite: {rewritten}"
-        );
-        let out = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&rewritten)
-            .current_dir(&ws)
-            .output()
-            .expect("sh runs");
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "the shell's status, not the backgrounded member's: {rewritten}"
-        );
-    }
-
-    /// `>(…)`/`<(…)` is process substitution — a word the shell builds from a
-    /// command — never a redirection: the member stays on the real `grep`
-    /// rather than being served on a word nothing can resolve.
-    #[test]
-    fn process_substitution_is_never_a_redirect() {
-        let (_tmp, ws, home) = serve_fixture();
-        for command in [
-            "grep -rn needle <(cat f.txt) .",
-            "grep -rn needle . >(cat f.txt)",
-        ] {
-            let serve = serve_command(
-                command,
-                &ws,
-                Some(&home),
+        {
+            let analyzed = analyze_command(command, &ws, &home, ShellPlatform::Unix, false)
+                .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
+            let jsons: Vec<String> = analyzed.specs.iter().map(spec_json).collect();
+            let rewritten = join_rewritten(
+                &analyzed.segments,
+                &analyzed.specs,
+                &jsons,
                 ShellPlatform::Unix,
-                || true,
-                None,
-            );
-            assert!(serve.refusal.is_none(), "{command}: unix never refuses");
+                &engine,
+                &analyzed.root_cwd,
+            )
+            .expect("the unix join never refuses")
+            .text;
             assert!(
-                serve.rewritten.is_none(),
-                "{command}: nothing to serve (got {:?})",
-                serve.rewritten
+                rewritten.ends_with(" &"),
+                "{command}: the `&` rides the rewrite: {rewritten}"
             );
-            assert_eq!(serve.outcomes.len(), 1, "{command}: one analyzed member");
+            let out = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&rewritten)
+                .current_dir(&ws)
+                .output()
+                .expect("sh runs");
             assert_eq!(
-                serve.outcomes[0].reason, "process substitution",
-                "{command}"
+                out.status.code(),
+                Some(0),
+                "{command}: the shell's status, not the backgrounded member's: {rewritten}"
             );
         }
     }

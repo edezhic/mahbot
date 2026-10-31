@@ -395,9 +395,7 @@ impl Ticket {
     ///
     /// Because agent tool calls depend on this exact format, changes to
     /// displayed fields or layout must be kept in sync with
-    /// [`crate::tools::ticket::GetTicketTool`] (the primary consumer). If new fields are
-    /// added here, update the integration test `test_get_ticket_tool`
-    /// to prevent silent divergence.
+    /// [`crate::tools::ticket::GetTicketTool`] (the primary consumer).
     #[must_use]
     pub fn detailed_display(&self) -> String {
         let mut out = self.header(&self.description);

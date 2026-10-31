@@ -1806,45 +1806,10 @@ fn render_extraction_failures(outcomes: &[AnalystOutcome]) -> String {
 mod tests {
     use super::*;
     use crate::util::UnwrapPoison as _;
-    use crate::util::test::{FakeProvider, install_fake_provider};
+    use crate::util::test::{FakeProvider, assert_contains_not_contains, install_fake_provider};
     use crate::workspace::test_ws;
     use serde_json::json;
     use std::sync::Arc;
-
-    #[tokio::test]
-    async fn test_analyze_missing_args() {
-        let tool = AnalyzeTool::new(DispatchMode::Sync, Role::Engineer);
-        let ws = test_ws("/tmp/test_ws");
-
-        // Missing message
-        let result = tool.execute(&ws, json!({})).await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("usage: missing required argument \"message\""),
-            "Should mention missing message"
-        );
-    }
-
-    /// Tests that analyze dispatches analysts and returns the consolidated result.
-    /// Requires an LLM provider to be configured. The sync path now runs through
-    /// the durable analyze core, so the stores must be initialized (like the
-    /// resume test).
-    #[tokio::test]
-    #[ignore = "requires LLM provider; runs only when explicitly invoked"]
-    async fn test_analyze_analyst() {
-        crate::util::test::init_management_test_stores().await;
-        let tool = AnalyzeTool::new(DispatchMode::Sync, Role::Engineer);
-        let ws = test_ws("/tmp/test_ws");
-        let args = json!({"message": "Say 'hello analyst' and nothing else."});
-        let result = tool.execute(&ws, args).await.expect("execute");
-        assert!(
-            result.contains("hello"),
-            "output should contain hello: {result}"
-        );
-    }
 
     // ── Consolidation edge-case tests (no LLM provider needed) ──
 
@@ -1888,47 +1853,105 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_consolidate_zero_responses_surfaces_failure_reasons() {
-        let ws = test_ws("/tmp/test_ws");
-        let runs = vec![
-            test_failed_run("analyst 0 still running when the round deadline expired"),
-            test_failed_run("analyst 1 task panicked"),
-            test_analyst_run(&ws, None),
-        ];
-        let result = consolidate_analyst_runs(
-            &ws,
-            "test question",
-            runs,
-            std::time::Instant::now() + Duration::from_mins(1),
-            "test_round",
-        )
-        .await;
-        let err = result.expect_err("0 valid responses should error");
-        assert!(
-            err.to_string()
-                .contains("internal: all parallel analysts failed"),
-            "error should mention analyst failure: {err}"
-        );
-        assert!(
-            err.to_string().contains("deadline expired"),
-            "error should surface the stuck-analyst reason: {err}"
-        );
-        assert!(
-            err.to_string().contains("panicked"),
-            "error should surface the panicked-analyst reason: {err}"
-        );
-        assert!(
-            err.to_string().contains("analyst produced no response"),
-            "error should surface the no-response reason: {err}"
-        );
+    /// One scripted analyst round for [`consolidate_analyst_runs`].
+    enum RoundMemberSpec {
+        Response(Option<&'static str>),
+        Failed(&'static str),
     }
 
-    /// The round wait is bounded: a member that never completes is aborted at
-    /// the deadline and reported [`RoundMember::TimedOut`], while completed
-    /// members keep their results.
+    /// A delivered round: the members, and the text — or the failure reasons —
+    /// the caller must receive.
+    struct ConsolidateRunsCase {
+        name: &'static str,
+        members: &'static [RoundMemberSpec],
+        /// `Err` lists the substrings the surfaced failure must name.
+        expected: Result<&'static str, &'static [&'static str]>,
+    }
+
     #[tokio::test]
-    async fn await_round_members_bounds_stuck_member() {
+    async fn consolidate_analyst_runs_cases() {
+        use RoundMemberSpec::{Failed, Response};
+        let cases = [
+            ConsolidateRunsCase {
+                name: "zero valid responses surface every failure reason",
+                members: &[
+                    Failed("analyst 0 still running when the round deadline expired"),
+                    Failed("analyst 1 task panicked"),
+                    Response(None),
+                ],
+                expected: Err(&[
+                    "internal: all parallel analysts failed",
+                    "deadline expired",
+                    "panicked",
+                    "analyst produced no response",
+                ]),
+            },
+            ConsolidateRunsCase {
+                name: "a single response is returned directly",
+                members: &[
+                    Response(Some("only answer")),
+                    Response(None),
+                    Response(None),
+                ],
+                expected: Ok("only answer"),
+            },
+            ConsolidateRunsCase {
+                name: "empty responses are filtered like missing ones",
+                members: &[
+                    Response(Some("valid")),
+                    Response(Some("")),
+                    Response(Some("   ")),
+                ],
+                expected: Ok("valid"),
+            },
+        ];
+
+        let ws = test_ws("/tmp/test_ws");
+        for case in &cases {
+            let runs = case
+                .members
+                .iter()
+                .map(|spec| match spec {
+                    RoundMemberSpec::Response(response) => test_analyst_run(&ws, *response),
+                    RoundMemberSpec::Failed(reason) => test_failed_run(reason),
+                })
+                .collect();
+            let result = consolidate_analyst_runs(
+                &ws,
+                "test question",
+                runs,
+                std::time::Instant::now() + Duration::from_mins(1),
+                "test_round",
+            )
+            .await;
+            match (&case.expected, result) {
+                (Ok(expected), Ok(actual)) => assert_eq!(
+                    actual.as_deref(),
+                    Some(*expected),
+                    "[{}] delivered the wrong text",
+                    case.name
+                ),
+                (Err(needles), Err(err)) => {
+                    let text = err.to_string();
+                    for needle in *needles {
+                        assert!(
+                            text.contains(needle),
+                            "[{}] error must name {needle:?}: {text}",
+                            case.name
+                        );
+                    }
+                }
+                (_, other) => panic!("[{}] unexpected outcome: {other:?}", case.name),
+            }
+        }
+    }
+
+    /// Guards the bounded-round wait: a member stuck past the deadline is
+    /// aborted (its task dropped, cancelling the work) while a completed member
+    /// keeps its value, and a panicking member is surfaced as `Panicked`
+    /// instead of being silently dropped or taking the round down.
+    #[tokio::test]
+    async fn await_round_members_cases() {
         struct AbortDetector(std::sync::Arc<std::sync::atomic::AtomicBool>);
         impl Drop for AbortDetector {
             fn drop(&mut self) {
@@ -1936,6 +1959,8 @@ mod tests {
             }
         }
 
+        // A stuck member is aborted at the deadline; the completed one keeps
+        // its result.
         let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = aborted.clone();
         let stuck = tokio::spawn(async move {
@@ -1947,236 +1972,196 @@ mod tests {
         let done = tokio::spawn(async { 42u32 });
         let deadline = std::time::Instant::now() + Duration::from_millis(300);
         let members = await_round_members(vec![stuck, done], deadline).await;
-        assert!(matches!(members[0], RoundMember::TimedOut), "{members:?}");
-        assert!(matches!(members[1], RoundMember::Done(42)), "{members:?}");
+        assert!(
+            matches!(members[0], RoundMember::TimedOut),
+            "a stuck member times out: {members:?}"
+        );
+        assert!(
+            matches!(members[1], RoundMember::Done(42)),
+            "a completed member keeps its result: {members:?}"
+        );
         // Aborting the task drops its locals — the detector fires.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             aborted.load(std::sync::atomic::Ordering::SeqCst),
-            "stuck member task should have been aborted at the deadline"
+            "the stuck member task is aborted at the deadline, not leaked"
         );
-    }
 
-    /// A panicking member is surfaced as [`RoundMember::Panicked`], never
-    /// silently dropped.
-    #[tokio::test]
-    async fn await_round_members_surfaces_panics() {
+        // A panicking member is surfaced, never dropped.
         let panicking = tokio::spawn(async { panic!("boom") });
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let members = await_round_members(vec![panicking], deadline).await;
-        assert!(matches!(members[0], RoundMember::Panicked), "{members:?}");
-    }
-
-    #[tokio::test]
-    async fn test_consolidate_one_response_returned_directly() {
-        let ws = test_ws("/tmp/test_ws");
-        let runs = vec![
-            test_analyst_run(&ws, Some("only answer")),
-            test_analyst_run(&ws, None),
-            test_analyst_run(&ws, None),
-        ];
-        let result = consolidate_analyst_runs(
-            &ws,
-            "test question",
-            runs,
-            std::time::Instant::now() + Duration::from_mins(1),
-            "test_round",
-        )
-        .await;
-        assert!(result.is_ok(), "1 response should succeed");
-        assert_eq!(
-            result.unwrap().as_deref(),
-            Some("only answer"),
-            "Should return the single response directly without consolidation"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_consolidate_empty_responses_filtered() {
-        // Empty/whitespace-only strings should be filtered the same as None
-        let ws = test_ws("/tmp/test_ws");
-        let runs = vec![
-            test_analyst_run(&ws, Some("valid")),
-            test_analyst_run(&ws, Some("")),
-            test_analyst_run(&ws, Some("   ")),
-        ];
-        let result = consolidate_analyst_runs(
-            &ws,
-            "test question",
-            runs,
-            std::time::Instant::now() + Duration::from_mins(1),
-            "test_round",
-        )
-        .await;
         assert!(
-            result.is_ok(),
-            "1 valid after filtering empty should succeed"
-        );
-        assert_eq!(
-            result.unwrap().as_deref(),
-            Some("valid"),
-            "Should return the only non-empty response"
+            matches!(members[0], RoundMember::Panicked),
+            "a panicking member is surfaced: {members:?}"
         );
     }
 
     // ── Analyze grouping renderer ────────────────────────────────────────────
 
+    /// One [`render_analyze_groups`] scenario: the analyst outcomes, the
+    /// grouping output to render, and the strings the section must (not) carry.
+    struct RenderGroupsCase {
+        name: &'static str,
+        outcomes: Vec<AnalystOutcome>,
+        output: crate::consensus::GroupingOutput,
+        references: Vec<crate::consensus::GroupingReference>,
+        contains: &'static [&'static str],
+        not_contains: &'static [&'static str],
+    }
+
+    #[expect(clippy::too_many_lines)] // one grouping shape per rendering rule
     #[test]
-    fn render_analyze_groups_computes_brackets_from_distinct_agents() {
-        let outcomes = vec![
-            AnalystOutcome::Findings {
-                raw: "r1".into(),
-                findings: findings(vec![
-                    ("alpha is true", "url1", "high"),
-                    ("beta is true", "url2", "medium"),
-                ]),
-            },
-            AnalystOutcome::Findings {
-                raw: "r2".into(),
-                findings: findings(vec![
-                    ("alpha is true", "url1", "high"),
-                    ("gamma is true", "url3", "low"),
-                ]),
-            },
-            AnalystOutcome::NoResponse("analyst produced no response".into()),
-        ];
-        // Global flat ids: 0 = a0 "alpha is true", 1 = a0 "beta is true",
-        // 2 = a1 "alpha is true", 3 = a1 "gamma is true".
-        let items = claims_per_agent(&outcomes);
-        let table = crate::consensus::ItemTable::new(&items);
-        let output = crate::consensus::GroupingOutput {
-            summary: "Two facts, one solo finding.".into(),
-            groups: vec![
-                crate::consensus::GroupingGroup {
-                    heading: "Alpha".into(),
-                    contradiction: false,
-                    members: vec![
-                        crate::consensus::GroupingMember {
-                            id: 0,
-                            ..Default::default()
+    fn render_analyze_groups_cases() {
+        use crate::consensus::{GroupingGroup, GroupingMember, GroupingOutput, GroupingReference};
+
+        let member = |id: usize| GroupingMember {
+            id,
+            ..Default::default()
+        };
+        let mut caveated = findings(vec![("alpha is true", "url1", "high")]);
+        caveated.claims[0].contradictions = vec!["source B says alpha may be false".into()];
+
+        let cases = vec![
+            RenderGroupsCase {
+                name: "brackets count distinct citing agents",
+                // Global flat ids: 0 = a0 "alpha is true", 1 = a0 "beta is true",
+                // 2 = a1 "alpha is true", 3 = a1 "gamma is true".
+                outcomes: vec![
+                    AnalystOutcome::Findings {
+                        raw: "r1".into(),
+                        findings: findings(vec![
+                            ("alpha is true", "url1", "high"),
+                            ("beta is true", "url2", "medium"),
+                        ]),
+                    },
+                    AnalystOutcome::Findings {
+                        raw: "r2".into(),
+                        findings: findings(vec![
+                            ("alpha is true", "url1", "high"),
+                            ("gamma is true", "url3", "low"),
+                        ]),
+                    },
+                    AnalystOutcome::NoResponse("analyst produced no response".into()),
+                ],
+                output: GroupingOutput {
+                    summary: "Two facts, one solo finding.".into(),
+                    groups: vec![
+                        GroupingGroup {
+                            heading: "Alpha".into(),
+                            contradiction: false,
+                            members: vec![member(0), member(2)],
                         },
-                        crate::consensus::GroupingMember {
-                            id: 2,
-                            ..Default::default()
+                        GroupingGroup {
+                            heading: "Beta".into(),
+                            contradiction: false,
+                            members: vec![member(1)],
                         },
                     ],
+                    ungrouped: vec![member(3)],
                 },
-                crate::consensus::GroupingGroup {
-                    heading: "Beta".into(),
-                    contradiction: false,
-                    members: vec![crate::consensus::GroupingMember {
-                        id: 1,
-                        ..Default::default()
+                references: Vec::new(),
+                contains: &[
+                    "**Alpha** [2/2]",
+                    "**Beta** [1/2]",
+                    "**Other**",
+                    "- Agent 1: gamma is true",
+                ],
+                not_contains: &["DISPUTED"],
+            },
+            RenderGroupsCase {
+                name: "DISPUTED only on a contradiction",
+                outcomes: vec![
+                    AnalystOutcome::Findings {
+                        raw: "r1".into(),
+                        findings: findings(vec![("alpha is true", "url1", "high")]),
+                    },
+                    AnalystOutcome::Findings {
+                        raw: "r2".into(),
+                        findings: findings(vec![("alpha is false", "url2", "high")]),
+                    },
+                ],
+                output: GroupingOutput {
+                    summary: "Agents disagree on alpha.".into(),
+                    groups: vec![GroupingGroup {
+                        heading: "Alpha".into(),
+                        contradiction: true,
+                        members: vec![member(0), member(1)],
                     }],
+                    ungrouped: Vec::new(),
                 },
-            ],
-            ungrouped: vec![crate::consensus::GroupingMember {
-                id: 3,
-                ..Default::default()
-            }],
-        };
-        let text = render_analyze_groups(&output, &[], &table, 2, &outcomes, "");
-        assert!(
-            text.contains("**Alpha** [2/2]"),
-            "consensus group renders [2/2] from distinct cited agents: {text}"
-        );
-        assert!(
-            text.contains("**Beta** [1/2]"),
-            "solo group renders [1/2] without DISPUTED: {text}"
-        );
-        assert!(text.contains("**Other**"), "ungrouped list renders: {text}");
-        assert!(
-            text.contains("- Agent 1: gamma is true"),
-            "ungrouped member attributes its source: {text}"
-        );
-        assert!(
-            !text.contains("DISPUTED"),
-            "no contradiction flag means no DISPUTED anywhere: {text}"
-        );
-    }
-
-    #[test]
-    fn render_analyze_groups_disputed_only_on_contradiction() {
-        let outcomes = vec![
-            AnalystOutcome::Findings {
-                raw: "r1".into(),
-                findings: findings(vec![("alpha is true", "url1", "high")]),
+                references: Vec::new(),
+                contains: &["**Alpha** [2/2 · DISPUTED]"],
+                not_contains: &[],
             },
-            AnalystOutcome::Findings {
-                raw: "r2".into(),
-                findings: findings(vec![("alpha is false", "url2", "high")]),
-            },
-        ];
-        let items = claims_per_agent(&outcomes);
-        let table = crate::consensus::ItemTable::new(&items);
-        let output = crate::consensus::GroupingOutput {
-            summary: "Agents disagree on alpha.".into(),
-            groups: vec![crate::consensus::GroupingGroup {
-                heading: "Alpha".into(),
-                contradiction: true,
-                members: vec![
-                    crate::consensus::GroupingMember {
-                        id: 0,
-                        ..Default::default()
+            RenderGroupsCase {
+                name: "a member caveat is metadata, not a contradiction",
+                outcomes: vec![
+                    AnalystOutcome::Findings {
+                        raw: "r1".into(),
+                        findings: caveated,
                     },
-                    crate::consensus::GroupingMember {
-                        id: 1,
-                        ..Default::default()
+                    AnalystOutcome::Findings {
+                        raw: "r2".into(),
+                        findings: findings(vec![("alpha is true", "url1", "high")]),
                     },
                 ],
-            }],
-            ungrouped: vec![],
-        };
-        let text = render_analyze_groups(&output, &[], &table, 2, &outcomes, "");
-        assert!(
-            text.contains("**Alpha** [2/2 · DISPUTED]"),
-            "contradiction group renders [2/2 · DISPUTED]: {text}"
-        );
-    }
-
-    #[test]
-    fn render_analyze_groups_surfaces_member_caveats_as_metadata() {
-        let mut claims = findings(vec![("alpha is true", "url1", "high")]);
-        claims.claims[0].contradictions = vec!["source B says alpha may be false".into()];
-        let outcomes = vec![
-            AnalystOutcome::Findings {
-                raw: "r1".into(),
-                findings: claims,
+                output: GroupingOutput {
+                    summary: "alpha is agreed.".into(),
+                    groups: vec![GroupingGroup {
+                        heading: "Alpha".into(),
+                        contradiction: false,
+                        members: vec![member(0), member(1)],
+                    }],
+                    ungrouped: Vec::new(),
+                },
+                references: Vec::new(),
+                contains: &["caveat: source B says alpha may be false"],
+                not_contains: &["DISPUTED"],
             },
-            AnalystOutcome::Findings {
-                raw: "r2".into(),
-                findings: findings(vec![("alpha is true", "url1", "high")]),
-            },
-        ];
-        let items = claims_per_agent(&outcomes);
-        let table = crate::consensus::ItemTable::new(&items);
-        let output = crate::consensus::GroupingOutput {
-            summary: "alpha is agreed.".into(),
-            groups: vec![crate::consensus::GroupingGroup {
-                heading: "Alpha".into(),
-                contradiction: false,
-                members: vec![
-                    crate::consensus::GroupingMember {
-                        id: 0,
-                        ..Default::default()
+            RenderGroupsCase {
+                name: "a disputed remainder renders a code-computed cross-reference",
+                outcomes: vec![
+                    AnalystOutcome::Findings {
+                        raw: "r1".into(),
+                        findings: findings(vec![("safe", "url1", "high")]),
                     },
-                    crate::consensus::GroupingMember {
-                        id: 1,
-                        ..Default::default()
+                    AnalystOutcome::Findings {
+                        raw: "r2".into(),
+                        findings: findings(vec![("actually unsafe", "url2", "high")]),
                     },
                 ],
-            }],
-            ungrouped: vec![],
-        };
-        let text = render_analyze_groups(&output, &[], &table, 2, &outcomes, "");
-        assert!(
-            text.contains("caveat: source B says alpha may be false"),
-            "self-reported caveat renders as member metadata: {text}"
-        );
-        assert!(
-            !text.contains("DISPUTED"),
-            "a self-reported caveat is NOT a contradiction: {text}"
-        );
+                output: GroupingOutput {
+                    summary: "One consensus, one dispute.".into(),
+                    groups: vec![GroupingGroup {
+                        heading: "Safety".into(),
+                        contradiction: false,
+                        members: vec![member(0)],
+                    }],
+                    ungrouped: vec![member(1)],
+                },
+                references: vec![GroupingReference {
+                    group: 0,
+                    member: member(1),
+                }],
+                contains: &["Agent 1: actually unsafe [DISPUTED — contradicts group 0 \"Safety\"]"],
+                not_contains: &[],
+            },
+        ];
+
+        for case in cases {
+            let items = claims_per_agent(&case.outcomes);
+            let table = crate::consensus::ItemTable::new(&items);
+            let text = render_analyze_groups(
+                &case.output,
+                &case.references,
+                &table,
+                2,
+                &case.outcomes,
+                "",
+            );
+            assert_contains_not_contains(case.name, &text, case.contains, case.not_contains);
+        }
     }
 
     // ── consolidation fail-open ────────────────────────────────────────
@@ -2216,566 +2201,446 @@ mod tests {
         ]
     }
 
+    /// One scripted consolidation scenario: the analyst inputs, the scripted
+    /// provider, and the strings the delivered text must (not) carry.
+    struct ConsolidationCase {
+        name: &'static str,
+        input: ConsolidationInput,
+        fake: FakeProvider,
+        contains: &'static [&'static str],
+        not_contains: &'static [&'static str],
+    }
+
+    enum ConsolidationInput {
+        /// Runs that still need findings extraction (which may fail).
+        Runs(Vec<AnalyzeRun>),
+        /// Already-extracted outcomes.
+        Outcomes(Vec<AnalystOutcome>),
+    }
+
     #[tokio::test]
     #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
-    async fn test_consolidation_fail_open_delivers_raw_reports() {
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+    async fn consolidation_outcome_cases() {
+        use crate::retry::FailureClass;
+        use ConsolidationInput::{Outcomes, Runs};
+
         // Synthesis retries (transport failures) exhaust → fail open.
-        let fake = FakeProvider::new()
-            .err(
-                crate::retry::FailureClass::Transport,
-                "error reading response body",
-            )
-            .err(
-                crate::retry::FailureClass::Transport,
-                "error reading response body",
-            )
-            .err(
-                crate::retry::FailureClass::Transport,
-                "error reading response body",
-            );
-        let result =
-            consolidate_with_script(agreed_outcomes("report one", "report two"), fake).await;
-        let text = result.expect("fail-open must succeed with raw reports");
-        assert!(
-            text.contains("unconsolidated — consolidation failed"),
-            "must carry the unconsolidated marker: {text}"
-        );
-        assert!(text.contains("## Analyst Reports"), "{text}");
-        assert!(text.contains("### Report from Analyst 1"), "{text}");
-        assert!(text.contains("report one"), "{text}");
-        assert!(text.contains("### Report from Analyst 2"), "{text}");
-        assert!(text.contains("report two"), "{text}");
-        assert!(
-            text.contains("no response: analyst produced no response"),
-            "no-response analyst renders its reason — nothing silently lost: {text}"
-        );
-    }
+        let exhausted = FakeProvider::new()
+            .err(FailureClass::Transport, "error reading response body")
+            .err(FailureClass::Transport, "error reading response body")
+            .err(FailureClass::Transport, "error reading response body");
+        // Extraction fails for every analyst → extraction fail-open.
+        let extraction_exhausted = FakeProvider::new()
+            .err(FailureClass::Transport, "error reading response body")
+            .err(FailureClass::Transport, "error reading response body")
+            .err(FailureClass::Transport, "error reading response body")
+            .err(FailureClass::Transport, "error reading response body")
+            .err(FailureClass::Transport, "error reading response body")
+            .err(FailureClass::Transport, "error reading response body");
+        // The grouping pass parses a strict id-based GroupingOutput; a faithful
+        // model groups the two agreed claims and leaves nothing ungrouped.
+        let one_group = r#"{"summary":"alpha is true.","groups":[{"heading":"Alpha","contradiction":false,"members":[{"id":0},{"id":1}]}],"ungrouped":[]}"#;
+        let runs_ws = test_ws("/tmp/test_ws");
 
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
-    async fn test_consolidation_non_retryable_fails_open() {
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        // Even an immediate non-retryable error fails open.
-        let fake = FakeProvider::new().err(
-            crate::retry::FailureClass::NonRetryable,
-            "insufficient balance",
-        );
-        let outcomes = vec![
-            AnalystOutcome::Findings {
-                raw: "alpha".into(),
-                findings: findings(vec![("a", "u1", "low")]),
+        let cases = vec![
+            ConsolidationCase {
+                name: "transport exhaustion fails open with every raw report",
+                input: Outcomes(agreed_outcomes("report one", "report two")),
+                fake: exhausted,
+                contains: &[
+                    "unconsolidated — consolidation failed",
+                    "## Analyst Reports",
+                    "### Report from Analyst 1",
+                    "report one",
+                    "### Report from Analyst 2",
+                    "report two",
+                    "no response: analyst produced no response",
+                ],
+                not_contains: &[],
             },
-            AnalystOutcome::Findings {
-                raw: "beta".into(),
-                findings: findings(vec![("a", "u1", "low")]),
-            },
-            AnalystOutcome::Findings {
-                raw: "gamma".into(),
-                findings: findings(vec![("a", "u1", "low")]),
-            },
-        ];
-        let result = consolidate_with_script(outcomes, fake).await;
-        let text = result.expect("non-retryable consolidation failure fails open");
-        assert!(
-            text.contains("unconsolidated — consolidation failed"),
-            "{text}"
-        );
-        assert!(text.contains("alpha"), "{text}");
-        assert!(text.contains("beta"), "{text}");
-        assert!(text.contains("gamma"), "{text}");
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
-    async fn test_consolidation_success_synthesizes() {
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        // The grouping pass parses a strict id-based GroupingOutput; a
-        // faithful model groups the two agreed claims and leaves nothing
-        // ungrouped.
-        let fake = FakeProvider::new().ok(
-            r#"{"summary":"alpha is true.","groups":[{"heading":"Alpha","contradiction":false,"members":[{"id":0},{"id":1}]}],"ungrouped":[]}"#,
-        );
-        let result = consolidate_with_script(agreed_outcomes("report a", "report b"), fake).await;
-        let text = result.expect("success");
-        assert!(text.contains("alpha is true"), "{text}");
-        assert!(
-            !text.contains("unconsolidated"),
-            "successful consolidation must not hit the fail-open marker: {text}"
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
-    async fn test_consolidation_single_parseable_source_skips_grouping() {
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        // ≥2 valid responses but only one produced parseable claims: a
-        // grouping pass over a single source can't yield agreement brackets
-        // or contradictions — the flat claim list + raw dumps are delivered
-        // without calling the provider.
-        let fake = FakeProvider::new(); // no script — any provider call would fail
-        let provider: Arc<dyn crate::Provider> = Arc::new(fake);
-        let _provider_guard = install_fake_provider(provider);
-        let ws = test_ws("/tmp/test_ws");
-        let outcomes = vec![
-            AnalystOutcome::Findings {
-                raw: "sole report".into(),
-                findings: findings(vec![("alpha is true", "url1", "high")]),
-            },
-            AnalystOutcome::ParseFailed {
-                raw: "unparseable report".into(),
-                failure: "parse failed".into(),
-            },
-        ];
-        let result = consolidate_findings(
-            &ws,
-            "test question",
-            outcomes,
-            "test_round",
-            std::time::Instant::now() + std::time::Duration::from_mins(60),
-        )
-        .await;
-        let text = result
-            .expect("single parseable source succeeds")
-            .expect("a live round delivers its text");
-        assert!(
-            text.contains("only one analyst produced parseable claims — grouping skipped"),
-            "skip marker must be present: {text}"
-        );
-        assert!(text.contains("alpha is true"), "{text}");
-        assert!(text.contains("### Report from Analyst 2"), "{text}");
-        assert!(text.contains("unparseable report"), "{text}");
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
-    async fn test_consolidation_fail_open_mixed_failure_classes() {
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        // Mixed transport + empty-response failures exercise both failure
-        // arms of the grouping retry loop; exhaustion still fails open.
-        // Script: transport error, then two empty responses.
-        let fake = FakeProvider::new()
-            .err(
-                crate::retry::FailureClass::Transport,
-                "error reading response body",
-            )
-            .ok("")
-            .ok("");
-        let result = consolidate_with_script(agreed_outcomes("only usable", "second"), fake).await;
-        let text = result.expect("mixed failures still fail open");
-        assert!(
-            text.contains("unconsolidated — consolidation failed"),
-            "{text}"
-        );
-        assert!(text.contains("only usable"), "{text}");
-        assert!(text.contains("second"), "{text}");
-    }
-
-    /// Extraction fails for every valid analyst → the raw reports are
-    /// delivered with the extraction-failure marker (fail-open at the
-    /// extraction step, not the synthesis step).
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
-    async fn test_extraction_fail_open_delivers_raw_reports() {
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        let fake = FakeProvider::new()
-            .err(
-                crate::retry::FailureClass::Transport,
-                "error reading response body",
-            )
-            .err(
-                crate::retry::FailureClass::Transport,
-                "error reading response body",
-            )
-            .err(
-                crate::retry::FailureClass::Transport,
-                "error reading response body",
-            )
-            .err(
-                crate::retry::FailureClass::Transport,
-                "error reading response body",
-            )
-            .err(
-                crate::retry::FailureClass::Transport,
-                "error reading response body",
-            )
-            .err(
-                crate::retry::FailureClass::Transport,
-                "error reading response body",
-            );
-        let provider: Arc<dyn crate::Provider> = Arc::new(fake);
-        let _provider_guard = install_fake_provider(provider);
-        let ws = test_ws("/tmp/test_ws");
-        let runs = vec![
-            test_analyst_run(&ws, Some("report one")),
-            test_analyst_run(&ws, Some("report two")),
-            test_analyst_run(&ws, None),
-        ];
-        let result = consolidate_analyst_runs(
-            &ws,
-            "test question",
-            runs,
-            std::time::Instant::now() + Duration::from_mins(1),
-            "test_round",
-        )
-        .await;
-        let text = result
-            .expect("extraction fail-open must deliver raw reports")
-            .expect("a live round delivers its text");
-        assert!(
-            text.contains("unconsolidated — findings extraction failed"),
-            "{text}"
-        );
-        assert!(text.contains("### Report from Analyst 1"), "{text}");
-        assert!(text.contains("report one"), "{text}");
-        assert!(text.contains("### Report from Analyst 2"), "{text}");
-        assert!(text.contains("report two"), "{text}");
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
-    async fn test_consolidation_async_envelope_carries_marker() {
-        // The async dispatch path (tokio::spawn in AnalyzeTool::execute) builds
-        // its envelope via SyncDurableCore::Analyze.build_async_message — this
-        // test drives the REAL fail-open consolidation result through that
-        // production builder (not a manual re-wrap), asserting the exact
-        // envelope + marker shape that reaches the caller's agent channel.
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        let fake = FakeProvider::new()
-            .err(crate::retry::FailureClass::Transport, "down")
-            .err(crate::retry::FailureClass::Transport, "down")
-            .err(crate::retry::FailureClass::Transport, "down");
-        let result =
-            consolidate_with_script(agreed_outcomes("raw report", "raw report 2"), fake).await;
-        let envelope = crate::tools::SyncDurableCore::Analyze.build_async_message(
-            "job123",
-            &result,
-            Some("/tmp/round-place"),
-            &crate::workspace::test_ws("/tmp/round-delivery"),
-        );
-        assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
-        assert!(
-            envelope.contains("unconsolidated — consolidation failed"),
-            "{envelope}"
-        );
-        assert!(envelope.contains("raw report"), "{envelope}");
-        assert!(
-            envelope.contains("\n\nJob: job123\n\nDirectory: /tmp/round-place\n\n"),
-            "the place directory must follow the job id: {envelope}"
-        );
-        assert!(
-            envelope.ends_with("</analyze-tool-result>"),
-            "envelope must close: {envelope}"
-        );
-    }
-
-    #[tokio::test]
-    async fn async_envelope_wraps_sub_agent_errors() {
-        // The async dispatch path's error branch: a failed sub-agent is
-        // wrapped in the same envelope with the error text. The delivery
-        // directory line is absent when the round ran in the caller's own
-        // workspace.
-        let envelope = crate::tools::SyncDurableCore::Analyze.build_async_message(
-            "job123",
-            &Err(anyhow::anyhow!("sub-agent exploded")),
-            None,
-            &crate::workspace::test_ws("/tmp/round-delivery"),
-        );
-        assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
-        assert!(
-            envelope.contains("An error occurred: sub-agent exploded"),
-            "{envelope}"
-        );
-        assert!(
-            !envelope.contains("Directory:"),
-            "no directory line without a place: {envelope}"
-        );
-        assert!(
-            envelope.ends_with("</analyze-tool-result>"),
-            "envelope must close: {envelope}"
-        );
-    }
-
-    /// The sync analyze path preserves tool output in full — the analyze tool
-    /// overrides `preserve_full_output` so the consolidated analysis (and any
-    /// appended verification section) is never sandwich-truncated.
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
-    async fn analyze_output_preserved_full_no_sandwich_truncation() {
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        let fake = FakeProvider::new()
-            .err(crate::retry::FailureClass::Transport, "down")
-            .err(crate::retry::FailureClass::Transport, "down")
-            .err(crate::retry::FailureClass::Transport, "down");
-        // A long raw report would overflow the shared 5 KB budget if truncated.
-        let long_report = "lorem ipsum ".repeat(2_000);
-        let result = consolidate_with_script(agreed_outcomes(&long_report, "second"), fake).await;
-        let text = result.expect("fail-open must succeed");
-        // The analyze tool's format_output returns the output verbatim — no
-        // head/tail sandwich, so the marker and all findings reach the caller.
-        let tool = AnalyzeTool::new(DispatchMode::Sync, Role::Engineer);
-        let formatted = tool.format_output(&text);
-        assert_eq!(
-            formatted, text,
-            "analyze output must be preserved in full (no sandwich truncation)"
-        );
-        assert!(
-            formatted.contains("unconsolidated — consolidation failed"),
-            "fail-open marker present: {formatted}"
-        );
-    }
-
-    #[test]
-    fn render_analyze_groups_renders_disputed_cross_references() {
-        // A remainder item that contradicts a frozen group renders with
-        // DISPUTED + a code-computed cross-reference (id-resolved — no text
-        // equality).
-        let outcomes = vec![
-            AnalystOutcome::Findings {
-                raw: "r1".into(),
-                findings: findings(vec![("safe", "url1", "high")]),
-            },
-            AnalystOutcome::Findings {
-                raw: "r2".into(),
-                findings: findings(vec![("actually unsafe", "url2", "high")]),
-            },
-        ];
-        let items = claims_per_agent(&outcomes);
-        let table = crate::consensus::ItemTable::new(&items);
-        let output = crate::consensus::GroupingOutput {
-            summary: "One consensus, one dispute.".into(),
-            groups: vec![crate::consensus::GroupingGroup {
-                heading: "Safety".into(),
-                contradiction: false,
-                members: vec![crate::consensus::GroupingMember {
-                    id: 0,
-                    ..Default::default()
-                }],
-            }],
-            ungrouped: vec![crate::consensus::GroupingMember {
-                id: 1,
-                ..Default::default()
-            }],
-        };
-        let references = vec![crate::consensus::GroupingReference {
-            group: 0,
-            member: crate::consensus::GroupingMember {
-                id: 1,
-                ..Default::default()
-            },
-        }];
-        let text = render_analyze_groups(&output, &references, &table, 2, &outcomes, "");
-        assert!(
-            text.contains("Agent 1: actually unsafe [DISPUTED — contradicts group 0 \"Safety\"]"),
-            "reference must render with DISPUTED + cross-ref: {text}"
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
-    async fn test_consolidation_partial_success_with_remainder() {
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        // Round 1 freezes one group and leaves one item ungrouped; round 2's
-        // delta leaves that item ungrouped → zero-progress stop. The frozen
-        // group + deterministic remainder are delivered (partial success —
-        // never the raw-dump fallback), and the round-1 summary is final.
-        let outcomes = vec![
-            AnalystOutcome::Findings {
-                raw: "r1".into(),
-                findings: findings(vec![
-                    ("alpha is true", "url1", "high"),
-                    ("beta is true", "url2", "medium"),
+            ConsolidationCase {
+                name: "an immediate non-retryable error fails open",
+                input: Outcomes(vec![
+                    AnalystOutcome::Findings {
+                        raw: "alpha".into(),
+                        findings: findings(vec![("a", "u1", "low")]),
+                    },
+                    AnalystOutcome::Findings {
+                        raw: "beta".into(),
+                        findings: findings(vec![("a", "u1", "low")]),
+                    },
+                    AnalystOutcome::Findings {
+                        raw: "gamma".into(),
+                        findings: findings(vec![("a", "u1", "low")]),
+                    },
                 ]),
+                fake: FakeProvider::new()
+                    .err(FailureClass::NonRetryable, "insufficient balance"),
+                contains: &["unconsolidated — consolidation failed", "alpha", "beta", "gamma"],
+                not_contains: &[],
             },
-            AnalystOutcome::Findings {
-                raw: "r2".into(),
-                findings: findings(vec![("alpha is true", "url1", "high")]),
+            ConsolidationCase {
+                name: "a faithful grouping pass synthesizes without the fail-open marker",
+                input: Outcomes(agreed_outcomes("report a", "report b")),
+                fake: FakeProvider::new().ok(one_group),
+                contains: &["alpha is true"],
+                not_contains: &["unconsolidated"],
             },
-            AnalystOutcome::NoResponse("analyst produced no response".into()),
+            ConsolidationCase {
+                name: "a single parseable source skips the grouping pass",
+                input: Outcomes(vec![
+                    AnalystOutcome::Findings {
+                        raw: "sole report".into(),
+                        findings: findings(vec![("alpha is true", "url1", "high")]),
+                    },
+                    AnalystOutcome::ParseFailed {
+                        raw: "unparseable report".into(),
+                        failure: "parse failed".into(),
+                    },
+                ]),
+                // No script — any provider call would fail.
+                fake: FakeProvider::new(),
+                contains: &[
+                    "only one analyst produced parseable claims — grouping skipped",
+                    "alpha is true",
+                    "### Report from Analyst 2",
+                    "unparseable report",
+                ],
+                not_contains: &[],
+            },
+            ConsolidationCase {
+                name: "mixed transport and empty-response failures fail open",
+                input: Outcomes(agreed_outcomes("only usable", "second")),
+                fake: FakeProvider::new()
+                    .err(FailureClass::Transport, "error reading response body")
+                    .ok("")
+                    .ok(""),
+                contains: &[
+                    "unconsolidated — consolidation failed",
+                    "only usable",
+                    "second",
+                ],
+                not_contains: &[],
+            },
+            ConsolidationCase {
+                name: "extraction failure fails open with the raw reports",
+                input: Runs(vec![
+                    test_analyst_run(&runs_ws, Some("report one")),
+                    test_analyst_run(&runs_ws, Some("report two")),
+                    test_analyst_run(&runs_ws, None),
+                ]),
+                fake: extraction_exhausted,
+                contains: &[
+                    "unconsolidated — findings extraction failed",
+                    "### Report from Analyst 1",
+                    "report one",
+                    "### Report from Analyst 2",
+                    "report two",
+                ],
+                not_contains: &[],
+            },
+            ConsolidationCase {
+                name: "partial success delivers the frozen group and the deterministic remainder",
+                input: Outcomes(vec![
+                    AnalystOutcome::Findings {
+                        raw: "r1".into(),
+                        findings: findings(vec![
+                            ("alpha is true", "url1", "high"),
+                            ("beta is true", "url2", "medium"),
+                        ]),
+                    },
+                    AnalystOutcome::Findings {
+                        raw: "r2".into(),
+                        findings: findings(vec![("alpha is true", "url1", "high")]),
+                    },
+                    AnalystOutcome::NoResponse("analyst produced no response".into()),
+                ]),
+                // ids: 0 = a0 "alpha is true", 1 = a0 "beta is true",
+                // 2 = a1 "alpha is true". Round 2 leaves the id-1 item
+                // ungrouped → zero-progress stop.
+                fake: FakeProvider::new()
+                    .ok(
+                        r#"{"summary":"alpha agreed, beta solo.","groups":[{"heading":"Alpha","contradiction":false,"members":[{"id":0},{"id":2}]}],"ungrouped":[{"id":1}]}"#,
+                    )
+                    .ok(r#"{"groups":[],"ungrouped":[{"id":1}]}"#),
+                contains: &[
+                    "**Alpha** [2/2]",
+                    "**Other**",
+                    "- Agent 0: beta is true",
+                    "alpha agreed, beta solo.",
+                ],
+                not_contains: &["unconsolidated"],
+            },
+            ConsolidationCase {
+                // A report far over the shared tool-output budget still reaches
+                // the caller whole when the analyze tool formats it.
+                name: "a long report is delivered verbatim",
+                input: Outcomes(agreed_outcomes(&"lorem ipsum ".repeat(2_000), "second")),
+                fake: FakeProvider::new()
+                    .err(FailureClass::Transport, "error reading response body")
+                    .err(FailureClass::Transport, "error reading response body")
+                    .err(FailureClass::Transport, "error reading response body"),
+                contains: &["unconsolidated — consolidation failed"],
+                not_contains: &[],
+            },
         ];
-        // ids: 0 = a0 "alpha is true", 1 = a0 "beta is true", 2 = a1 "alpha is true".
-        let fake = FakeProvider::new()
-            .ok(
-                r#"{"summary":"alpha agreed, beta solo.","groups":[{"heading":"Alpha","contradiction":false,"members":[{"id":0},{"id":2}]}],"ungrouped":[{"id":1}]}"#,
-            )
-            .ok(r#"{"groups":[],"ungrouped":[{"id":1}]}"#);
-        let result = consolidate_with_script(outcomes, fake).await;
-        let text = result.expect("partial success must be delivered");
-        assert!(
-            text.contains("**Alpha** [2/2]"),
-            "frozen group with code-computed bracket renders: {text}"
-        );
-        assert!(
-            text.contains("**Other**") && text.contains("- Agent 0: beta is true"),
-            "deterministic remainder renders in the ungrouped section: {text}"
-        );
-        assert!(
-            text.contains("alpha agreed, beta solo."),
-            "round-1 summary is final: {text}"
-        );
-        assert!(
-            !text.contains("unconsolidated"),
-            "partial success replaces the raw-dump fallback: {text}"
-        );
+
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let ws = test_ws("/tmp/test_ws");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(60);
+        for case in cases {
+            let provider: Arc<dyn crate::Provider> = Arc::new(case.fake);
+            let _provider_guard = install_fake_provider(provider);
+            let result = match case.input {
+                ConsolidationInput::Runs(runs) => {
+                    consolidate_analyst_runs(&ws, "test question", runs, deadline, "test_round")
+                        .await
+                }
+                ConsolidationInput::Outcomes(outcomes) => {
+                    consolidate_findings(&ws, "test question", outcomes, "test_round", deadline)
+                        .await
+                }
+            };
+            let text = result
+                .unwrap_or_else(|err| panic!("[{}] consolidation errored: {err}", case.name))
+                .expect("a live round delivers its consolidated text");
+            assert_contains_not_contains(case.name, &text, case.contains, case.not_contains);
+            // The analyze tool's format_output returns the output verbatim — no
+            // head/tail sandwich — so a marker and all findings reach the caller.
+            let tool = AnalyzeTool::new(DispatchMode::Sync, Role::Engineer);
+            assert_eq!(
+                tool.format_output(&text),
+                text,
+                "[{}] analyze output must be preserved in full",
+                case.name
+            );
+        }
+    }
+
+    /// What the async path delivers to the caller's agent channel.
+    enum AsyncEnvelopeInput {
+        /// The real fail-open consolidation result (transport retries exhausted).
+        FailOpenAfterTransportExhaustion,
+        /// A failed sub-agent.
+        SubAgentError,
+    }
+
+    /// One async analyze envelope: the delivered result, the place (if any) and
+    /// the exact shape the caller must receive.
+    struct AsyncEnvelopeCase {
+        name: &'static str,
+        input: AsyncEnvelopeInput,
+        place: Option<&'static str>,
+        contains: &'static [&'static str],
+        not_contains: &'static [&'static str],
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
+    async fn async_envelope_cases() {
+        for case in [
+            AsyncEnvelopeCase {
+                name: "the fail-open marker and the place directory reach the caller",
+                input: AsyncEnvelopeInput::FailOpenAfterTransportExhaustion,
+                place: Some("/tmp/round-place"),
+                contains: &[
+                    "<analyze-tool-result>",
+                    "unconsolidated — consolidation failed",
+                    "raw report",
+                    "\n\nJob: job123\n\nDirectory: /tmp/round-place\n\n",
+                ],
+                not_contains: &[],
+            },
+            AsyncEnvelopeCase {
+                name: "a failed sub-agent is wrapped with its error and no directory",
+                input: AsyncEnvelopeInput::SubAgentError,
+                place: None,
+                contains: &[
+                    "<analyze-tool-result>",
+                    "An error occurred: sub-agent exploded",
+                ],
+                not_contains: &["Directory:"],
+            },
+        ] {
+            let _policy_guard =
+                crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+            let result: anyhow::Result<String> = match case.input {
+                AsyncEnvelopeInput::FailOpenAfterTransportExhaustion => {
+                    let fake = FakeProvider::new()
+                        .err(crate::retry::FailureClass::Transport, "down")
+                        .err(crate::retry::FailureClass::Transport, "down")
+                        .err(crate::retry::FailureClass::Transport, "down");
+                    consolidate_with_script(agreed_outcomes("raw report", "raw report 2"), fake)
+                        .await
+                }
+                AsyncEnvelopeInput::SubAgentError => Err(anyhow::anyhow!("sub-agent exploded")),
+            };
+            // Drives the production builder (not a manual re-wrap), so the
+            // envelope + marker shape asserted here is the one that ships.
+            let envelope = crate::tools::SyncDurableCore::Analyze.build_async_message(
+                "job123",
+                &result,
+                case.place,
+                &crate::workspace::test_ws("/tmp/round-delivery"),
+            );
+            let mut needles: Vec<&str> = case.contains.to_vec();
+            needles.push("</analyze-tool-result>");
+            assert_contains_not_contains(case.name, &envelope, &needles, case.not_contains);
+            assert!(
+                envelope.ends_with("</analyze-tool-result>"),
+                "[{}] envelope must close: {envelope}",
+                case.name
+            );
+        }
+    }
+
+    /// One boot resume of a crashed async analyze: the job row and roster the
+    /// crash left behind, the place it was running in and what the delivered
+    /// envelope must say.
+    struct ResumeRoundCase {
+        name: &'static str,
+        job_id: &'static str,
+        workspace: &'static str,
+        /// The place directory the crashed round recorded, if it had one.
+        place: Option<&'static str>,
+        /// The analyst's stored outcome, when the crash left a completed slot.
+        outcome: Option<&'static str>,
+        /// Substrings the delivered envelope must carry.
+        contains: &'static [&'static str],
     }
 
     /// Boot resume of a crashed async analyze must REUSE the existing job + roster
     /// (never re-spawn — the jobs.id PK would conflict AND freshly generated
     /// analyst ids would not match the stored roster rows, so outcomes would
-    /// be lost). A single done slot reconstructs from its stored outcome
-    /// (raw passthrough — no provider needed).
+    /// be lost): a single done slot reconstructs from its stored outcome (raw
+    /// passthrough — no provider needed), and the round terminalizes into an
+    /// envelope delivered to the ORIGINAL caller. A place round whose recorded
+    /// directory is gone must END with a plain failure instead — the job
+    /// terminalizes and the caller receives the reason, never left launched and
+    /// silent forever.
     ///
     /// Serialized with the drain-flag writers: `resume_analyze_round` consults the
     /// process-global drain flag and aborts early while it is set.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
-    async fn resume_analyze_round_reuses_existing_job() {
+    async fn resume_round_cases() {
         crate::util::test::init_management_test_stores().await;
-        let ws = test_ws("/tmp/test_ws_resume_analyze");
-        let job_id = "analyze_job_resume_1";
-        let agent_id = format!("analyze_{}_rs_0_analyst", ws.name);
-        let conn = &crate::session::store().conn;
-        // Pre-create the job row exactly as a crashed dispatch leaves it
-        // (caller identity persisted on the job row; one done slot with a
-        // stored outcome).
-        crate::jobs::spawn_job(
-            conn,
-            job_id,
-            "question?",
-            &ws.name,
-            "caller-user",
-            "telegram",
-            crate::Role::Assistant,
-            &[crate::jobs::NewAgent {
-                agent_id: agent_id.clone(),
-                kind: crate::jobs::AgentKind::Analyst,
-                idx: Some(0),
-                task: "question?".to_string(),
-            }],
-            &crate::jobs::SpawnChild::Analyze,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        crate::jobs::write_agent_outcome(
-            conn,
-            job_id,
-            &agent_id,
-            crate::jobs::RowStatus::Done,
-            Some("completed analyst response"),
-        )
-        .await
-        .unwrap();
-
-        // Resume: must NOT hit the jobs.id PK conflict, must reuse the stored
-        // roster slot, then terminalize into a durable envelope delivered to
-        // the ORIGINAL caller (Assistant, not Manager).
-        resume_analyze_round(job_id, &ws, None).await;
-
-        let job_rows = conn
-            .query(
-                "SELECT id FROM jobs WHERE id = ?1",
-                crate::db::params![job_id],
+        for case in [
+            // Pre-create the job row exactly as a crashed dispatch leaves it
+            // (caller identity persisted on the job row; one done slot with a
+            // stored outcome).
+            ResumeRoundCase {
+                name: "a crashed round is resumed over its own roster",
+                job_id: "analyze_job_resume_1",
+                workspace: "/tmp/test_ws_resume_analyze",
+                place: None,
+                outcome: Some("completed analyst response"),
+                contains: &["completed analyst response"],
+            },
+            ResumeRoundCase {
+                name: "a place round whose directory vanished fails loudly",
+                job_id: "analyze_job_resume_place",
+                workspace: "/tmp/test_ws_resume_place",
+                place: Some("/definitely/not/here/analyze-place"),
+                outcome: None,
+                contains: &[
+                    "no longer available",
+                    "Directory: /definitely/not/here/analyze-place",
+                ],
+            },
+        ] {
+            let ws = test_ws(case.workspace);
+            let conn = &crate::session::store().conn;
+            let agent_id = format!("{}_analyst", case.job_id);
+            crate::jobs::spawn_job(
+                conn,
+                case.job_id,
+                "question?",
+                &ws.name,
+                "caller-user",
+                "telegram",
+                crate::Role::Assistant,
+                &[crate::jobs::NewAgent {
+                    agent_id: agent_id.clone(),
+                    kind: crate::jobs::AgentKind::Analyst,
+                    idx: Some(0),
+                    task: "question?".to_string(),
+                }],
+                &crate::jobs::SpawnChild::Analyze,
+                None,
+                case.place,
+                None,
             )
             .await
             .unwrap();
-        assert_eq!(job_rows.len(), 0, "resumed job must be terminalized");
-        let pending = conn
-            .query(
-                "SELECT envelope FROM pending_jobs WHERE id = ?1",
-                crate::db::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert_eq!(pending.len(), 1, "envelope persisted with the job id");
-        let envelope: crate::agent::message_router::AgentJob =
-            serde_json::from_str(&pending[0].get::<String>(0).unwrap()).unwrap();
-        assert_eq!(
-            envelope.role,
-            crate::Role::Assistant,
-            "resumed envelope routes to the original caller role, not Manager"
-        );
-        assert_eq!(envelope.user_name, "caller-user");
-    }
+            if let Some(outcome) = case.outcome {
+                crate::jobs::write_agent_outcome(
+                    conn,
+                    case.job_id,
+                    &agent_id,
+                    crate::jobs::RowStatus::Done,
+                    Some(outcome),
+                )
+                .await
+                .unwrap();
+            }
 
-    /// A place round whose recorded directory is gone must END with a plain
-    /// failure — the job terminalizes and the caller receives the reason, never
-    /// left launched and silent forever.
-    #[tokio::test]
-    #[serial_test::serial(drain)] // serializes the process-global drain flag
-    async fn resume_place_round_with_a_vanished_directory_fails_loudly() {
-        crate::util::test::init_management_test_stores().await;
-        let ws = test_ws("/tmp/test_ws_resume_place");
-        let job_id = "analyze_job_resume_place";
-        let place = "/definitely/not/here/analyze-place";
-        let conn = &crate::session::store().conn;
-        crate::jobs::spawn_job(
-            conn,
-            job_id,
-            "question?",
-            &ws.name,
-            "caller-user",
-            "telegram",
-            crate::Role::Assistant,
-            &[crate::jobs::NewAgent {
-                agent_id: format!("{job_id}_analyst"),
-                kind: crate::jobs::AgentKind::Analyst,
-                idx: Some(0),
-                task: "question?".to_string(),
-            }],
-            &crate::jobs::SpawnChild::Analyze,
-            None,
-            Some(place),
-            None,
-        )
-        .await
-        .unwrap();
+            // Resume: must NOT hit the jobs.id PK conflict, must reuse the stored
+            // roster slot, then terminalize into a durable envelope.
+            resume_analyze_round(case.job_id, &ws, case.place).await;
 
-        resume_analyze_round(job_id, &ws, Some(place)).await;
-
-        let job_rows = conn
-            .query(
-                "SELECT id FROM jobs WHERE id = ?1",
-                crate::db::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert_eq!(job_rows.len(), 0, "the round must terminalize, not hang");
-        let pending = conn
-            .query(
-                "SELECT envelope FROM pending_jobs WHERE id = ?1",
-                crate::db::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert_eq!(pending.len(), 1, "the failure is delivered to the caller");
-        let envelope: crate::agent::message_router::AgentJob =
-            serde_json::from_str(&pending[0].get::<String>(0).unwrap()).unwrap();
-        assert_eq!(
-            envelope.workspace_name, ws.name,
-            "the delivery key stays the caller's own workspace, never the place"
-        );
-        assert!(
-            envelope.content.contains("no longer available"),
-            "{}",
-            envelope.content
-        );
-        assert!(
-            envelope.content.contains(&format!("Directory: {place}")),
-            "{}",
-            envelope.content
-        );
+            let job_rows = conn
+                .query(
+                    "SELECT id FROM jobs WHERE id = ?1",
+                    crate::db::params![case.job_id],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                job_rows.len(),
+                0,
+                "[{}] the round must terminalize, not hang",
+                case.name
+            );
+            let pending = conn
+                .query(
+                    "SELECT envelope FROM pending_jobs WHERE id = ?1",
+                    crate::db::params![case.job_id],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                pending.len(),
+                1,
+                "[{}] the delivery is persisted with the job id",
+                case.name
+            );
+            let envelope: crate::agent::message_router::AgentJob =
+                serde_json::from_str(&pending[0].get::<String>(0).unwrap()).unwrap();
+            // Delivered to the ORIGINAL caller (Assistant, not Manager), keyed to
+            // that caller's own workspace — never to the place.
+            assert_eq!(
+                envelope.role,
+                crate::Role::Assistant,
+                "[{}] the original caller role",
+                case.name
+            );
+            assert_eq!(envelope.user_name, "caller-user", "[{}]", case.name);
+            assert_eq!(
+                envelope.workspace_name, ws.name,
+                "[{}] the delivery key stays the caller's own workspace, never the place",
+                case.name
+            );
+            for needle in case.contains {
+                assert!(
+                    envelope.content.contains(needle),
+                    "[{}] the envelope must say {needle:?}: {}",
+                    case.name,
+                    envelope.content
+                );
+            }
+        }
     }
 
     /// A provider that parks every chat call until the test opens the gate, so
@@ -3864,62 +3729,6 @@ mod tests {
         assert!(!cancel_row_exists("jobs", job_id).await);
     }
 
-    /// A cancelled round starts no model call on its way out: both the findings
-    /// extraction and the grouping pass stop at the fired signal, so the round
-    /// reports its cancellation instead of a result — no extraction call and no
-    /// re-registered `consolidate` call card.
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)]
-    async fn a_cancelled_round_starts_no_consolidation_call() {
-        crate::util::test::init_management_test_stores().await;
-        let ws = test_ws("/tmp/test_ws_analyze_cancel_consolidate");
-        let round = "analyze_cancel_consolidate_round";
-        // Every scripted call fails: a call the cancelled round started anyway
-        // would surface as a fail-open deliverable instead of a cancellation.
-        let fake =
-            FakeProvider::new().err(crate::retry::FailureClass::Transport, "no call expected");
-        let provider: Arc<dyn crate::Provider> = Arc::new(fake);
-        let _provider_guard = install_fake_provider(provider);
-        // The round's cancel signal, fired before either phase: the entry stays
-        // alive for the duration of the test.
-        let _cancel_guard = crate::round_cancel::register(round, None);
-
-        // Extraction phase: the gate sits ahead of the analyst extraction calls.
-        let runs = vec![
-            test_analyst_run(&ws, Some("report one")),
-            test_analyst_run(&ws, Some("report two")),
-        ];
-        crate::round_cancel::cancel(round);
-        let result = consolidate_analyst_runs(
-            &ws,
-            "test question",
-            runs,
-            std::time::Instant::now() + Duration::from_mins(1),
-            round,
-        )
-        .await
-        .expect("a cancelled round is not a failure");
-        assert!(
-            result.is_none(),
-            "a cancelled round produces no text: {result:?}"
-        );
-
-        // Grouping pass: the gate sits ahead of the shared grouping call.
-        let result = consolidate_findings(
-            &ws,
-            "test question",
-            agreed_outcomes("report one", "report two"),
-            round,
-            std::time::Instant::now() + Duration::from_mins(1),
-        )
-        .await
-        .expect("a cancelled round is not a failure");
-        assert!(
-            result.is_none(),
-            "a cancelled round starts no grouping call: {result:?}"
-        );
-    }
-
     /// A cancel landing AFTER a phase's entry gate stops that phase's own model
     /// calls instead of letting the retry loop re-ask: both the findings
     /// extraction and the consolidation pass are abandoned at the fired signal,
@@ -4030,67 +3839,6 @@ mod tests {
             "a cancelled round starts no grouping call"
         );
         assert_no_further_calls(&provider, 3).await;
-    }
-
-    /// A cancelled round raises no warning about itself: the verification
-    /// phase's cancel gate is its first statement, so the elapsed-window WARN —
-    /// the very state the expired deadline below sets up — cannot fire for a
-    /// round whose result is discarded.
-    #[tokio::test(flavor = "current_thread")]
-    #[expect(clippy::unchecked_time_subtraction)] // the expired deadline is this fixture's point
-    async fn a_cancelled_round_raises_no_verification_warning() {
-        let ws = test_ws("/tmp/test_ws_analyze_cancel_verify_warning");
-        let round_key = "analyze_cancel_verify_warning_job";
-        let _cancel_guard = crate::round_cancel::register(round_key, None);
-        crate::round_cancel::cancel(round_key);
-
-        let items = vec![
-            vec!["the cache is warm".to_string()],
-            vec!["the cache is cold".to_string()],
-        ];
-        let table = crate::consensus::ItemTable::new(&items);
-        let output = crate::consensus::GroupingOutput {
-            summary: "contested".to_string(),
-            groups: vec![crate::consensus::GroupingGroup {
-                heading: "cache state".to_string(),
-                contradiction: true,
-                members: Vec::new(),
-            }],
-            ungrouped: Vec::new(),
-        };
-        let recorder = LevelRecorder::default();
-        let section = {
-            use tracing_subscriber::layer::SubscriberExt as _;
-            let _capture = tracing::subscriber::set_default(
-                tracing_subscriber::registry().with(recorder.clone()),
-            );
-            verify_disputed_groups(
-                &ws,
-                "test question",
-                &output,
-                &table,
-                &[],
-                round_key,
-                std::time::Instant::now() - round_timeout(),
-            )
-            .await
-        };
-        assert!(
-            section.is_empty(),
-            "a cancelled round renders no verification: {section}"
-        );
-        // The capture saw this phase's own record (the gate's INFO), so the
-        // absence of a WARN below is not a vacuous pass.
-        assert!(
-            recorder.levels().contains(&tracing::Level::INFO),
-            "the capture must observe the gate's own record: {:?}",
-            recorder.levels()
-        );
-        assert!(
-            !recorder.levels().contains(&tracing::Level::WARN),
-            "a cancelled round must not warn about itself: {:?}",
-            recorder.levels()
-        );
     }
 
     /// Cancelling one round leaves the caller's other in-flight rounds alone: a
@@ -4751,34 +4499,52 @@ mod tests {
         }
     }
 
-    #[test]
-    fn verification_units_single_group_is_one_unit() {
-        let groups = [disputed_group("Alpha", &[0, 1])];
-        let units = verification_units(&groups.iter().collect::<Vec<_>>());
-        assert_eq!(units.len(), 1, "exactly one disputed group → one unit");
-        assert_eq!(units[0].len(), 1);
-        assert_eq!(units[0][0].heading, "Alpha");
+    /// One [`verification_units`] partition scenario.
+    struct VerificationUnitCase {
+        name: &'static str,
+        headings: &'static [&'static str],
+        /// Group count of each unit, in order (the first takes the extra).
+        expected_sizes: &'static [usize],
     }
 
     #[test]
-    fn verification_units_splits_by_group_count_first_takes_extra() {
-        let group = |h: &str| disputed_group(h, &[]);
-        // 3 groups → 2 units: first takes the extra (2), second gets 1.
-        let groups = [group("A"), group("B"), group("C")];
-        let refs = groups.iter().collect::<Vec<_>>();
-        let units = verification_units(&refs);
-        assert_eq!(units.len(), 2);
-        assert_eq!(units[0].len(), 2, "first part takes the extra group");
-        assert_eq!(units[1].len(), 1);
-        assert_eq!(units[0][1].heading, "B");
-        assert_eq!(units[1][0].heading, "C");
-
-        // 4 groups → 2 units of 2/2.
-        let groups = [group("A"), group("B"), group("C"), group("D")];
-        let refs = groups.iter().collect::<Vec<_>>();
-        let units = verification_units(&refs);
-        assert_eq!(units[0].len(), 2);
-        assert_eq!(units[1].len(), 2);
+    fn verification_units_cases() {
+        for case in [
+            VerificationUnitCase {
+                name: "a single disputed group is one unit",
+                headings: &["Alpha"],
+                expected_sizes: &[1],
+            },
+            VerificationUnitCase {
+                name: "three groups split 2/1 with the first taking the extra",
+                headings: &["A", "B", "C"],
+                expected_sizes: &[2, 1],
+            },
+            VerificationUnitCase {
+                name: "four groups split 2/2",
+                headings: &["A", "B", "C", "D"],
+                expected_sizes: &[2, 2],
+            },
+        ] {
+            let groups: Vec<_> = case
+                .headings
+                .iter()
+                .map(|h| disputed_group(h, &[]))
+                .collect();
+            let refs = groups.iter().collect::<Vec<_>>();
+            let units = verification_units(&refs);
+            let sizes: Vec<usize> = units.iter().map(Vec::len).collect();
+            assert_eq!(sizes, case.expected_sizes, "[{}] unit sizes", case.name);
+            let flattened: Vec<&str> = units
+                .iter()
+                .flat_map(|unit| unit.iter().map(|group| group.heading.as_str()))
+                .collect();
+            assert_eq!(
+                flattened, case.headings,
+                "[{}] groups keep their order",
+                case.name
+            );
+        }
     }
 
     #[test]
@@ -4835,13 +4601,17 @@ mod tests {
             "member self-reported contradictions aggregate: {}",
             target.contradictions
         );
-    }
 
-    #[test]
-    fn render_verification_section_formats_verdicts() {
-        let results = vec![
+        // No results render nothing; every verdict is one bullet; multi-line
+        // claim/evidence text is collapsed to semicolons; and fenced untrusted
+        // text is escaped.
+        assert!(
+            render_verification_section(&[]).is_empty(),
+            "an empty set renders nothing"
+        );
+        let verdicts = vec![
             VerificationResult {
-                claim: "Alpha: x".into(),
+                claim: "Alpha: x\nsecond".into(),
                 verdict: "supported".into(),
                 evidence: "primary source confirms".into(),
                 tool_calls: 1,
@@ -4851,21 +4621,16 @@ mod tests {
             VerificationResult {
                 claim: "Beta: y".into(),
                 verdict: "unresolved".into(),
-                evidence: "no evidence found".into(),
+                evidence: "```no evidence```\nfound".into(),
                 tool_calls: 0,
                 searches: 1,
                 queries: vec![],
             },
         ];
-        let text = render_verification_section(&results);
         assert_eq!(
-            text,
-            "## Verification\n- Alpha: x → **supported** — primary source confirms\n- Beta: y → **unresolved** — no evidence found",
-            "verdicts render as annotation lines"
-        );
-        assert!(
-            render_verification_section(&[]).is_empty(),
-            "empty results render an empty section"
+            render_verification_section(&verdicts),
+            "## Verification\n- Alpha: x; second → **supported** — primary source confirms\n- Beta: y → **unresolved** — \\`\\`\\`no evidence\\`\\`\\`; found",
+            "one bullet per verdict, newlines collapsed and fences escaped"
         );
     }
 

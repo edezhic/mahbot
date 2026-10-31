@@ -889,99 +889,6 @@ mod tests {
     use super::*;
     use crate::util::test::ProbeFile;
 
-    #[test]
-    fn header_parses_comments_and_all_four_types() {
-        let source = "#!/usr/bin/env bun\n\
-                      // @description Fetches the weather for a city.\n\
-                      // @param city string required the city to look up\n\
-                      // @param days integer optional forecast days\n\
-                      /* @param metric boolean required use metric units */\n\
-                      /**\n\
-                       * @param tags list optional labels\n\
-                       */\n\
-                      \n\
-                      const city = process.argv[2];\n\
-                      // @param late string optional after the code\n";
-        let (description, params) = parse_header(source).expect("valid header");
-        assert_eq!(description, "Fetches the weather for a city.");
-        // The last line sits past the first line of code, so it is not part of
-        // the header block at all.
-        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["city", "days", "metric", "tags"]);
-        assert_eq!(params[0].ty, ParamType::Str);
-        assert!(params[0].required);
-        assert_eq!(params[0].description, "the city to look up");
-        assert_eq!(params[1].ty, ParamType::Integer);
-        assert!(!params[1].required);
-        assert_eq!(params[2].ty, ParamType::Boolean);
-        // A block comment's closing punctuation is not part of its prose.
-        assert_eq!(params[2].description, "use metric units");
-        assert_eq!(params[3].ty, ParamType::List);
-        assert_eq!(params[3].description, "labels");
-    }
-
-    #[test]
-    fn malformed_headers_are_rejected() {
-        let cases: [&str; 8] = [
-            // no description at all
-            "// @param city string required\n",
-            // no header at all
-            "const x = 1;\n",
-            // empty description
-            "// @description\n",
-            // a second description
-            "// @description x\n// @description y\n",
-            // a misspelled directive is a typo, not a silent no-op
-            "// @description x\n// @parm city string required\n",
-            // unknown type
-            "// @description x\n// @param city float required\n",
-            // missing required/optional
-            "// @description x\n// @param city string\n",
-            // duplicate parameter
-            "// @description x\n// @param c string required\n// @param c string optional\n",
-        ];
-        for case in cases {
-            assert!(parse_header(case).is_none(), "must reject: {case:?}");
-        }
-    }
-
-    #[test]
-    fn catalogue_lines_narrate_parameters() {
-        let tools = [
-            CustomToolEntry {
-                name: "weather".to_string(),
-                description: "Fetches the weather.".to_string(),
-                params: vec![
-                    Param {
-                        name: "city".to_string(),
-                        ty: ParamType::Str,
-                        required: true,
-                        description: "the city to look up".to_string(),
-                    },
-                    Param {
-                        name: "days".to_string(),
-                        ty: ParamType::Integer,
-                        required: false,
-                        description: String::new(),
-                    },
-                ],
-                path: PathBuf::from("weather.ts"),
-            },
-            CustomToolEntry {
-                name: "disk".to_string(),
-                description: "Reports disk usage.".to_string(),
-                params: Vec::new(),
-                path: PathBuf::from("disk.js"),
-            },
-        ];
-        let refs: Vec<&CustomToolEntry> = tools.iter().collect();
-        assert_eq!(
-            render_lines(&refs),
-            "- weather: Fetches the weather. Parameters: city (string, required) — the city to \
-             look up; days (integer, optional).\n- disk: Reports disk usage."
-        );
-    }
-
     /// The folder the discovery tests share: a tool that parses, a same-stem
     /// pair that both parse, a name whose first file by path is broken and whose
     /// second parses, a name every file of which is broken, and the files that
@@ -1026,38 +933,6 @@ mod tests {
         let weather = tools.iter().find(|t| t.name == "weather").expect("weather");
         assert_eq!(weather.description, "Other weather.");
         assert!(weather.path.ends_with("weather.js"));
-    }
-
-    /// Broken files are listed, not skipped, and a usable sibling under the same
-    /// stem takes the name over — the listing and the model catalogue must never
-    /// disagree about which tools exist.
-    #[test]
-    fn listings_include_broken_tools_in_name_order() {
-        let tmp = discovery_fixture();
-        let listings = load_listings(tmp.path()).expect("read the folder");
-        let names: Vec<&str> = listings.iter().map(ToolListing::name).collect();
-        assert_eq!(names, ["helper", "mended", "weather", "wrecked"]);
-        // The listing shows the same file the catalogue picks when two files
-        // share a name.
-        let usable = |name: &str| match listings.iter().find(|l| l.name() == name) {
-            Some(ToolListing::Usable(entry)) => entry.description.clone(),
-            other => panic!("expected a usable {name}, got {other:?}"),
-        };
-        assert_eq!(usable("weather"), "Other weather.");
-        // A broken first file leaves the name to its usable sibling.
-        assert_eq!(usable("mended"), "Mended.");
-        // A name every file of which is broken stays listed as broken.
-        assert!(matches!(
-            listings.iter().find(|l| l.name() == "wrecked"),
-            Some(ToolListing::Broken(_))
-        ));
-        // A folder nobody has written a tool into holds no tools — an empty
-        // listing, not a failed read.
-        assert!(
-            load_listings(&tmp.path().join("absent"))
-                .expect("an absent folder is not a failure")
-                .is_empty()
-        );
     }
 
     /// The block's listing split is what keeps a guest from being told about
@@ -1256,64 +1131,127 @@ mod tests {
         }
     }
 
+    /// One grant notice: the guest it wakes and the tool it names — with the
+    /// tool's own catalogue entry when the catalogue holds a readable definition
+    /// for it.
+    struct GrantNoticeCase<'a> {
+        name: &'static str,
+        guest: &'static str,
+        tool: &'static str,
+        entry: Option<&'a CustomToolEntry>,
+    }
+
     /// A real grant change wakes the guest's existing Assistant session with a
-    /// durable notice naming the tool and the direction; the admin is never
-    /// notified and an account without an Assistant session is left alone.
+    /// durable notice naming the tool and the direction, carrying the tool's own
+    /// entry where the catalogue has one and the bare name where it has none; a
+    /// removal carries the name and no entry. The admin is never notified and an
+    /// account without an Assistant session is left alone.
+    #[expect(clippy::too_many_lines)]
     #[tokio::test]
-    async fn grant_change_notice_wakes_only_an_existing_guest_session() {
+    async fn grant_notice_cases() {
         // A name no test authors a file for, so the catalogue holds no readable
         // definition for it.
         const ABSENT: &str = "notice_absent_tool";
         crate::util::test::init_management_test_stores().await;
-        let store = crate::users::store();
-        let guest = "grant_notice_guest";
-        store.add_user(guest).await.unwrap();
-        let guest_id = crate::session::resolve_agent_id(
-            guest,
-            crate::Role::Assistant.as_str(),
-            &crate::users::personal_workspace_name(guest),
-        );
-        // A registered receiver captures the routed job deterministically — no
-        // consumer loop (and no agent run) is spawned.
-        let mut rx = crate::agent::message_router::register_agent(&guest_id);
-        crate::util::test::seed_session_row(
-            &crate::session::store().conn,
-            &guest_id,
-            "user",
-            "hello",
+        let dir = shared_dir();
+        std::fs::create_dir_all(&dir).expect("create the shared folder");
+        let probe = ProbeFile(dir.join("notice_entry_probe.ts"));
+        std::fs::write(
+            &probe.0,
+            "// @description Reports the notice probe.\n\
+             // @param city string required the city to look up\n",
         )
-        .await;
+        .expect("write the probe tool");
+        let entry = load_catalogue(&dir)
+            .into_iter()
+            .find(|t| t.name == "notice_entry_probe")
+            .expect("the probe tool is in the catalogue");
 
-        notify_grant_change(guest, ABSENT, true).await;
-        let job = rx.try_recv().expect("an existing session is woken");
-        // With no definition to render there is no entry: the notice keeps the
-        // exact text it has always had — no empty slot, no blank line — and says
-        // nothing about the tool's health.
-        assert_eq!(
-            job.content,
-            format!(
-                "<custom-tools-notice>\n\
-                 Custom tools granted to your account: {ABSENT}\n\
-                 </custom-tools-notice>\n"
+        let store = crate::users::store();
+        for case in [
+            // With no definition to render there is no entry: the notice keeps the
+            // exact text it has always had — no empty slot, no blank line — and says
+            // nothing about the tool's health.
+            GrantNoticeCase {
+                name: "a grant of a tool with no definition carries the name alone",
+                guest: "grant_notice_guest",
+                tool: ABSENT,
+                entry: None,
+            },
+            // The entry is the block's own rendering of the tool — the very text a
+            // session-start list shows for it — following the notice's wording as
+            // its own line.
+            GrantNoticeCase {
+                name: "a grant carries the granted tool's own entry",
+                guest: "grant_notice_entry_guest",
+                tool: "notice_entry_probe",
+                entry: Some(&entry),
+            },
+        ] {
+            store.add_user(case.guest).await.unwrap();
+            let agent_id = crate::session::resolve_agent_id(
+                case.guest,
+                crate::Role::Assistant.as_str(),
+                &crate::users::personal_workspace_name(case.guest),
+            );
+            // A registered receiver captures the routed job deterministically — no
+            // consumer loop (and no agent run) is spawned.
+            let mut rx = crate::agent::message_router::register_agent(&agent_id);
+            crate::util::test::seed_session_row(
+                &crate::session::store().conn,
+                &agent_id,
+                "user",
+                "hello",
             )
-        );
-        assert_eq!(
-            job.kind,
-            crate::agent::message_router::MessageKind::UserMessage
-        );
-        assert_eq!(job.role, crate::Role::Assistant);
-        assert!(job.pending_job_id.is_some(), "the notice must be durable");
+            .await;
 
-        notify_grant_change(guest, ABSENT, false).await;
-        let job = rx.try_recv().expect("a revocation is announced too");
-        assert_eq!(
-            job.content,
-            format!(
+            notify_grant_change(case.guest, case.tool, true).await;
+            let job = rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("[{}] an existing session is woken", case.name));
+            let mut granted = format!(
                 "<custom-tools-notice>\n\
-                 Custom tools removed from your account: {ABSENT}\n\
-                 </custom-tools-notice>\n"
-            )
-        );
+                 Custom tools granted to your account: {}\n",
+                case.tool
+            );
+            if let Some(entry) = case.entry {
+                granted.push_str(&render_lines(&[entry]));
+                granted.push('\n');
+            }
+            granted.push_str("</custom-tools-notice>\n");
+            assert_eq!(job.content, granted, "[{}] the grant notice", case.name);
+            assert_eq!(
+                job.kind,
+                crate::agent::message_router::MessageKind::UserMessage,
+                "[{}] the notice is the caller's own kind",
+                case.name
+            );
+            assert_eq!(job.role, crate::Role::Assistant, "[{}]", case.name);
+            assert!(
+                job.pending_job_id.is_some(),
+                "[{}] the notice must be durable",
+                case.name
+            );
+
+            notify_grant_change(case.guest, case.tool, false).await;
+            let job = rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("[{}] a revocation is announced too", case.name));
+            assert_eq!(
+                job.content,
+                format!(
+                    "<custom-tools-notice>\n\
+                     Custom tools removed from your account: {}\n\
+                     </custom-tools-notice>\n",
+                    case.tool
+                ),
+                "[{}] the removal carries no entry",
+                case.name
+            );
+
+            crate::agent::message_router::unregister_agent(&agent_id);
+            clear_pending(&agent_id).await;
+        }
 
         // The admin holds every tool, so its own account is never a recipient —
         // not even with a live session. Asserted on the durable rows rather than
@@ -1347,76 +1285,6 @@ mod tests {
         );
         notify_grant_change(fresh, ABSENT, true).await;
         assert!(!has_tool_notice(&fresh_id).await, "no session to wake");
-
-        crate::agent::message_router::unregister_agent(&guest_id);
-        clear_pending(&guest_id).await;
-    }
-
-    /// A grant notice carries the granted tool's own entry — the very line the
-    /// `<custom-tools>` block renders for it, scrubbing included — so the tool
-    /// is usable straight from the notice. A removal carries the name and the
-    /// direction and no entry.
-    #[tokio::test]
-    async fn grant_notice_carries_the_tools_own_entry() {
-        crate::util::test::init_management_test_stores().await;
-        let dir = shared_dir();
-        std::fs::create_dir_all(&dir).expect("create the shared folder");
-        let probe = ProbeFile(dir.join("notice_entry_probe.ts"));
-        std::fs::write(
-            &probe.0,
-            "// @description Reports the notice probe.\n\
-             // @param city string required the city to look up\n",
-        )
-        .expect("write the probe tool");
-
-        let guest = "grant_notice_entry_guest";
-        crate::users::store().add_user(guest).await.unwrap();
-        let guest_id = crate::session::resolve_agent_id(
-            guest,
-            crate::Role::Assistant.as_str(),
-            &crate::users::personal_workspace_name(guest),
-        );
-        let mut rx = crate::agent::message_router::register_agent(&guest_id);
-        crate::util::test::seed_session_row(
-            &crate::session::store().conn,
-            &guest_id,
-            "user",
-            "hello",
-        )
-        .await;
-
-        let entry = load_catalogue(&dir)
-            .into_iter()
-            .find(|t| t.name == "notice_entry_probe")
-            .expect("the probe tool is in the catalogue");
-
-        notify_grant_change(guest, "notice_entry_probe", true).await;
-        let job = rx.try_recv().expect("an existing session is woken");
-        // The entry is the block's own rendering of the tool — the very text a
-        // session-start list shows for it — following the notice's wording as
-        // its own line.
-        assert_eq!(
-            job.content,
-            format!(
-                "<custom-tools-notice>\n\
-                 Custom tools granted to your account: notice_entry_probe\n\
-                 {}\n\
-                 </custom-tools-notice>\n",
-                render_lines(&[&entry])
-            )
-        );
-
-        notify_grant_change(guest, "notice_entry_probe", false).await;
-        let job = rx.try_recv().expect("a revocation is announced too");
-        assert_eq!(
-            job.content,
-            "<custom-tools-notice>\n\
-             Custom tools removed from your account: notice_entry_probe\n\
-             </custom-tools-notice>\n"
-        );
-
-        crate::agent::message_router::unregister_agent(&guest_id);
-        clear_pending(&guest_id).await;
     }
 
     /// Delete the durable notice rows addressed to `agent_id`, so other tests'

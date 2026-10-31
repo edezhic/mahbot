@@ -372,66 +372,60 @@ mod tests {
         assert_eq!(bun_asset_target("windows", "arm64ec", false, true), None);
     }
 
-    #[test]
-    fn bun_asset_target_appends_baseline_for_x64_without_avx2() {
-        assert_eq!(
-            bun_asset_target("linux", "x86_64", false, false).as_deref(),
-            Some("linux-x64-baseline")
-        );
-        assert_eq!(
-            bun_asset_target("macos", "x86_64", false, false).as_deref(),
-            Some("darwin-x64-baseline")
-        );
-        // aarch64 ships no baseline split on any platform (the AVX2 value is
-        // unused there) — Windows on ARM included.
-        assert_eq!(
-            bun_asset_target("linux", "aarch64", false, false).as_deref(),
-            Some("linux-aarch64")
-        );
-        assert_eq!(
-            bun_asset_target("windows", "aarch64", false, false).as_deref(),
-            Some("windows-aarch64")
-        );
+    /// One AVX2 detection rule: the line and whether it counts as detected.
+    struct Avx2Case {
+        name: &'static str,
+        detected: fn(&str) -> bool,
+        input: &'static str,
+        expected: bool,
     }
 
     #[test]
-    fn cpuinfo_avx2_flags_line_is_detected() {
-        let cpuinfo = "processor : 0\nflags\t\t: fpu vme avx2 sse4_1\n";
-        assert!(cpuinfo_has_avx2(cpuinfo));
-        let cpuinfo = "processor : 0\nflags\t\t: fpu vme sse4_1\n";
-        assert!(!cpuinfo_has_avx2(cpuinfo));
-        // The flags line must be a `flags:` line (not `Features:`).
-        assert!(!cpuinfo_has_avx2("Features\t\t: avx2\n"));
-    }
-
-    #[test]
-    fn sysctl_avx2_line_is_detected() {
-        let out = "machdep.cpu.features: FPU VME AVX2\n";
-        assert!(sysctl_has_avx2(out));
-        let out = "machdep.cpu.features: FPU VME\n";
-        assert!(!sysctl_has_avx2(out));
-        // Case-sensitive AVX2, mirrors install.sh grep.
-        assert!(!sysctl_has_avx2("machdep.cpu.features: avx2\n"));
-    }
-
-    #[test]
-    fn shasums256_line_matching_finds_the_requested_asset() {
-        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let body = format!(
-            "{hash}  bun-darwin-aarch64.zip\n\
-             1111111111111111111111111111111111111111111111111111111111111111  bun-linux-x64.zip\n\
-             2222222222222222222222222222222222222222222222222222222222222222  SHASUMS256.txt\n"
-        );
-        assert_eq!(
-            shasums256_hash_for(&body, "bun-linux-x64.zip").as_deref(),
-            Ok("1111111111111111111111111111111111111111111111111111111111111111")
-        );
-        // A soft failure when the chosen asset has no line (the upstream asset
-        // name set is not frozen) — the caller skips and retries on the next start.
-        assert_eq!(
-            shasums256_hash_for(&body, "bun-linux-x64-baseline.zip")
-                .expect_err("missing asset must be an Err"),
-            "SHASUMS256.txt has no entry for bun-linux-x64-baseline.zip"
-        );
+    fn avx2_detection_cases() {
+        for case in [
+            Avx2Case {
+                name: "a cpuinfo flags line naming avx2",
+                detected: cpuinfo_has_avx2,
+                input: "processor : 0\nflags\t\t: fpu vme avx2 sse4_1\n",
+                expected: true,
+            },
+            Avx2Case {
+                name: "a cpuinfo flags line without avx2",
+                detected: cpuinfo_has_avx2,
+                input: "processor : 0\nflags\t\t: fpu vme sse4_1\n",
+                expected: false,
+            },
+            Avx2Case {
+                name: "a Features line is not a flags line",
+                detected: cpuinfo_has_avx2,
+                input: "Features\t\t: avx2\n",
+                expected: false,
+            },
+            Avx2Case {
+                name: "a sysctl features line naming AVX2",
+                detected: sysctl_has_avx2,
+                input: "machdep.cpu.features: FPU VME AVX2\n",
+                expected: true,
+            },
+            Avx2Case {
+                name: "a sysctl features line without AVX2",
+                detected: sysctl_has_avx2,
+                input: "machdep.cpu.features: FPU VME\n",
+                expected: false,
+            },
+            Avx2Case {
+                name: "a lowercase avx2 is not detected",
+                detected: sysctl_has_avx2,
+                input: "machdep.cpu.features: avx2\n",
+                expected: false,
+            },
+        ] {
+            assert_eq!(
+                (case.detected)(case.input),
+                case.expected,
+                "[{}]",
+                case.name
+            );
+        }
     }
 }

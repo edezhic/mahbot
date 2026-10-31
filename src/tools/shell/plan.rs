@@ -2346,145 +2346,311 @@ mod tests {
         plan.steps.iter().map(|step| step.cwd.as_path()).collect()
     }
 
-    /// `grep -rn x .` — the one shape that is nothing but a served search: one
-    /// own step in the workspace root, sequenced as the line's first.
-    #[test]
-    fn a_lone_search_is_one_own_step() {
-        let plan = plan(&[served(ROOT, "")]);
-        assert_eq!(plan.steps.len(), 1);
-        assert_eq!(plan.steps[0].join, Join::First);
-        assert_eq!(plan.steps[0].cwd, PathBuf::from(ROOT));
-        let Run::Own { args, .. } = &plan.steps[0].run else {
-            panic!("the served member must be an own step");
-        };
-        assert_eq!(args[0], "__grep-engine");
+    /// One member of a plan-shape case: a verbatim shell member or a served
+    /// search, with the connector that follows it — the analyzer's own data.
+    #[derive(Clone, Copy)]
+    enum ShapeMember {
+        Shell(&'static str, &'static str),
+        Served(&'static str, &'static str),
     }
 
-    /// `grep -rn x . | head -3`: a pipe group of two members — the engine, then
-    /// the tail the runner feeds it to — while the run's line stays two members
-    /// wide.
-    #[test]
-    fn a_pipelined_search_is_one_pipe_group() {
-        let plan = plan(&[served(ROOT, "|"), shell("head -3", "")]);
-        assert_eq!(plan.steps.len(), 2);
-        assert_eq!(plan.steps[1].join, Join::Pipe);
-        // One group, two members: the pipe is the runner's, not a step boundary.
-        assert_eq!(pipe_groups(&plan.steps), vec![0..2]);
+    /// One assertion a plan-shape case makes about the plan's steps.
+    #[derive(Clone, Copy)]
+    enum ShapeCheck {
+        Steps(usize),
+        Join(usize, Join),
+        ShellText(usize, &'static str),
+        Cwd(usize, &'static str),
+        /// The cwd the decomposition tracks from [`ROOT`] itself.
+        CwdTrackedRoot(usize),
+        /// The tracked root with `child` joined to it.
+        CwdUnderRoot(usize, &'static str),
+        CwdEquals(usize, usize),
+        PipeGroups(&'static [(usize, usize)]),
+        OwnStep(usize),
+        OwnArgs(usize, &'static str),
+        RunsAfter(usize, Option<i32>, bool),
     }
 
-    /// `cd src && grep -rn x .` — the fold is cmd.exe's own `cd`, and the served
-    /// step runs in the directory that `cd` chose, which the analyzer tracked
-    /// (not in the line's own cwd, and not in whatever the fold's cmd.exe would
-    /// have left behind).
-    #[test]
-    fn a_cd_before_a_search_is_a_fold_and_the_tracked_cwd() {
-        let plan = plan(&[shell("cd src", "&&"), served(r"C:\ws\src", "")]);
-        assert_eq!(plan.steps.len(), 2);
-        assert_eq!(shell_text(&plan.steps[0]), "cd src");
-        // The fold starts where the line does: it runs the `cd` itself.
-        assert_eq!(plan.steps[0].cwd, tracked_root_of(ROOT));
-        assert_eq!(plan.steps[1].join, Join::And);
-        assert_eq!(plan.steps[1].cwd, PathBuf::from(r"C:\ws\src"));
+    struct ShapeCase {
+        name: &'static str,
+        members: &'static [ShapeMember],
+        checks: &'static [ShapeCheck],
     }
 
-    /// `cd src && grep -rn x . | head -3`: one fold, one pipe group — three
-    /// members, two steps. The tail's fold starts in the cwd the served member
-    /// ran in, which is where the step after the engine's `cd` left the line.
+    /// The plan's member shape, as one table: how many steps a line's members
+    /// become, how they join, which of them the runner spawns, and the cwd every
+    /// step carries. Each case is one line the analyzer can hand over.
     #[test]
-    fn a_cd_search_and_tail_is_a_fold_then_a_pipe_group() {
-        let plan = plan(&[
-            shell("cd src", "&&"),
-            served(r"C:\ws\src", "|"),
-            shell("head -3", ""),
-        ]);
-        assert_eq!(plan.steps.len(), 3);
-        assert_eq!(plan.steps[2].join, Join::Pipe);
-        // The fold, then the pipeline the engine feeds.
-        assert_eq!(pipe_groups(&plan.steps), vec![0..1, 1..3]);
-        assert_eq!(shell_text(&plan.steps[0]), "cd src");
-        assert_eq!(plan.steps[2].cwd, plan.steps[1].cwd);
-    }
-
-    /// `cd src && type f.txt | grep -n needle`: the producer is a step of its own,
-    /// so the plan is three steps — the `cd`'s fold (`&&`), the pipe's head
-    /// (`&&`), and the served search (`|`) — not two. Folding the producer into
-    /// the `cd` would gate the pipeline on the `cd`'s connector instead of the
-    /// producer's own, and would send the fold's whole stdout through the pipe.
-    #[test]
-    fn a_member_that_feeds_a_pipe_is_a_step_of_its_own() {
-        let root = tracked_root_of(ROOT);
-        let plan = plan(&[
-            shell("cd src", "&&"),
-            shell("type f.txt", "|"),
-            served(r"C:\ws\src", ""),
-        ]);
-        assert_eq!(plan.steps.len(), 3);
-        // One-member groups: the head runs on its own, the search is the one
-        // member the producer's stdout feeds.
-        assert_eq!(pipe_groups(&plan.steps), vec![0..1, 1..3]);
-        assert_eq!(shell_text(&plan.steps[0]), "cd src");
-        assert_eq!(plan.steps[0].join, Join::First);
-        assert_eq!(shell_text(&plan.steps[1]), "type f.txt");
-        assert_eq!(plan.steps[1].join, Join::And);
-        assert!(matches!(plan.steps[2].run, Run::Own { .. }));
-        assert_eq!(plan.steps[2].join, Join::Pipe);
-        // Each step runs where the line's own `cd` tracking leaves it: the `cd`'s
-        // fold at the root (it runs the `cd` itself), the head in the directory
-        // that `cd` chose, and the search at the cwd its own tracking named.
-        assert_eq!(
-            step_cwds(&plan),
-            vec![
-                root.as_path(),
-                root.join("src").as_path(),
-                Path::new(r"C:\ws\src")
-            ]
-        );
-    }
-
-    /// A member that *takes* a pipe is a step of its own too: what a following
-    /// connector reaches in `grep x . | head -3 && cat` runs in cmd's own process,
-    /// with the shell's stdin rather than the pipe the consumer alone was given.
-    #[test]
-    fn the_pipeline_consumer_is_a_step_of_its_own() {
-        let piped = plan(&[served(ROOT, "|"), shell("head -3", "&&"), shell("cat", "")]);
-        assert_eq!(piped.steps.len(), 3);
-        assert_eq!(pipe_groups(&piped.steps), vec![0..2, 2..3]);
-        assert!(matches!(piped.steps[0].run, Run::Own { .. }));
-        assert_eq!(shell_text(&piped.steps[1]), "head -3");
-        assert_eq!(piped.steps[1].join, Join::Pipe);
-        assert_eq!(shell_text(&piped.steps[2]), "cat");
-        assert_eq!(piped.steps[2].join, Join::And);
-
-        // Two consumers and a tail after them: every pipe member is its own step,
-        // and the tail is gated by the last consumer's own status.
-        let tailed = plan(&[
-            served(ROOT, "|"),
-            shell("head -3", "|"),
-            shell("sort", "&&"),
-            shell("echo done", ""),
-        ]);
-        assert_eq!(tailed.steps.len(), 4);
-        assert_eq!(pipe_groups(&tailed.steps), vec![0..3, 3..4]);
-        assert_eq!(tailed.steps[3].join, Join::And);
-
-        // Two members around a `|` are two steps even with nothing after the
-        // consumer: the pipe is the runner's, so both ends are spawned by it.
-        let bare = plan(&[shell("type a.txt", "|"), shell("sort", "")]);
-        assert_eq!(bare.steps.len(), 2);
-        assert_eq!(shell_text(&bare.steps[0]), "type a.txt");
-        assert_eq!(shell_text(&bare.steps[1]), "sort");
-        assert_eq!(pipe_groups(&bare.steps), vec![0..2]);
-    }
-
-    /// `grep a f1 && grep b f2`: two served members, each in its own group, the
-    /// second sequenced by cmd's `&&` and running in the first's cwd.
-    #[test]
-    fn two_searches_are_two_sequenced_own_steps() {
-        let plan = plan(&[served(ROOT, "&&"), served(ROOT, "")]);
-        assert_eq!(plan.steps.len(), 2);
-        assert_eq!(plan.steps[1].join, Join::And);
-        assert!(runs_after(plan.steps[1].join, Some(0)));
-        assert!(!runs_after(plan.steps[1].join, Some(1)));
+    #[expect(clippy::too_many_lines)] // one cohesive table over the plan's shapes
+    fn plan_shape_cases() {
+        let cases: &[ShapeCase] = &[
+            // `grep -rn x .` — nothing but a served search: one own step in the
+            // workspace root, sequenced as the line's first.
+            ShapeCase {
+                name: "a lone search is one own step",
+                members: &[ShapeMember::Served(ROOT, "")],
+                checks: &[
+                    ShapeCheck::Steps(1),
+                    ShapeCheck::Join(0, Join::First),
+                    ShapeCheck::Cwd(0, ROOT),
+                    ShapeCheck::OwnStep(0),
+                    ShapeCheck::OwnArgs(0, "__grep-engine"),
+                ],
+            },
+            // `grep -rn x . | head -3`: one pipe group of two members — the
+            // engine, then the tail the runner feeds it to.
+            ShapeCase {
+                name: "a pipelined search is one pipe group",
+                members: &[
+                    ShapeMember::Served(ROOT, "|"),
+                    ShapeMember::Shell("head -3", ""),
+                ],
+                checks: &[
+                    ShapeCheck::Steps(2),
+                    ShapeCheck::Join(1, Join::Pipe),
+                    ShapeCheck::PipeGroups(&[(0, 2)]),
+                ],
+            },
+            // `cd src && grep -rn x .` — the fold is cmd.exe's own `cd`, and the
+            // served step runs in the directory that `cd` chose.
+            ShapeCase {
+                name: "a cd before a search is a fold and the tracked cwd",
+                members: &[
+                    ShapeMember::Shell("cd src", "&&"),
+                    ShapeMember::Served(r"C:\ws\src", ""),
+                ],
+                checks: &[
+                    ShapeCheck::Steps(2),
+                    ShapeCheck::ShellText(0, "cd src"),
+                    ShapeCheck::CwdTrackedRoot(0),
+                    ShapeCheck::Join(1, Join::And),
+                    ShapeCheck::Cwd(1, r"C:\ws\src"),
+                ],
+            },
+            // `cd src && grep -rn x . | head -3`: one fold, one pipe group —
+            // three members, two steps.
+            ShapeCase {
+                name: "a cd search and tail is a fold then a pipe group",
+                members: &[
+                    ShapeMember::Shell("cd src", "&&"),
+                    ShapeMember::Served(r"C:\ws\src", "|"),
+                    ShapeMember::Shell("head -3", ""),
+                ],
+                checks: &[
+                    ShapeCheck::Steps(3),
+                    ShapeCheck::Join(2, Join::Pipe),
+                    ShapeCheck::PipeGroups(&[(0, 1), (1, 3)]),
+                    ShapeCheck::ShellText(0, "cd src"),
+                    ShapeCheck::CwdEquals(2, 1),
+                ],
+            },
+            // `cd src && type f.txt | grep -n needle`: the producer is a step of
+            // its own, so the plan is three steps.
+            ShapeCase {
+                name: "a member that feeds a pipe is a step of its own",
+                members: &[
+                    ShapeMember::Shell("cd src", "&&"),
+                    ShapeMember::Shell("type f.txt", "|"),
+                    ShapeMember::Served(r"C:\ws\src", ""),
+                ],
+                checks: &[
+                    ShapeCheck::Steps(3),
+                    ShapeCheck::PipeGroups(&[(0, 1), (1, 3)]),
+                    ShapeCheck::ShellText(0, "cd src"),
+                    ShapeCheck::Join(0, Join::First),
+                    ShapeCheck::ShellText(1, "type f.txt"),
+                    ShapeCheck::Join(1, Join::And),
+                    ShapeCheck::OwnStep(2),
+                    ShapeCheck::Join(2, Join::Pipe),
+                    ShapeCheck::CwdTrackedRoot(0),
+                    ShapeCheck::CwdUnderRoot(1, "src"),
+                    ShapeCheck::Cwd(2, r"C:\ws\src"),
+                ],
+            },
+            // A member that takes a pipe is a step of its own: the connector
+            // after the consumer runs in cmd's own process, not in the pipe.
+            ShapeCase {
+                name: "the pipeline consumer is a step of its own",
+                members: &[
+                    ShapeMember::Served(ROOT, "|"),
+                    ShapeMember::Shell("head -3", "&&"),
+                    ShapeMember::Shell("cat", ""),
+                ],
+                checks: &[
+                    ShapeCheck::Steps(3),
+                    ShapeCheck::PipeGroups(&[(0, 2), (2, 3)]),
+                    ShapeCheck::OwnStep(0),
+                    ShapeCheck::ShellText(1, "head -3"),
+                    ShapeCheck::Join(1, Join::Pipe),
+                    ShapeCheck::ShellText(2, "cat"),
+                    ShapeCheck::Join(2, Join::And),
+                ],
+            },
+            // Two consumers and a tail after them: every pipe member is its own
+            // step, and the tail is gated by the last consumer's own status.
+            ShapeCase {
+                name: "two consumers and a tail are three steps",
+                members: &[
+                    ShapeMember::Served(ROOT, "|"),
+                    ShapeMember::Shell("head -3", "|"),
+                    ShapeMember::Shell("sort", "&&"),
+                    ShapeMember::Shell("echo done", ""),
+                ],
+                checks: &[
+                    ShapeCheck::Steps(4),
+                    ShapeCheck::PipeGroups(&[(0, 3), (3, 4)]),
+                    ShapeCheck::Join(3, Join::And),
+                ],
+            },
+            // Two members around a `|` are two steps even with nothing after the
+            // consumer: the pipe is the runner's, so both ends are spawned.
+            ShapeCase {
+                name: "a bare pipe has two steps",
+                members: &[
+                    ShapeMember::Shell("type a.txt", "|"),
+                    ShapeMember::Shell("sort", ""),
+                ],
+                checks: &[
+                    ShapeCheck::Steps(2),
+                    ShapeCheck::ShellText(0, "type a.txt"),
+                    ShapeCheck::ShellText(1, "sort"),
+                    ShapeCheck::PipeGroups(&[(0, 2)]),
+                ],
+            },
+            // `grep a f1 && grep b f2`: two served members, each in its own
+            // group, the second sequenced by cmd's `&&` and running in the
+            // first's cwd.
+            ShapeCase {
+                name: "two searches are two sequenced own steps",
+                members: &[
+                    ShapeMember::Served(ROOT, "&&"),
+                    ShapeMember::Served(ROOT, ""),
+                ],
+                checks: &[
+                    ShapeCheck::Steps(2),
+                    ShapeCheck::Join(1, Join::And),
+                    ShapeCheck::RunsAfter(1, Some(0), true),
+                    ShapeCheck::RunsAfter(1, Some(1), false),
+                ],
+            },
+            // An own-image member breaks the fold, and the fold after it runs
+            // in that member's cwd.
+            ShapeCase {
+                name: "an own step breaks the fold and carries the cwd",
+                members: &[
+                    ShapeMember::Shell("cd src", "&&"),
+                    ShapeMember::Served(r"C:\ws\src", "&&"),
+                    ShapeMember::Shell("type note.txt", ""),
+                ],
+                checks: &[
+                    ShapeCheck::Steps(3),
+                    ShapeCheck::ShellText(0, "cd src"),
+                    ShapeCheck::ShellText(2, "type note.txt"),
+                    ShapeCheck::Cwd(2, r"C:\ws\src"),
+                ],
+            },
+            // The pipe-group split: `|` continues a group, every other join
+            // starts one.
+            ShapeCase {
+                name: "pipe groups split on every join but a pipe",
+                members: &[
+                    ShapeMember::Shell("echo one", "&&"),
+                    ShapeMember::Served(ROOT, "|"),
+                    ShapeMember::Shell("head -1", "&&"),
+                    ShapeMember::Served(ROOT, "||"),
+                    ShapeMember::Shell("tail -1", ""),
+                ],
+                checks: &[ShapeCheck::PipeGroups(&[(0, 1), (1, 3), (3, 4), (4, 5)])],
+            },
+        ];
+        for case in cases {
+            let members: Vec<(Member, String)> = case
+                .members
+                .iter()
+                .map(|member| match member {
+                    ShapeMember::Shell(text, conn) => shell(text, conn),
+                    ShapeMember::Served(cwd, conn) => served(cwd, conn),
+                })
+                .collect();
+            let plan = plan(&members);
+            for check in case.checks {
+                match check {
+                    ShapeCheck::Steps(steps) => {
+                        assert_eq!(plan.steps.len(), *steps, "{}: step count", case.name);
+                    }
+                    ShapeCheck::Join(at, join) => {
+                        assert_eq!(plan.steps[*at].join, *join, "{}: step {at}", case.name);
+                    }
+                    ShapeCheck::ShellText(at, text) => {
+                        assert_eq!(
+                            shell_text(&plan.steps[*at]),
+                            *text,
+                            "{}: step {at}",
+                            case.name
+                        );
+                    }
+                    ShapeCheck::Cwd(at, cwd) => {
+                        assert_eq!(
+                            plan.steps[*at].cwd,
+                            PathBuf::from(cwd),
+                            "{}: step {at} cwd",
+                            case.name
+                        );
+                    }
+                    ShapeCheck::CwdTrackedRoot(at) => {
+                        assert_eq!(
+                            plan.steps[*at].cwd,
+                            tracked_root_of(ROOT),
+                            "{}: step {at} cwd",
+                            case.name
+                        );
+                    }
+                    ShapeCheck::CwdUnderRoot(at, child) => {
+                        assert_eq!(
+                            plan.steps[*at].cwd,
+                            tracked_root_of(ROOT).join(child),
+                            "{}: step {at} cwd",
+                            case.name
+                        );
+                    }
+                    ShapeCheck::CwdEquals(a, b) => {
+                        assert_eq!(
+                            plan.steps[*a].cwd, plan.steps[*b].cwd,
+                            "{}: steps {a} and {b} cwd",
+                            case.name
+                        );
+                    }
+                    ShapeCheck::PipeGroups(groups) => {
+                        let expected: Vec<Range<usize>> =
+                            groups.iter().map(|(start, end)| *start..*end).collect();
+                        assert_eq!(pipe_groups(&plan.steps), expected, "{}: groups", case.name);
+                    }
+                    ShapeCheck::OwnStep(at) => {
+                        assert!(
+                            matches!(plan.steps[*at].run, Run::Own { .. }),
+                            "{}: step {at} is an own step",
+                            case.name
+                        );
+                    }
+                    ShapeCheck::OwnArgs(at, first) => {
+                        let Run::Own { args, .. } = &plan.steps[*at].run else {
+                            panic!("{}: step {at} is not an own step", case.name);
+                        };
+                        assert_eq!(args[0], *first, "{}: step {at} argv", case.name);
+                    }
+                    ShapeCheck::RunsAfter(at, after, expected) => {
+                        assert_eq!(
+                            runs_after(plan.steps[*at].join, *after),
+                            *expected,
+                            "{}: step {at}",
+                            case.name
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(pipe_groups(&[]), Vec::<Range<usize>>::new());
     }
 
     /// A member whose redirect the runner applies, carried with the step.
@@ -2516,22 +2682,6 @@ mod tests {
             shell_text(&plan.steps[0]),
             "echo one & echo two && echo three"
         );
-    }
-
-    /// The fold is broken by an own-image member, and the fold after it runs in
-    /// that member's cwd — the cwd the analyzer tracked and the line's own `cd`s
-    /// left behind.
-    #[test]
-    fn an_own_step_breaks_the_fold_and_carries_the_cwd() {
-        let plan = plan(&[
-            shell("cd src", "&&"),
-            served(r"C:\ws\src", "&&"),
-            shell("type note.txt", ""),
-        ]);
-        assert_eq!(plan.steps.len(), 3);
-        assert_eq!(shell_text(&plan.steps[0]), "cd src");
-        assert_eq!(shell_text(&plan.steps[2]), "type note.txt");
-        assert_eq!(plan.steps[2].cwd, PathBuf::from(r"C:\ws\src"));
     }
 
     /// A verbatim member that is a plain call of this service's own program is not
@@ -2835,87 +2985,233 @@ mod tests {
     /// The redirect set the runner applies by itself, and the spellings it
     /// refuses with the spelling named.
     #[test]
+    #[expect(clippy::too_many_lines)] // one cohesive table over the closed set
     fn redirects_supported_is_the_closed_set_it_documents() {
-        for supported in [
-            vec![">", "out.txt"],
-            vec!["1>", "out.txt"],
-            vec![">>", "out.txt"],
-            vec!["1>>", "out.txt"],
-            vec!["2>", "err.txt"],
-            vec!["2>>", "err.txt"],
-            vec!["<", "in.txt"],
-            vec![">", "nul"],
-            vec!["2>", "NUL"],
-            vec![">", "out.txt", "2>", "err.txt", "<", "in.txt"],
+        struct RedirectCase {
+            name: &'static str,
+            command: &'static [&'static str],
+            refused: bool,
+        }
+        let cases = [
+            RedirectCase {
+                name: "stdout to a file",
+                command: &[">", "out.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "fd 1 to a file",
+                command: &["1>", "out.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "stdout append",
+                command: &[">>", "out.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "fd 1 append",
+                command: &["1>>", "out.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "stderr to a file",
+                command: &["2>", "err.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "stderr append",
+                command: &["2>>", "err.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "stdin from a file",
+                command: &["<", "in.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "stdout to the lowercase nul device",
+                command: &[">", "nul"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "stderr to the uppercase NUL device",
+                command: &["2>", "NUL"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "all three streams at once",
+                command: &[">", "out.txt", "2>", "err.txt", "<", "in.txt"],
+                refused: false,
+            },
             // A target glued to its operator is the same redirect — cmd.exe splits
             // neither apart, and this is the spelling an agent actually types.
-            vec![">out.txt"],
-            vec!["1>>log.txt"],
-            vec!["2>err.txt"],
-            vec!["2>>err.txt"],
-            vec!["<in.txt"],
-            vec!["1>0"],
+            RedirectCase {
+                name: "stdout glued to its target",
+                command: &[">out.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "fd 1 append glued to its target",
+                command: &["1>>log.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "stderr glued to its target",
+                command: &["2>err.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "stderr append glued to its target",
+                command: &["2>>err.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "stdin glued to its target",
+                command: &["<in.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "fd 1 to fd 0",
+                command: &["1>0"],
+                refused: false,
+            },
             // A drive-rooted target is the runner's file like any other path: only
             // the drive-RELATIVE spelling below names a directory it cannot know.
-            vec![">", r"C:\out.txt"],
-            vec![">", r#""C:\out.txt""#],
+            RedirectCase {
+                name: "a drive-rooted target",
+                command: &[">", r"C:\out.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "a quoted drive-rooted target",
+                command: &[">", r#""C:\out.txt""#],
+                refused: false,
+            },
             // The stdout merge: self-contained (no target word of its own), and
             // beside a `>` its destination is that file, not the caller's.
-            vec!["2>&1"],
-            vec![">", "out.txt", "2>&1"],
-            vec!["2>&1", ">", "out.txt"],
-        ] {
-            let redirects: Vec<String> = supported.iter().map(|w| (*w).to_string()).collect();
-            assert_eq!(redirects_supported(&redirects), Ok(()), "{supported:?}");
-        }
-        for refused in [
-            vec!["1>&2"],
-            vec![">&2"],
-            vec![">>"],
-            vec!["<"],
-            vec!["10>", "out.txt"],
-            vec![">"],
-            vec!["<&2"],
-            vec!["<>file"],
-            vec![">", r"%TEMP%\out.txt"],
-            vec![r">%TEMP%\out.txt"],
+            RedirectCase {
+                name: "the stdout merge alone",
+                command: &["2>&1"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "the stdout merge beside a redirect",
+                command: &[">", "out.txt", "2>&1"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "the stdout merge before a redirect",
+                command: &["2>&1", ">", "out.txt"],
+                refused: false,
+            },
+            RedirectCase {
+                name: "fd 1 duplicated to stderr",
+                command: &["1>&2"],
+                refused: true,
+            },
+            RedirectCase {
+                name: "a bare stderr dup",
+                command: &[">&2"],
+                refused: true,
+            },
+            RedirectCase {
+                name: "an append with no target",
+                command: &[">>"],
+                refused: true,
+            },
+            RedirectCase {
+                name: "an input redirect with no target",
+                command: &["<"],
+                refused: true,
+            },
+            RedirectCase {
+                name: "fd 10 is outside the set",
+                command: &["10>", "out.txt"],
+                refused: true,
+            },
+            RedirectCase {
+                name: "a redirect with no target",
+                command: &[">"],
+                refused: true,
+            },
+            RedirectCase {
+                name: "stdin duplicated from stderr",
+                command: &["<&2"],
+                refused: true,
+            },
+            RedirectCase {
+                name: "a read-write redirect",
+                command: &["<>file"],
+                refused: true,
+            },
+            RedirectCase {
+                name: "a percent-expanded target",
+                command: &[">", r"%TEMP%\out.txt"],
+                refused: true,
+            },
+            RedirectCase {
+                name: "a glued percent-expanded target",
+                command: &[r">%TEMP%\out.txt"],
+                refused: true,
+            },
             // A drive-relative target names another drive's current directory —
             // quoted or not, since cmd.exe's quote removal is applied before the
             // file is opened.
-            vec![">", "C:out.txt"],
-            vec![">C:out.txt"],
-            vec![">", r#""C:out.txt""#],
-            vec![r#">"C:out.txt""#],
+            RedirectCase {
+                name: "a drive-relative target",
+                command: &[">", "C:out.txt"],
+                refused: true,
+            },
+            RedirectCase {
+                name: "a glued drive-relative target",
+                command: &[">C:out.txt"],
+                refused: true,
+            },
+            RedirectCase {
+                name: "a quoted drive-relative target",
+                command: &[">", r#""C:out.txt""#],
+                refused: true,
+            },
+            RedirectCase {
+                name: "a glued quoted drive-relative target",
+                command: &[r#">"C:out.txt""#],
+                refused: true,
+            },
             // Quote removal can also sit between the colon and the path
             // (`"C:""out.txt"` → `C:"out.txt`), which is drive-relative the same way.
-            vec![">", r#""C:""out.txt""#],
-            vec!["<", "C:in.txt"],
+            RedirectCase {
+                name: "a drive-relative target split by quote removal",
+                command: &[">", r#""C:""out.txt""#],
+                refused: true,
+            },
+            RedirectCase {
+                name: "a drive-relative stdin target",
+                command: &["<", "C:in.txt"],
+                refused: true,
+            },
             // A dup of another descriptor: only the stdout merge has a
             // destination the runner already owns.
-            vec!["3>&1"],
-        ] {
-            let spellings: Vec<String> = refused.iter().map(|w| (*w).to_string()).collect();
-            let reason = redirects_supported(&spellings).expect_err("outside the set");
-            assert!(
-                reason.contains(&format!("`{}`", refused[0])),
-                "{refused:?}: {reason}"
-            );
+            RedirectCase {
+                name: "fd 3 duplicated to stdout",
+                command: &["3>&1"],
+                refused: true,
+            },
+        ];
+        for case in cases {
+            let redirects: Vec<String> = case.command.iter().map(|w| (*w).to_string()).collect();
+            let outcome = redirects_supported(&redirects);
+            if case.refused {
+                let reason = outcome.expect_err("outside the closed set");
+                assert!(
+                    reason.contains(&format!("`{}`", case.command[0])),
+                    "{}: {:?}: {reason}",
+                    case.name,
+                    case.command
+                );
+            } else {
+                assert_eq!(outcome, Ok(()), "{}: {:?}", case.name, case.command);
+            }
         }
-    }
-
-    /// The pipe-group split: `|` continues a group, every other join starts one.
-    #[test]
-    fn pipe_groups_split_on_every_join_but_a_pipe() {
-        let plan = plan(&[
-            shell("echo one", "&&"),
-            served(ROOT, "|"),
-            shell("head -1", "&&"),
-            served(ROOT, "||"),
-            shell("tail -1", ""),
-        ]);
-        let groups: Vec<Range<usize>> = pipe_groups(&plan.steps);
-        assert_eq!(groups, vec![0..1, 1..3, 3..4, 4..5]);
-        assert_eq!(pipe_groups(&[]), Vec::<Range<usize>>::new());
     }
 
     /// The own-image reading: command position and a launcher count, argument

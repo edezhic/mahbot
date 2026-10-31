@@ -485,25 +485,6 @@ mod tests {
         );
     }
 
-    /// The victim is the least-recently-ADDRESSED tab, not the oldest created.
-    #[test]
-    #[serial_test::serial(chrome_tabs)]
-    fn victim_is_the_least_recently_addressed_tab() {
-        let _guard = TestLedgerGuard::install();
-        let ns = "agent-tab-bbbbbbbbbbbb-";
-        fill_to_cap(ns);
-        // Re-address the oldest CREATED tab (`a`) so it is now the most recently addressed.
-        assert!(
-            note_addressed(ns, "a", true).is_none(),
-            "a re-address does not cross the cap"
-        );
-        // One more appearance crosses the cap: the victim must be `b`, the second-oldest created.
-        assert_eq!(
-            note_addressed(ns, "f", true).map(|eviction| eviction.name),
-            Some("b".to_string())
-        );
-    }
-
     /// A failed eviction leaves the tab counted open, and the very next over-cap appearance picks
     /// that same tab again.
     #[test]

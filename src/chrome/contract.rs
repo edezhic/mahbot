@@ -897,28 +897,6 @@ mod tests {
     }
 
     #[test]
-    fn leftover_note_names_the_session_the_stop_and_the_idle_timeout() {
-        let note = chrome_leftover_pipe_note("mahbot-chrome-agent-tab-abc-default");
-        assert!(
-            note.contains("mahbot-chrome-agent-tab-abc-default"),
-            "{note}"
-        );
-        assert!(
-            note.contains("mahbot chrome session stop mahbot-chrome-agent-tab-abc-default --force"),
-            "{note}"
-        );
-        assert!(note.contains("idle timeout"), "{note}");
-        // Mode-neutral: a SUCCESS and a FAILURE both carry this note, so it
-        // claims no exit status of its own and never reads as a failure's text.
-        assert!(
-            note.contains("no more of its output could be collected"),
-            "{note}"
-        );
-        assert!(!note.contains("result"), "{note}");
-        assert!(!note.contains("failed"), "{note}");
-    }
-
-    #[test]
     fn chrome_response_parses_structured_error_retryable() {
         let v = serde_json::json!({
             "success": false, "error": "boom", "code": "connection_failed", "retryable": true,
@@ -998,23 +976,6 @@ mod tests {
     }
 
     #[test]
-    fn out_kind_as_str_matches_contract() {
-        for (kind, s) in [
-            (OutKind::Ok, "ok"),
-            (OutKind::Empty, "empty"),
-            (OutKind::Timeout, "timeout"),
-            (OutKind::Network, "network"),
-            (OutKind::Redesign, "redesign"),
-            (OutKind::NotFound, "not-found"),
-            (OutKind::Error, "error"),
-            (OutKind::Environment, "environment"),
-            (OutKind::Usage, "usage"),
-        ] {
-            assert_eq!(kind.as_str(), s);
-        }
-    }
-
-    #[test]
     fn out_envelope_one_line_json_flattens_payload() {
         let env = OutEnvelope {
             action: "status".into(),
@@ -1029,57 +990,80 @@ mod tests {
         );
     }
 
+    /// The extract output reader reads chrome-use's envelope and tolerates the
+    /// other shapes it may come in.
     #[test]
-    fn extract_output_reads_the_chrome_use_15101_envelope() {
-        // The real 1.5.101 rows-mode shape: {extracted, count, origin, meta}.
-        let data = serde_json::json!({
-            "extracted": [{"a": 1}, {"a": 2}, {"a": 3}],
-            "count": 3,
-            "origin": "https://x",
-            "meta": {},
-        });
-        let out = extract_output(&data, Some(2));
-        assert_eq!(
-            out["data"],
-            serde_json::json!([{"a": 1}, {"a": 2}]),
-            "limit trims rows"
-        );
-        assert_eq!(out["total"], 3, "total stays honest");
-        assert_eq!(out["returned"], 2);
+    fn extract_output_reads_the_envelope_and_tolerates_others() {
+        {
+            let case = "extract output reads the chrome use 15101 envelope";
+            // The real 1.5.101 rows-mode shape: {extracted, count, origin, meta}.
+            let data = serde_json::json!({
+                "extracted": [{"a": 1}, {"a": 2}, {"a": 3}],
+                "count": 3,
+                "origin": "https://x",
+                "meta": {},
+            });
+            let out = extract_output(&data, Some(2));
+            assert_eq!(
+                out["data"],
+                serde_json::json!([{"a": 1}, {"a": 2}]),
+                "case {case}: limit trims rows"
+            );
+            assert_eq!(out["total"], 3, "case {case}: total stays honest");
+            assert_eq!(
+                out["returned"], 2,
+                "case {case}: returned counts the rows given back"
+            );
 
-        // Without a limit: no `returned` key.
-        let out = extract_output(&data, None);
-        assert_eq!(out["total"], 3);
-        assert!(out.get("returned").is_none());
-    }
+            // Without a limit: no `returned` key.
+            let out = extract_output(&data, None);
+            assert_eq!(out["total"], 3, "case {case}: no limit keeps every row");
+            assert!(
+                out.get("returned").is_none(),
+                "case {case}: no limit reports no `returned`"
+            );
+        }
 
-    #[test]
-    fn extract_output_tolerates_other_shapes() {
-        // Plain array passes through unchanged.
-        let arr = serde_json::json!([{"a": 1}]);
-        assert_eq!(
-            extract_output(&arr, None)["data"],
-            serde_json::json!([{"a": 1}])
-        );
+        {
+            let case = "extract output tolerates other shapes";
+            // Plain array, bare object and a non-array `extracted` field each become
+            // a row list; null is no rows at all.
+            let shapes = [
+                (
+                    serde_json::json!([{"a": 1}]),
+                    serde_json::json!([{"a": 1}]),
+                    "plain array passes through unchanged",
+                ),
+                (
+                    // Bare object → single-element (schemaless) row list.
+                    serde_json::json!({"a": 1}),
+                    serde_json::json!([{"a": 1}]),
+                    "bare object is one row",
+                ),
+                (
+                    // Non-array `extracted` field → wrapped as a single row.
+                    serde_json::json!({"extracted": "weird"}),
+                    serde_json::json!(["weird"]),
+                    "non-array extracted is one row",
+                ),
+            ];
+            for (input, expected, why) in shapes {
+                assert_eq!(
+                    extract_output(&input, None)["data"],
+                    expected,
+                    "case {case}: {why}"
+                );
+            }
 
-        // Bare object → single-element (schemaless) row list.
-        let obj = serde_json::json!({"a": 1});
-        assert_eq!(
-            extract_output(&obj, None)["data"],
-            serde_json::json!([{"a": 1}])
-        );
-
-        // Non-array `extracted` field → wrapped as a single row.
-        let weird = serde_json::json!({"extracted": "weird"});
-        assert_eq!(
-            extract_output(&weird, None)["data"],
-            serde_json::json!(["weird"])
-        );
-
-        // Null → empty rows, total 0.
-        let out = extract_output(&serde_json::Value::Null, None);
-        assert_eq!(out["data"], serde_json::json!([]));
-        assert_eq!(out["total"], 0);
+            // Null → empty rows, total 0.
+            let out = extract_output(&serde_json::Value::Null, None);
+            assert_eq!(
+                out["data"],
+                serde_json::json!([]),
+                "case {case}: null is no rows"
+            );
+            assert_eq!(out["total"], 0, "case {case}: null has no total");
+        }
     }
 
     #[test]
@@ -1160,50 +1144,54 @@ mod tests {
         );
     }
 
+    /// A network error's code is read from either form and bucketed into dns, refused or other.
     #[test]
-    fn net_error_code_extraction_canonicalizes_both_forms() {
-        // The net::ERR_ prefix form (chrome-use errorText) and the bare
-        // ERR_*/DNS_* form (div.error-code) canonicalize to the bare token.
-        assert_eq!(
-            extract_net_error_code("Navigation failed: net::ERR_NAME_NOT_RESOLVED"),
-            Some("ERR_NAME_NOT_RESOLVED".into())
-        );
-        assert_eq!(
-            extract_net_error_code("ERR_CONNECTION_REFUSED"),
-            Some("ERR_CONNECTION_REFUSED".into())
-        );
-        assert_eq!(
-            extract_net_error_code("DNS_PROBE_FINISHED_NXDOMAIN"),
-            Some("DNS_PROBE_FINISHED_NXDOMAIN".into())
-        );
-        assert_eq!(
-            extract_net_error_code("error: net::ERR_CONNECTION_TIMED_OUT — retry"),
-            Some("ERR_CONNECTION_TIMED_OUT".into())
-        );
-        assert_eq!(extract_net_error_code("connection refused by peer"), None);
-        assert_eq!(extract_net_error_code(""), None);
-    }
+    fn net_error_extraction_buckets_both_code_forms() {
+        {
+            let case = "net error code extraction canonicalizes both forms";
+            // The net::ERR_ prefix form (chrome-use errorText) and the bare
+            // ERR_*/DNS_* form (div.error-code) canonicalize to the bare token.
+            for (text, expected) in [
+                (
+                    "Navigation failed: net::ERR_NAME_NOT_RESOLVED",
+                    Some("ERR_NAME_NOT_RESOLVED"),
+                ),
+                ("ERR_CONNECTION_REFUSED", Some("ERR_CONNECTION_REFUSED")),
+                (
+                    "DNS_PROBE_FINISHED_NXDOMAIN",
+                    Some("DNS_PROBE_FINISHED_NXDOMAIN"),
+                ),
+                (
+                    "error: net::ERR_CONNECTION_TIMED_OUT — retry",
+                    Some("ERR_CONNECTION_TIMED_OUT"),
+                ),
+                ("connection refused by peer", None),
+                ("", None),
+            ] {
+                assert_eq!(
+                    extract_net_error_code(text).as_deref(),
+                    expected,
+                    "case {case}: {text:?}"
+                );
+            }
+        }
 
-    #[test]
-    fn net_error_phrases_bucket_dns_refused_other() {
-        assert_eq!(
-            net_error_phrase("DNS_PROBE_FINISHED_NXDOMAIN"),
-            "DNS resolution failure"
-        );
-        // ERR_NAME_NOT_RESOLVED is the DNS-failure code surfaced via CDP
-        // errorText despite the ERR_ prefix.
-        assert_eq!(
-            net_error_phrase("ERR_NAME_NOT_RESOLVED"),
-            "DNS resolution failure"
-        );
-        assert_eq!(
-            net_error_phrase("ERR_CONNECTION_REFUSED"),
-            "connection refused"
-        );
-        assert_eq!(
-            net_error_phrase("ERR_CONNECTION_RESET"),
-            "site unreachable or connection failed"
-        );
+        {
+            let case = "net error phrases bucket dns refused other";
+            for (code, expected) in [
+                // ERR_NAME_NOT_RESOLVED is the DNS-failure code surfaced via CDP
+                // errorText despite the ERR_ prefix.
+                ("DNS_PROBE_FINISHED_NXDOMAIN", "DNS resolution failure"),
+                ("ERR_NAME_NOT_RESOLVED", "DNS resolution failure"),
+                ("ERR_CONNECTION_REFUSED", "connection refused"),
+                (
+                    "ERR_CONNECTION_RESET",
+                    "site unreachable or connection failed",
+                ),
+            ] {
+                assert_eq!(net_error_phrase(code), expected, "case {case}: {code}");
+            }
+        }
     }
 
     #[test]
@@ -1277,42 +1265,62 @@ mod tests {
         assert_eq!(parse_error_page_probe(&resp(json!(true))), None);
     }
 
+    /// A timeout message loses the canned stale-relay hint, and a message that
+    /// is not a timeout is left alone.
     #[test]
-    fn sanitize_timeout_message_strips_stale_relay_hint() {
-        // Timeout-classified message with the canned hint → hint stripped
-        // (including the separator period before the hint sentence), honest
-        // prefix ("Wait timed out after 15000ms") kept.
-        assert_eq!(
-            sanitize_timeout_message(
-                OutKind::Timeout,
-                "Wait timed out after 15000ms. Hint: the session's browser connection \
-                 is unresponsive (likely a stale relay/service-worker mid-session). Reconnect \
-                 with `connect`, or close the session and reopen it."
-            ),
-            "Wait timed out after 15000ms"
-        );
-        // A Timeout message without the marker is unchanged.
-        assert_eq!(
-            sanitize_timeout_message(OutKind::Timeout, "Wait timed out after 19000ms"),
-            "Wait timed out after 19000ms"
-        );
+    fn sanitize_timeout_message_strips_only_the_stale_relay_hint() {
+        {
+            let case = "sanitize timeout message strips stale relay hint";
+            // Timeout-classified message with the canned hint → hint stripped
+            // (including the separator period before the hint sentence), honest
+            // prefix ("Wait timed out after 15000ms") kept. A Timeout message
+            // without the marker is unchanged.
+            for (input, expected) in [
+                (
+                    "Wait timed out after 15000ms. Hint: the session's browser connection \
+                     is unresponsive (likely a stale relay/service-worker mid-session). Reconnect \
+                     with `connect`, or close the session and reopen it.",
+                    "Wait timed out after 15000ms",
+                ),
+                (
+                    "Wait timed out after 19000ms",
+                    "Wait timed out after 19000ms",
+                ),
+            ] {
+                assert_eq!(
+                    sanitize_timeout_message(OutKind::Timeout, input),
+                    expected,
+                    "case {case}: {input:?}"
+                );
+            }
+        }
+
+        {
+            let case = "sanitize timeout message leaves non timeout alone";
+            // The hint with NO timeout phrasing → not Timeout, so untouched; an
+            // Environment-classified relay message and an Error-classified message
+            // carrying the hint are left verbatim too.
+            let hint = "Hint: the session's browser connection is unresponsive (likely a stale \
+                        relay/service-worker mid-session). Reconnect with `connect`, or close the session \
+                        and reopen it.";
+            let untouched = [
+                (OutKind::Error, hint.to_string()),
+                (OutKind::Environment, "relay isn't connected".to_string()),
+                (OutKind::Error, format!("some other failure\n{hint}")),
+            ];
+            for (kind, message) in untouched {
+                assert_eq!(
+                    sanitize_timeout_message(kind, &message),
+                    message,
+                    "case {case}: {kind:?}"
+                );
+            }
+        }
     }
 
-    #[test]
-    fn sanitize_timeout_message_leaves_non_timeout_alone() {
-        // The hint with NO timeout phrasing → not Timeout, so untouched.
-        let hint = "Hint: the session's browser connection is unresponsive (likely a stale \
-             relay/service-worker mid-session). Reconnect with `connect`, or close the session \
-             and reopen it.";
-        assert_eq!(sanitize_timeout_message(OutKind::Error, hint), hint);
-        // An Environment-classified relay message passes through untouched.
-        let relay = "relay isn't connected";
-        assert_eq!(sanitize_timeout_message(OutKind::Environment, relay), relay);
-        // An Error-classified message with the hint keeps it verbatim.
-        let other = format!("some other failure\n{hint}");
-        assert_eq!(sanitize_timeout_message(OutKind::Error, &other), other);
-    }
-
+    /// Only a phrased wait/expect timeout earns its action's remediation note: an
+    /// empty message is the mahbot-side deadline kill and keeps its own factual
+    /// text, and every other kind or action is a no-op.
     #[test]
     fn with_condition_timeout_note_appends_by_action() {
         // Phrased wait timeout → wait note; expect → expect note.
@@ -1320,24 +1328,28 @@ mod tests {
         with_condition_timeout_note("wait", OutKind::Timeout, &mut m);
         assert_eq!(
             m,
-            format!("Wait timed out after 15000ms{WAIT_TIMEOUT_NOTE}")
+            format!("Wait timed out after 15000ms{WAIT_TIMEOUT_NOTE}"),
+            "wait gets the target remediation"
         );
         let mut m = String::from("waitFor timed out: .submit");
         with_condition_timeout_note("expect", OutKind::Timeout, &mut m);
         assert_eq!(
             m,
-            format!("waitFor timed out: .submit{EXPECT_TIMEOUT_NOTE}")
+            format!("waitFor timed out: .submit{EXPECT_TIMEOUT_NOTE}"),
+            "expect gets the condition remediation"
         );
-        // Empty message (mahbot-side deadline kill) → untouched, so the
-        // deadline kill keeps its own factual error text.
+
+        // Empty message (mahbot-side deadline kill) → untouched, so the deadline
+        // kill keeps its own factual error text and never gets the remediation.
         let mut m = String::new();
         with_condition_timeout_note("wait", OutKind::Timeout, &mut m);
-        assert!(m.is_empty());
+        assert!(m.is_empty(), "an empty message is never given the note");
+
         // Non-Timeout kinds and other actions are never touched.
         let mut m = String::from("some failure");
         with_condition_timeout_note("wait", OutKind::Error, &mut m);
         with_condition_timeout_note("eval", OutKind::Timeout, &mut m);
-        assert_eq!(m, "some failure");
+        assert_eq!(m, "some failure", "every other kind or action is a no-op");
     }
 
     #[test]

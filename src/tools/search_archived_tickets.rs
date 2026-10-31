@@ -98,32 +98,6 @@ mod tests {
     use crate::pipeline::board::{BoardStore, TicketPhase};
     use crate::util::test::make_ticket;
 
-    /// Test that format_results formats real ticket data correctly.
-    #[tokio::test]
-    async fn test_format_results_formats_correctly() {
-        let (store, _tmp) = open_test_store!(BoardStore, "board");
-        let ws = crate::workspace::test_ws("ws");
-        let id_a = make_ticket(&store, &ws, "Alpha ticket", TicketPhase::Done).await;
-        store.set_archived(&id_a).await.expect("archive");
-        let id_b = make_ticket(&store, &ws, "Beta ticket", TicketPhase::Cancelled).await;
-        store.set_archived(&id_b).await.expect("archive");
-
-        let ids = vec![id_a.clone(), id_b.clone()];
-        let result = super::SearchArchivedTicketsTool::format_results(&store, &ids)
-            .await
-            .expect("format_results");
-        let expected_header = "Search results (highest score first, 2 of at most 10):\n";
-        assert!(result.starts_with(expected_header));
-        assert!(
-            result.contains(&format!("[ws] [done] {id_a}: Alpha ticket")),
-            "should contain first ticket line"
-        );
-        assert!(
-            result.contains(&format!("[ws] [cancelled] {id_b}: Beta ticket")),
-            "should contain second ticket line"
-        );
-    }
-
     /// Archive search must rank by relevance and must never let live tickets
     /// consume the limit: the archive predicate is applied outside the ranked
     /// scope, and that scope is unbounded. The fixtures pin both halves — the

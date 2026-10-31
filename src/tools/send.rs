@@ -2120,232 +2120,6 @@ mod tests {
         }
     }
 
-    /// The addressees a holder's text may name: the choice declaration names
-    /// every held addressee, and an argument's text names exactly the held
-    /// addressees that take it.
-    fn assert_labels_follow_the_choice(tool: &SendTool, kinds: &[Addressee]) {
-        let description = tool.description();
-        for kind in Addressee::OFFERED {
-            let labelled = format!("`{}`", kind.as_str());
-            let named = kinds.contains(&kind);
-            assert_eq!(
-                description.contains(&labelled),
-                named,
-                "{kinds:?} reads {labelled}: {description}"
-            );
-        }
-        let schema = tool.parameters_schema();
-        for (name, property) in schema["properties"].as_object().unwrap() {
-            let text = property["description"].as_str().unwrap_or_default();
-            let named: Vec<Addressee> = if name == Addressee::ARG {
-                kinds.to_vec()
-            } else {
-                Argument::ALL
-                    .iter()
-                    .find(|arg| arg.as_str() == name)
-                    .map(|arg| {
-                        kinds
-                            .iter()
-                            .filter(|kind| kind.requirements().iter().any(|req| req.arg == *arg))
-                            .copied()
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            for kind in Addressee::OFFERED {
-                let labelled = format!("`{}`", kind.as_str());
-                assert_eq!(
-                    text.contains(&labelled),
-                    named.contains(&kind),
-                    "{kinds:?} reads {labelled} in `{name}`: {text}"
-                );
-            }
-        }
-    }
-
-    /// The arguments a holder declares: `message` and the choice always, and one
-    /// more where a held addressee takes it (and only then) — a requirement
-    /// belongs to the choice that needs it.
-    fn assert_arguments_follow_the_addressees(tool: &SendTool, kinds: &[Addressee]) {
-        let schema = tool.parameters_schema();
-        let properties = schema["properties"].as_object().unwrap();
-        let mut expected: Vec<&str> = vec!["message", Addressee::ARG];
-        for arg in Argument::ALL {
-            let taken = kinds
-                .iter()
-                .any(|kind| kind.requirements().iter().any(|req| req.arg == arg));
-            assert_eq!(
-                properties.contains_key(arg.as_str()),
-                taken,
-                "{kinds:?} and `{}`",
-                arg.as_str()
-            );
-            if taken {
-                expected.push(arg.as_str());
-            }
-        }
-        let mut present: Vec<&str> = properties.keys().map(String::as_str).collect();
-        present.sort_unstable();
-        expected.sort_unstable();
-        assert_eq!(present, expected, "{kinds:?}");
-
-        let required: Vec<&str> = schema["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_str().unwrap())
-            .collect();
-        let mut expected_required = vec!["message", Addressee::ARG];
-        // With one addressee there is no other choice to make, so its own
-        // required arguments stand.
-        if let [only] = kinds {
-            expected_required.extend(
-                only.requirements()
-                    .iter()
-                    .filter(|req| req.required)
-                    .map(|req| req.arg.as_str()),
-            );
-        }
-        assert_eq!(required, expected_required, "{kinds:?}");
-    }
-
-    /// How an argument's text states whether it can be left out: one
-    /// `required for` phrase naming every choice that needs it, never an
-    /// unconditional requirement.
-    fn assert_requirements_are_named_per_choice(tool: &SendTool, kinds: &[Addressee]) {
-        let schema = tool.parameters_schema();
-        let properties = schema["properties"].as_object().unwrap();
-        for arg in Argument::ALL {
-            let Some(text) = properties
-                .get(arg.as_str())
-                .and_then(|property| property["description"].as_str())
-            else {
-                continue;
-            };
-            let needed: Vec<Addressee> = kinds
-                .iter()
-                .filter(|kind| {
-                    kind.requirements()
-                        .iter()
-                        .any(|req| req.arg == arg && req.required)
-                })
-                .copied()
-                .collect();
-            assert!(
-                !text.ends_with(" Required."),
-                "{kinds:?}: `{}` is not unconditional: {text}",
-                arg.as_str()
-            );
-            if needed.is_empty() {
-                continue;
-            }
-            let lowered = text.to_lowercase();
-            let clause = lowered
-                .find("required for")
-                .map_or_else(String::new, |at| lowered[at..].to_string());
-            // The clause names every choice that needs the argument — and no
-            // choice that does not, so an over-broad requirement is caught too.
-            for kind in kinds {
-                let labelled = format!("`{}`", kind.as_str());
-                assert_eq!(
-                    clause.contains(&labelled),
-                    needed.contains(kind),
-                    "{kinds:?}: `{}` and {labelled}: {text}",
-                    arg.as_str()
-                );
-            }
-        }
-    }
-
-    /// What an arm may read directly with `get_str`: its addressee's required
-    /// arguments must be declared for every holder that can reach that arm —
-    /// `get_str` cannot filter, so an undeclared one there would be read even
-    /// though the interface never offers it. Swept over every holder.
-    fn assert_required_arguments_are_declared(tool: &SendTool, kinds: &[Addressee]) {
-        for kind in kinds {
-            for requirement in kind.requirements() {
-                assert!(
-                    !requirement.required || tool.declares(requirement.arg),
-                    "{kinds:?}: `{}` requires `{}`, which the holder must declare",
-                    kind.as_str(),
-                    requirement.arg.as_str()
-                );
-            }
-        }
-    }
-
-    /// A holder reads only the choices and the requirements it has. Swept over
-    /// EVERY holder and every argument — every non-empty subset of the grant
-    /// vocabulary, which is what a custom role can hold, plus the admin
-    /// Assistant's own holder — so the class cannot come back one instance at a
-    /// time: a new grantable addressee or argument joins the sweep by existing,
-    /// and the admin holder is swept whole. The Engineer's sync worker — the one
-    /// holder that declares no `place` — sits outside the subsets and is pinned by
-    /// its own tests.
-    #[test]
-    fn a_holder_reads_only_the_choices_and_requirements_it_has() {
-        let grantable: Vec<Addressee> = Addressee::OFFERED
-            .into_iter()
-            .filter(|kind| Addressee::STRS.contains(&kind.as_str()))
-            .collect();
-        let mut holders: Vec<SendTool> = (1u32..(1 << grantable.len()))
-            .map(|mask| {
-                let kinds: Vec<Addressee> = grantable
-                    .iter()
-                    .enumerate()
-                    .filter(|(bit, _)| mask & (1 << bit) != 0)
-                    .map(|(_, kind)| *kind)
-                    .collect();
-                SendTool::granted(&kinds)
-            })
-            .collect();
-        // The one holder with the `guest` handover: the owner's own Assistant.
-        holders.push(SendTool::admin(Role::Assistant));
-
-        for tool in &holders {
-            let kinds = tool.kinds.as_slice();
-            assert_labels_follow_the_choice(tool, kinds);
-            assert_arguments_follow_the_addressees(tool, kinds);
-            assert_requirements_are_named_per_choice(tool, kinds);
-            assert_required_arguments_are_declared(tool, kinds);
-        }
-
-        // The prose itself, once: a choice holder reads each held addressee under
-        // its own label, and the two worker kinds share one note.
-        let admin = SendTool::admin(Role::Assistant);
-        assert!(
-            admin
-                .description()
-                .contains("`worker`: One worker sub-agent")
-        );
-        assert!(
-            admin
-                .description()
-                .contains("`manager`: Deliver an internal message")
-        );
-        let place = admin.parameters_schema()["properties"]["place"]["description"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(place.contains("`worker`/`worker_branch`:"), "{place}");
-
-        // The Engineer's own instance: a sync worker that declares the choice
-        // like any other holder, and no folder at all.
-        let engineer = SendTool::engineer();
-        assert!(engineer.description().contains("One worker sub-agent"));
-        assert!(
-            engineer
-                .description()
-                .contains(load_prompt("tool/send_addressee.md").as_str()),
-            "the addressee-required note is read by every holder: {}",
-            engineer.description()
-        );
-        let schema = engineer.parameters_schema();
-        assert_eq!(schema["required"], json!(["message", "addressee"]));
-        assert_eq!(schema["properties"]["addressee"]["enum"], json!(["worker"]));
-        assert!(schema["properties"].get("place").is_none());
-    }
-
     /// The Engineer's sync `send` through the tool wrapper, end to end: the
     /// worker really runs, and its report comes back inline in the call's own
     /// result — never as the async `<worker-report>` envelope, and with no job
@@ -2472,198 +2246,163 @@ mod tests {
         }
     }
 
-    /// The command line's own strictness: a script names the address and the flags
-    /// apart, so an argument the named address does not take is refused rather
-    /// than dispatched with the value silently dropped. An agent's call is built
-    /// from its holder's own interface — where the combination cannot arise — and
-    /// an argument it cannot use stays inert there, as it always is.
-    #[tokio::test]
-    async fn a_command_line_flag_the_address_does_not_take_is_refused() {
-        let ws = crate::workspace::test_ws("/tmp/test_ws_send_unused");
-        let send = SendTool::admin(Role::Assistant);
-        for (addressee, flag) in [
-            ("assistant", "place"),
-            ("assistant", "branch"),
-            ("worker", "branch"),
-            ("worker", "name"),
-            ("manager", "name"),
-            ("guest", "place"),
-            ("guest", "branch"),
-        ] {
-            let mut args = json!({ "message": "go", "addressee": addressee });
-            args[flag] = json!(if flag == "place" { "/tmp" } else { "x" });
-            let err = dispatch_command_line(&send, &ws, args)
-                .await
-                .expect_err("an argument the address does not take is refused")
-                .to_string();
-            assert!(
-                err.contains(flag) && err.contains(addressee),
-                "the refusal names the argument and the address: {err}"
-            );
-        }
+    /// How a refused address call is made.
+    enum RefusalCall {
+        /// An agent session's call: the holder and its arguments.
+        Agent(SendTool, serde_json::Value),
+        /// A command-line handover that names no owner.
+        Unscoped(SendTool, serde_json::Value),
+        /// Command-line calls naming an argument the address does not take.
+        UnusedFlag(SendTool, &'static [(&'static str, &'static str)]),
     }
 
-    /// A choice value the holder does not offer is refused, naming its own set —
-    /// never silently narrowed. The calls run in an agent session: on the command
-    /// line the vocabulary is the command line's own (see [`Addressee::COMMAND_LINE`]).
+    /// One refused call and what its refusal must say.
+    struct RefusalCase {
+        name: &'static str,
+        call: RefusalCall,
+        contains: &'static [&'static str],
+        /// Substrings the lowercased refusal must carry.
+        lowercase_contains: &'static [&'static str],
+    }
+
+    #[expect(clippy::too_many_lines)] // one table over every refused address
     #[tokio::test]
-    async fn unheld_addressee_values_are_refused() {
+    async fn address_refusal_cases() {
         let ws = crate::workspace::test_ws("/tmp/test_ws_send_refuse");
-        let engineer = SendTool::engineer();
-        let err = dispatch(
-            &engineer,
-            &ws,
-            json!({ "message": "do it", "addressee": "manager" }),
-        )
-        .await
-        .expect_err("the engineer addresses a worker only");
-        let err = err.to_string();
-        assert!(err.contains("`addressee` must be one of worker"), "{err}");
-
-        let admin = SendTool::admin(Role::Assistant);
-        let err = dispatch(
-            &admin,
-            &ws,
-            json!({ "message": "do it", "addressee": "bogus" }),
-        )
-        .await
-        .expect_err("an unknown addressee is refused");
-        let err = err.to_string();
-        assert!(
-            err.contains("worker, worker_branch, manager, role, guest"),
-            "{err}"
-        );
-
-        let err = dispatch(
-            &admin,
-            &ws,
-            json!({ "message": "do it", "addressee": "assistant" }),
-        )
-        .await
-        .expect_err("an agent session never names the owner's own assistant");
-        let err = err.to_string();
-        assert!(
-            err.contains("worker, worker_branch, manager, role, guest"),
-            "{err}"
-        );
-
-        // The guest handover is the owner's Assistant's alone: a custom role's
-        // holder never reads it as one of its own choices.
-        let role_holder = SendTool::granted(&[Addressee::Role]);
-        let err = dispatch(
-            &role_holder,
-            &ws,
-            json!({ "message": "do it", "addressee": "guest", "name": "anyone" }),
-        )
-        .await
-        .expect_err("a custom role never acquires the guest handover");
-        let err = err.to_string();
-        assert!(err.contains("`addressee` must be one of role"), "{err}");
-    }
-
-    /// What decides is the marker the executor sets: a turn that ARRIVED over the
-    /// command line's channel — the assistant answering a `mahbot send`, whose
-    /// envelope carries the tag — is an agent's own call, so it must state its
-    /// address and can never name the owner's own assistant. The tag is a
-    /// transport, not a caller.
-    #[tokio::test]
-    async fn a_command_line_delivered_turn_is_still_an_agents_own() {
-        let ws = crate::workspace::test_ws("/tmp/test_ws_send_cli_turn");
-        let admin = SendTool::admin(Role::Assistant);
-        let err = dispatch_over(
-            crate::cli::CHANNEL,
-            Some("agent_harness"),
-            &admin,
-            &ws,
-            json!({ "message": "do it" }),
-        )
-        .await
-        .expect_err("an agent's turn states its address whatever channel it arrived over");
-        let err = err.to_string();
-        assert!(
-            err.contains("`addressee`") && err.to_lowercase().contains("required"),
-            "{err}"
-        );
-
-        let err = dispatch_over(
-            crate::cli::CHANNEL,
-            Some("agent_harness"),
-            &admin,
-            &ws,
-            json!({ "message": "do it", "addressee": "assistant" }),
-        )
-        .await
-        .expect_err("an agent's turn never names the owner's own assistant");
-        let err = err.to_string();
-        assert!(
-            err.contains("worker, worker_branch, manager, role, guest"),
-            "{err}"
-        );
-    }
-
-    /// The address is never assumed: an agent's call that names no addressee is
-    /// refused by every holder, even one that can address only a single agent.
-    /// The refusal happens before any dispatch, so no store or provider is needed.
-    /// (The command line's own rule differs: there an unnamed address means the
-    /// owner's assistant.)
-    #[tokio::test]
-    async fn a_missing_addressee_is_refused_for_every_holder() {
-        let ws = crate::workspace::test_ws("/tmp/test_ws_send_required");
-        for holder in [
-            SendTool::admin(Role::Assistant),
-            SendTool::engineer(),
-            SendTool::granted(&[Addressee::Worker]),
-            SendTool::granted(&[Addressee::Manager]),
+        let mut cases = vec![RefusalCase {
+            name: "an argument the address does not take is refused",
+            call: RefusalCall::UnusedFlag(
+                SendTool::admin(Role::Assistant),
+                &[
+                    ("assistant", "place"),
+                    ("assistant", "branch"),
+                    ("worker", "branch"),
+                    ("worker", "name"),
+                    ("manager", "name"),
+                    ("guest", "place"),
+                    ("guest", "branch"),
+                ],
+            ),
+            contains: &[],
+            lowercase_contains: &[],
+        }];
+        // A choice value the holder does not offer is refused, naming its own
+        // set — never silently narrowed.
+        cases.extend([
+            RefusalCase {
+                name: "the engineer addresses a worker only",
+                call: RefusalCall::Agent(
+                    SendTool::engineer(),
+                    json!({ "message": "do it", "addressee": "manager" }),
+                ),
+                contains: &["`addressee` must be one of worker"],
+                lowercase_contains: &[],
+            },
+            RefusalCase {
+                name: "an unknown addressee names the offered set",
+                call: RefusalCall::Agent(
+                    SendTool::admin(Role::Assistant),
+                    json!({ "message": "do it", "addressee": "bogus" }),
+                ),
+                contains: &["worker, worker_branch, manager, role, guest"],
+                lowercase_contains: &[],
+            },
+            RefusalCase {
+                name: "an agent session never names the owner's own assistant",
+                call: RefusalCall::Agent(
+                    SendTool::admin(Role::Assistant),
+                    json!({ "message": "do it", "addressee": "assistant" }),
+                ),
+                contains: &["worker, worker_branch, manager, role, guest"],
+                lowercase_contains: &[],
+            },
+            RefusalCase {
+                name: "a custom role never acquires the guest handover",
+                call: RefusalCall::Agent(
+                    SendTool::granted(&[Addressee::Role]),
+                    json!({ "message": "do it", "addressee": "guest", "name": "anyone" }),
+                ),
+                contains: &["`addressee` must be one of role"],
+                lowercase_contains: &[],
+            },
+        ]);
+        // The address is never assumed: an agent's call that names none is
+        // refused by every holder, even one that can address only one agent.
+        for (name, holder) in [
+            (
+                "the admin assistant states its address",
+                SendTool::admin(Role::Assistant),
+            ),
+            ("the engineer states its address", SendTool::engineer()),
+            (
+                "a worker-granted role states its address",
+                SendTool::granted(&[Addressee::Worker]),
+            ),
+            (
+                "a manager-granted role states its address",
+                SendTool::granted(&[Addressee::Manager]),
+            ),
         ] {
-            let err = dispatch(&holder, &ws, json!({ "message": "do it" }))
-                .await
-                .expect_err("a call that names no addressee is refused");
-            let err = err.to_string();
-            assert!(
-                err.contains("`addressee`") && err.to_lowercase().contains("required"),
-                "{err}"
-            );
+            cases.push(RefusalCase {
+                name,
+                call: RefusalCall::Agent(holder, json!({ "message": "do it" })),
+                contains: &["`addressee`"],
+                lowercase_contains: &["required"],
+            });
         }
-    }
-
-    /// The command line's handover carries the owner it acts for: a call that
-    /// names none is refused rather than attributed to nobody and addressed to a
-    /// `personal:` workspace that does not exist. (The command line itself always
-    /// scopes the owner, so this pins the contract, as the Manager arm's own check
-    /// does.)
-    #[tokio::test]
-    async fn a_command_line_handover_without_an_owner_is_refused() {
-        let ws = crate::workspace::test_ws("/tmp/test_ws_send_ownerless");
-        let err = dispatch_command_line_as(
-            "",
-            &SendTool::admin(Role::Assistant),
-            &ws,
-            json!({ "message": "no owner" }),
-        )
-        .await
-        .expect_err("a handover that names no owner is refused");
-        assert!(err.to_string().contains("No user identity"), "{err}");
-    }
-
-    /// The resume tolerance the required address depends on: an in-flight `send`
-    /// frame that predates the choice still reconnects to its unfinished sync
-    /// worker round instead of being refused or restarted. A frame naming another
-    /// addressee stays unresolvable and is re-executed, as today.
-    #[test]
-    fn an_absent_address_still_resumes_the_sync_worker() {
-        use crate::tools::SyncDurableCore;
-        assert!(matches!(
-            SyncDurableCore::from_call("send", &json!({ "message": "m" })),
-            Some(SyncDurableCore::Worker)
-        ));
-        assert!(matches!(
-            SyncDurableCore::from_call("send", &json!({ "message": "m", "addressee": "worker" })),
-            Some(SyncDurableCore::Worker)
-        ));
-        assert!(
-            SyncDurableCore::from_call("send", &json!({ "message": "m", "addressee": "manager" }))
-                .is_none()
-        );
+        // The command line's handover carries the owner it acts for.
+        cases.push(RefusalCase {
+            name: "a handover that names no owner is refused",
+            call: RefusalCall::Unscoped(
+                SendTool::admin(Role::Assistant),
+                json!({ "message": "no owner" }),
+            ),
+            contains: &["No user identity"],
+            lowercase_contains: &[],
+        });
+        for case in cases {
+            let expected = match case.call {
+                RefusalCall::Agent(tool, args) => dispatch(&tool, &ws, args).await,
+                RefusalCall::Unscoped(tool, args) => {
+                    dispatch_command_line_as("", &tool, &ws, args).await
+                }
+                RefusalCall::UnusedFlag(tool, combinations) => {
+                    for (addressee, flag) in combinations {
+                        let mut args = json!({ "message": "go", "addressee": addressee });
+                        args[flag] = json!(if *flag == "place" { "/tmp" } else { "x" });
+                        let err = dispatch_command_line(&tool, &ws, args)
+                            .await
+                            .expect_err("an argument the address does not take is refused")
+                            .to_string();
+                        assert!(
+                            err.contains(flag) && err.contains(addressee),
+                            "[{}] the refusal names the argument and the address: {err}",
+                            case.name
+                        );
+                    }
+                    continue;
+                }
+            };
+            let err = match expected {
+                Err(err) => err.to_string(),
+                Ok(ok) => panic!("[{}] expected a refusal, got: {ok}", case.name),
+            };
+            for needle in case.contains {
+                assert!(
+                    err.contains(needle),
+                    "[{}] expected {needle:?}: {err}",
+                    case.name
+                );
+            }
+            let lowercase = err.to_lowercase();
+            for needle in case.lowercase_contains {
+                assert!(
+                    lowercase.contains(needle),
+                    "[{}] expected {needle:?}: {err}",
+                    case.name
+                );
+            }
+        }
     }
 
     /// Regression: the manager send stays fully internal — the

@@ -530,85 +530,119 @@ mod tests {
     use crate::workspace::test_ws;
     use serde_json::json;
 
-    fn comment(role: &str, content: &str, ts: &str) -> crate::pipeline::board::TicketComment {
-        crate::pipeline::board::TicketComment {
-            role: role.to_string(),
-            content: content.to_string(),
-            created_at: ts.to_string(),
+    /// What a create-ticket call must produce.
+    enum CreateArgsExpect {
+        Created {
+            starts_with: &'static str,
+            contains: &'static [&'static str],
+            not_contains: &'static [&'static str],
+        },
+        /// Substrings the usage error must carry.
+        Usage(&'static [&'static str]),
+    }
+
+    /// One create-ticket argument scenario.
+    struct CreateArgsCase {
+        name: &'static str,
+        role: &'static str,
+        args: serde_json::Value,
+        expected: CreateArgsExpect,
+    }
+
+    #[tokio::test]
+    async fn create_ticket_argument_cases() {
+        crate::util::test::init_test_stores().await;
+
+        let ws = test_ws("/tmp/test_ws");
+        for case in [
+            CreateArgsCase {
+                name: "a non-string prerequisite is a usage error",
+                role: "test",
+                args: json!({
+                    "title": "Test",
+                    "description": "desc",
+                    "prerequisites": [123],
+                }),
+                expected: CreateArgsExpect::Usage(&[
+                    "usage: ",
+                    r#"argument "prerequisites" must be an array of strings"#,
+                ]),
+            },
+            // The created ticket answers with its own name, and an argument given as
+            // null is absent rather than spelled out.
+            CreateArgsCase {
+                name: "null optional arguments are absent",
+                role: "manager",
+                args: json!({
+                    "title": "Null optionals",
+                    "description": "desc",
+                    "prerequisites": null,
+                    "supersede": null,
+                    "priority": null,
+                }),
+                expected: CreateArgsExpect::Created {
+                    starts_with: "Created ticket ",
+                    contains: &["Null optionals"],
+                    not_contains: &["with prerequisites"],
+                },
+            },
+            CreateArgsCase {
+                name: "a non-integer priority is a usage error",
+                role: "manager",
+                args: json!({
+                    "title": "Bad priority",
+                    "description": "desc",
+                    "priority": "high",
+                }),
+                expected: CreateArgsExpect::Usage(&[
+                    "usage: ",
+                    r#"argument "priority" must be an integer"#,
+                ]),
+            },
+        ] {
+            let tool = CreateTicketTool::new(case.role, &ws);
+            match (case.expected, tool.execute(&ws, case.args).await) {
+                (CreateArgsExpect::Usage(needles), Err(err)) => {
+                    let msg = err.to_string();
+                    for needle in needles {
+                        assert!(
+                            msg.contains(needle),
+                            "[{}] expected {needle:?}: {msg}",
+                            case.name
+                        );
+                    }
+                }
+                (
+                    CreateArgsExpect::Created {
+                        starts_with,
+                        contains,
+                        not_contains,
+                    },
+                    Ok(result),
+                ) => {
+                    assert!(
+                        result.starts_with(starts_with),
+                        "[{}] got: {result}",
+                        case.name
+                    );
+                    for needle in contains {
+                        assert!(
+                            result.contains(needle),
+                            "[{}] expected {needle:?}: {result}",
+                            case.name
+                        );
+                    }
+                    for needle in not_contains {
+                        assert!(
+                            !result.contains(needle),
+                            "[{}] expected no {needle:?}: {result}",
+                            case.name
+                        );
+                    }
+                }
+                (_, other) => panic!("[{}] unexpected outcome: {other:?}", case.name),
+            }
         }
-    }
-
-    #[tokio::test]
-    async fn test_create_ticket_tool() {
-        crate::util::test::init_test_stores().await;
-
-        let ws = test_ws("/tmp/test_ws");
-        let tool = CreateTicketTool::new("test", &ws);
-        let args = json!({
-            "title": "Test ticket",
-            "description": "A test description",
-        });
-        let result = tool.execute(&ws, args).await.expect("execute");
-        assert!(
-            result.contains("Test ticket"),
-            "Output should contain title"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_create_ticket_rejects_non_string_prerequisite() {
-        crate::util::test::init_test_stores().await;
-
-        let ws = test_ws("/tmp/test_ws");
-        let tool = CreateTicketTool::new("test", &ws);
-        let args = json!({
-            "title": "Test",
-            "description": "desc",
-            "prerequisites": [123],
-        });
-        let msg = tool.execute(&ws, args).await.unwrap_err().to_string();
-        assert!(msg.starts_with("usage: "), "got: {msg}");
-        assert!(
-            msg.contains(r#"argument "prerequisites" must be an array of strings"#),
-            "got: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_create_ticket_treats_null_optional_arguments_as_absent() {
-        crate::util::test::init_test_stores().await;
-
-        let ws = test_ws("/tmp/test_ws");
-        let tool = CreateTicketTool::new("manager", &ws);
-        let args = json!({
-            "title": "Null optionals",
-            "description": "desc",
-            "prerequisites": null,
-            "supersede": null,
-            "priority": null,
-        });
-        let result = tool.execute(&ws, args).await.expect("null is absent");
-        assert!(result.starts_with("Created ticket "), "got: {result}");
-        assert!(!result.contains("with prerequisites"), "got: {result}");
-    }
-
-    #[tokio::test]
-    async fn test_create_ticket_rejects_non_integer_priority() {
-        crate::util::test::init_test_stores().await;
-
-        let ws = test_ws("/tmp/test_ws");
-        let tool = CreateTicketTool::new("manager", &ws);
-        let args = json!({
-            "title": "Bad priority",
-            "description": "desc",
-            "priority": "high",
-        });
-        let msg = tool.execute(&ws, args).await.unwrap_err().to_string();
-        assert!(msg.starts_with("usage: "), "got: {msg}");
-        assert!(
-            msg.contains(r#"argument "priority" must be an integer"#),
-            "got: {msg}"
-        );
     }
 
     #[tokio::test]
@@ -730,73 +764,72 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_list_tickets_invalid_phase() {
-        crate::util::test::init_test_stores().await;
-
-        let ws = crate::workspace::test_ws("/tmp");
-        let tool = ListTicketsTool::new(&ws);
-        let args = json!({"phase": "bogus_phase"});
-        let result = tool.execute(&ws, args).await;
-        assert!(result.is_err(), "Invalid phase should fail");
+    /// One add-comment call: the phase the ticket is in, and the comment the
+    /// ticket must carry afterwards.
+    struct AddCommentCase {
+        name: &'static str,
+        phase: TicketPhase,
+        content: &'static str,
     }
 
     #[tokio::test]
-    async fn test_get_ticket_tool() {
+    async fn add_comment_cases() {
         crate::util::test::init_test_stores().await;
 
         let store = board_store();
         let ws = test_ws("/ws");
-        let id = TicketBuilder::new(store, &ws)
-            .title("GetTest")
-            .desc("get me")
-            .create()
-            .await
-            .expect("create");
+        for case in [
+            AddCommentCase {
+                name: "a comment on a backlog ticket is stored",
+                phase: TicketPhase::Backlog,
+                content: "This is a test comment",
+            },
+            // A pipeline-occupied ticket may not be mutated, but commenting on it
+            // is not a mutation.
+            AddCommentCase {
+                name: "a comment on a pipeline-occupied ticket is allowed",
+                phase: TicketPhase::InDevelopment,
+                content: "This should be allowed now",
+            },
+        ] {
+            let id = TicketBuilder::new(store, &ws)
+                .title("CommentTest")
+                .desc("add a comment")
+                .phase(case.phase)
+                .create()
+                .await
+                .unwrap_or_else(|err| panic!("[{}] create: {err}", case.name));
 
-        // Fetch the ticket to compare against detailed_display()
-        let ticket = crate::util::test::expect_ticket(store, &id).await;
-        let expected = ticket.detailed_display();
+            let result = AddCommentTool::new(&ws)
+                .execute(&ws, json!({"ticket_id": id, "content": case.content}))
+                .await
+                .unwrap_or_else(|err| panic!("[{}] a comment is allowed here: {err}", case.name));
+            assert!(
+                result.contains(&id),
+                "[{}] the answer names the ticket: {result}",
+                case.name
+            );
 
-        let tool = GetTicketTool::new("manager", &ws);
-        let args = json!({"ticket_id": id, "full": true});
-        let result = tool.execute(&ws, args).await.expect("execute");
-        assert_eq!(
-            result, expected,
-            "GetTicketTool output must match Ticket::detailed_display()"
-        );
+            let ticket = expect_ticket(store, &id).await;
+            let stored = ticket.comments.last().expect("at least one comment");
+            assert_eq!(stored.role, Role::Manager.as_str(), "[{}] role", case.name);
+            assert_eq!(stored.content, case.content, "[{}] content", case.name);
+        }
+    }
+
+    /// One tool that must refuse an unknown phase.
+    enum InvalidPhaseTool {
+        Update,
+        List,
+    }
+
+    struct InvalidPhaseCase {
+        name: &'static str,
+        tool: InvalidPhaseTool,
     }
 
     #[tokio::test]
-    async fn test_add_comment_tool() {
-        crate::util::test::init_test_stores().await;
-
-        let store = board_store();
-        let ws = test_ws("/ws");
-        let id = TicketBuilder::new(store, &ws)
-            .title("CommentTest")
-            .desc("add a comment")
-            .create()
-            .await
-            .expect("create");
-
-        let tool = AddCommentTool::new(&ws);
-        let args = json!({
-            "ticket_id": id,
-            "content": "This is a test comment",
-        });
-        let result = tool.execute(&ws, args).await.expect("execute");
-        assert!(result.contains(&id), "Output should contain ticket id");
-
-        // Verify comment was stored
-        let ticket = crate::util::test::expect_ticket(store, &id).await;
-        let comment = ticket.comments.last().expect("at least one comment");
-        assert_eq!(comment.role, Role::Manager.as_str());
-        assert_eq!(comment.content, "This is a test comment");
-    }
-
-    #[tokio::test]
-    async fn test_invalid_phase() {
+    async fn invalid_phase_cases() {
         crate::util::test::init_test_stores().await;
 
         let store = board_store();
@@ -809,13 +842,33 @@ mod tests {
         )
         .await;
 
-        let tool = UpdateTicketTool::new(&ws);
-        let args = json!({
-            "ticket_id": id,
-            "phase": "invalid_phase"
-        });
-        let result = tool.execute(&ws, args).await;
-        assert!(result.is_err(), "Invalid phase should fail");
+        for case in [
+            InvalidPhaseCase {
+                name: "an update refuses an unknown phase",
+                tool: InvalidPhaseTool::Update,
+            },
+            InvalidPhaseCase {
+                name: "a listing refuses an unknown phase",
+                tool: InvalidPhaseTool::List,
+            },
+        ] {
+            let result = match case.tool {
+                InvalidPhaseTool::Update => {
+                    UpdateTicketTool::new(&ws)
+                        .execute(
+                            &ws,
+                            json!({"ticket_id": id.clone(), "phase": "invalid_phase"}),
+                        )
+                        .await
+                }
+                InvalidPhaseTool::List => {
+                    ListTicketsTool::new(&ws)
+                        .execute(&ws, json!({"phase": "bogus_phase"}))
+                        .await
+                }
+            };
+            assert!(result.is_err(), "[{}] invalid phase should fail", case.name);
+        }
     }
 
     // ── Pipeline-occupied guard tests ────────────────────────────
@@ -877,137 +930,125 @@ mod tests {
             .expect("create")
     }
 
-    #[tokio::test]
-    #[serial_test::serial(reset_inflight)] // shared global board — a concurrent boot reset would clobber the InDevelopment fixture
-    async fn test_update_ticket_blocked_by_pipeline() {
-        let id = create_occupied_ticket().await;
-        let ws = test_ws("/ws");
-        let result = UpdateTicketTool::new(&ws)
-            .execute(&ws, json!({"ticket_id": id, "phase": "backlog"}))
-            .await;
-        assert!(
-            result.is_err(),
-            "Pipeline-occupied ticket should reject update"
-        );
+    /// One mutation that the pipeline-occupied guard must refuse.
+    enum BlockedMutation {
+        Update,
+        SupersedeCreate,
+    }
+
+    struct BlockedMutationCase {
+        name: &'static str,
+        mutation: BlockedMutation,
     }
 
     #[tokio::test]
     #[serial_test::serial(reset_inflight)] // shared global board — a concurrent boot reset would clobber the InDevelopment fixture
-    async fn test_create_ticket_supersede_blocked_by_pipeline() {
-        let id = create_occupied_ticket().await;
-        let ws = test_ws("/ws");
-        let result = CreateTicketTool::new("test", &ws)
-            .execute(
-                &ws,
-                json!({"title": "Replacement", "description": "trying to supersede", "supersede": id}),
-            )
-            .await;
-        assert!(
-            result.is_err(),
-            "Supersede should be rejected for pipeline-occupied tickets"
-        );
+    async fn pipeline_occupied_mutation_cases() {
+        for case in [
+            BlockedMutationCase {
+                name: "an update is refused",
+                mutation: BlockedMutation::Update,
+            },
+            BlockedMutationCase {
+                name: "a supersede is refused",
+                mutation: BlockedMutation::SupersedeCreate,
+            },
+        ] {
+            let id = create_occupied_ticket().await;
+            let ws = test_ws("/ws");
+            let result = match case.mutation {
+                BlockedMutation::Update => {
+                    UpdateTicketTool::new(&ws)
+                        .execute(&ws, json!({"ticket_id": id, "phase": "backlog"}))
+                        .await
+                }
+                BlockedMutation::SupersedeCreate => {
+                    CreateTicketTool::new("test", &ws)
+                        .execute(
+                            &ws,
+                            json!({
+                                "title": "Replacement",
+                                "description": "trying to supersede",
+                                "supersede": id,
+                            }),
+                        )
+                        .await
+                }
+            };
+            assert!(
+                result.is_err(),
+                "[{}] a pipeline-occupied ticket cannot be modified",
+                case.name
+            );
+        }
+    }
+
+    /// One supersede call: the explicit priority (if any) and the priority the
+    /// replacement must end up with.
+    struct SupersedePriorityCase {
+        name: &'static str,
+        explicit: Option<i64>,
+        expected: i64,
     }
 
     #[tokio::test]
-    async fn test_supersede_inherits_priority() {
+    async fn supersede_priority_cases() {
         crate::util::test::init_test_stores().await;
 
         let store = board_store();
         let ws = test_ws("/tmp/test_ws_supersede_priority");
 
-        // Create a ticket with a non-default priority (0 = highest urgency).
-        let old_id = TicketBuilder::new(store, &ws)
-            .title("Urgent")
-            .priority(0)
-            .create()
-            .await
-            .expect("create old ticket");
+        for case in [
+            SupersedePriorityCase {
+                name: "an omitted priority is inherited from the superseded ticket",
+                explicit: None,
+                expected: 0,
+            },
+            SupersedePriorityCase {
+                name: "an explicit priority overrides inheritance",
+                explicit: Some(5),
+                expected: 5,
+            },
+        ] {
+            // A ticket with a non-default priority (0 = highest urgency).
+            let old_id = TicketBuilder::new(store, &ws)
+                .title("Old ticket")
+                .priority(0)
+                .create()
+                .await
+                .expect("create old ticket");
 
-        // Supersede without specifying priority — should inherit priority 0.
-        let tool = CreateTicketTool::new("manager", &ws);
-        let args = json!({
-            "title": "Replacement",
-            "description": "superseding the urgent ticket",
-            "supersede": old_id,
-        });
-        let result = tool
-            .execute(&ws, args)
-            .await
-            .expect("supersede should succeed");
-        assert!(result.contains("Superseded"), "Expected supersede output");
+            let mut args = json!({
+                "title": "Replacement",
+                "description": "superseding the old ticket",
+                "supersede": &old_id,
+            });
+            if let Some(priority) = case.explicit {
+                args["priority"] = json!(priority);
+            }
+            let result = CreateTicketTool::new("manager", &ws)
+                .execute(&ws, args)
+                .await
+                .expect("supersede should succeed");
+            assert!(
+                result.contains("Superseded"),
+                "[{}] expected supersede output: {result}",
+                case.name
+            );
 
-        // Find the new ticket ID via the old ticket's superseded_by link.
-        let old_ticket = expect_ticket(store, &old_id).await;
-        let new_id = old_ticket
-            .superseded_by
-            .as_deref()
-            .expect("old ticket should have superseded_by");
-
-        // Verify the new ticket inherited priority 0 from the old ticket.
-        let new_ticket = expect_ticket(store, new_id).await;
-        assert_eq!(
-            new_ticket.priority, 0,
-            "Should inherit priority from superseded ticket"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_supersede_explicit_priority_overrides_inheritance() {
-        crate::util::test::init_test_stores().await;
-
-        let store = board_store();
-        let ws = test_ws("/tmp/test_ws_supersede_explicit_priority");
-
-        // Create a ticket with a non-default priority.
-        let old_id = TicketBuilder::new(store, &ws)
-            .title("Old ticket")
-            .priority(0)
-            .create()
-            .await
-            .expect("create old ticket");
-
-        // Supersede with explicit priority — should use the explicit value,
-        // not inherit the old ticket's priority.
-        let tool = CreateTicketTool::new("manager", &ws);
-        let args = json!({
-            "title": "Replacement",
-            "description": "superseding with explicit priority",
-            "supersede": old_id,
-            "priority": 5,
-        });
-        let result = tool
-            .execute(&ws, args)
-            .await
-            .expect("supersede should succeed");
-        assert!(result.contains("Superseded"), "Expected supersede output");
-
-        let old_ticket = expect_ticket(store, &old_id).await;
-        let new_id = old_ticket
-            .superseded_by
-            .as_deref()
-            .expect("old ticket should have superseded_by");
-
-        let new_ticket = expect_ticket(store, new_id).await;
-        assert_eq!(
-            new_ticket.priority, 5,
-            "Explicit priority should override inheritance from old ticket"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_add_comment_allowed_on_pipeline_occupied() {
-        let id = create_occupied_ticket().await;
-        let ws = test_ws("/ws");
-        let result = AddCommentTool::new(&ws)
-            .execute(
-                &ws,
-                json!({"ticket_id": id, "content": "This should be allowed now"}),
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "Comments should be allowed on pipeline-occupied tickets"
-        );
+            // The new ticket hangs off the old ticket's superseded_by link.
+            let old_ticket = expect_ticket(store, &old_id).await;
+            let new_id = old_ticket
+                .superseded_by
+                .as_deref()
+                .expect("old ticket should have superseded_by");
+            let new_ticket = expect_ticket(store, new_id).await;
+            assert_eq!(
+                new_ticket.priority, case.expected,
+                "[{}] replacement priority",
+                case.name
+            );
+        }
     }
 
     #[test]
@@ -1078,180 +1119,5 @@ mod tests {
             .await
             .expect("a prefixed ID from any workspace is accepted");
         assert_eq!(result, expected);
-    }
-
-    #[tokio::test]
-    async fn test_detailed_display_limited_truncates_description_and_non_tail_comments() {
-        crate::util::test::init_test_stores().await;
-
-        let store = board_store();
-        let ws = test_ws("/ws");
-        let long_desc = "x".repeat(600);
-        let id = TicketBuilder::new(store, &ws)
-            .title("Limited")
-            .desc(&long_desc)
-            .create()
-            .await
-            .expect("create");
-
-        let mut ticket = crate::util::test::expect_ticket(store, &id).await;
-        ticket.comments = vec![
-            comment("engineer", &"a".repeat(300), "2026-01-01T00:00:00Z"),
-            comment("qa", &"b".repeat(250), "2026-01-02T00:00:00Z"),
-            comment("reviewer", &"c".repeat(150), "2026-01-03T00:00:00Z"),
-            comment("manager", &"d".repeat(100), "2026-01-04T00:00:00Z"),
-            comment("assistant", &"e".repeat(80), "2026-01-05T00:00:00Z"),
-        ];
-
-        let out = ticket.detailed_display_limited(500, 200, 3);
-
-        // (a) description capped at 500 chars, ellipsis included
-        assert!(out.contains(&format!("Description: {}…", "x".repeat(499))));
-        assert!(
-            !out.contains(&long_desc),
-            "full description must not appear"
-        );
-        // (d) header metadata never truncated
-        assert!(out.contains(&format!("Ticket: {}", ticket.id)));
-        assert!(out.contains("Title: Limited"));
-        assert!(out.contains("Reporter: test"));
-        assert!(out.contains("Priority: P1"));
-        // (b) comments older than the last three capped at 200 chars, ellipsis
-        // included
-        assert!(out.contains(&format!(
-            "[engineer] (2026-01-01T00:00:00): {}…",
-            "a".repeat(199)
-        )));
-        assert!(out.contains(&format!("[qa] (2026-01-02T00:00:00): {}…", "b".repeat(199))));
-        // (c) last three comments shown in full
-        assert!(out.contains(&format!(
-            "[reviewer] (2026-01-03T00:00:00): {}",
-            "c".repeat(150)
-        )));
-        assert!(out.contains(&format!(
-            "[manager] (2026-01-04T00:00:00): {}",
-            "d".repeat(100)
-        )));
-        assert!(out.contains(&format!(
-            "[assistant] (2026-01-05T00:00:00): {}",
-            "e".repeat(80)
-        )));
-    }
-
-    #[tokio::test]
-    async fn test_detailed_display_limited_three_or_fewer_comments_all_full() {
-        crate::util::test::init_test_stores().await;
-
-        let store = board_store();
-        let ws = test_ws("/ws");
-        let id = TicketBuilder::new(store, &ws)
-            .title("FewComments")
-            .desc("short desc")
-            .create()
-            .await
-            .expect("create");
-
-        let mut ticket = crate::util::test::expect_ticket(store, &id).await;
-        ticket.comments = vec![
-            comment("engineer", &"a".repeat(300), "2026-01-01T00:00:00Z"),
-            comment("qa", &"b".repeat(250), "2026-01-02T00:00:00Z"),
-            comment("reviewer", &"c".repeat(150), "2026-01-03T00:00:00Z"),
-        ];
-
-        let out = ticket.detailed_display_limited(500, 200, 3);
-        assert!(out.contains(&"a".repeat(300)));
-        assert!(out.contains(&"b".repeat(250)));
-        assert!(out.contains(&"c".repeat(150)));
-        assert!(
-            !out.contains('…'),
-            "with ≤3 comments none should be truncated"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_ticket_default_truncated_for_same_agent() {
-        crate::util::test::init_test_stores().await;
-
-        let store = board_store();
-        let ws = test_ws("/ws");
-        let long_desc = "y".repeat(600);
-        let id = TicketBuilder::new(store, &ws)
-            .title("SameAgent")
-            .reporter("manager")
-            .desc(&long_desc)
-            .create()
-            .await
-            .expect("create");
-
-        let tool = GetTicketTool::new("manager", &ws);
-        let result = tool
-            .execute(&ws, json!({"ticket_id": id}))
-            .await
-            .expect("execute");
-        assert!(
-            result.contains(&format!("Description: {}…", "y".repeat(499))),
-            "same-agent default view must truncate the description"
-        );
-        assert!(!result.contains(&long_desc));
-    }
-
-    #[tokio::test]
-    async fn test_get_ticket_full_output_for_different_creator() {
-        crate::util::test::init_test_stores().await;
-
-        let store = board_store();
-        let ws = test_ws("/ws");
-        let long_desc = "z".repeat(600);
-        let id = TicketBuilder::new(store, &ws)
-            .title("OtherAgent")
-            .reporter("maintainer")
-            .desc(&long_desc)
-            .create()
-            .await
-            .expect("create");
-
-        let ticket = crate::util::test::expect_ticket(store, &id).await;
-        let expected = ticket.detailed_display();
-
-        let tool = GetTicketTool::new("manager", &ws);
-        let result = tool
-            .execute(&ws, json!({"ticket_id": id}))
-            .await
-            .expect("execute");
-        assert_eq!(
-            result, expected,
-            "a different creator must produce the full un-truncated ticket"
-        );
-        assert!(result.contains(&long_desc));
-    }
-
-    #[tokio::test]
-    async fn test_get_ticket_full_flag_returns_complete() {
-        crate::util::test::init_test_stores().await;
-
-        let store = board_store();
-        let ws = test_ws("/ws");
-        let long_desc = "w".repeat(600);
-        let id = TicketBuilder::new(store, &ws)
-            .title("FullFlag")
-            .reporter("manager")
-            .desc(&long_desc)
-            .create()
-            .await
-            .expect("create");
-
-        let ticket = crate::util::test::expect_ticket(store, &id).await;
-        let expected = ticket.detailed_display();
-
-        let tool = GetTicketTool::new("manager", &ws);
-        let result = tool
-            .execute(&ws, json!({"ticket_id": id, "full": true}))
-            .await
-            .expect("execute");
-        assert_eq!(
-            result, expected,
-            "full=true must return the complete ticket"
-        );
-        assert!(result.contains(&long_desc));
     }
 }

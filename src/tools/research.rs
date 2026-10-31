@@ -3548,40 +3548,6 @@ mod tests {
         assert!(budget.is_exhausted());
     }
 
-    #[test]
-    fn test_research_fail_open_envelope() {
-        // All-decomposers-failed follows the analyze convention: an error envelope
-        // with an explicit marker, never a silent drop.
-        let envelope = build_async_research_message(
-            "job123",
-            &Err(anyhow::anyhow!("all decomposition analysts failed")),
-        );
-        assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
-        assert!(
-            envelope.contains("An error occurred: all decomposition analysts failed"),
-            "{envelope}"
-        );
-        assert!(
-            envelope.ends_with("</analyze-tool-result>"),
-            "envelope must close: {envelope}"
-        );
-    }
-
-    /// Legacy checkpoint migration guard: pre-collapse blobs stored
-    /// stage="verification". ResearchState::load falls back to a fresh run on
-    /// ANY deserialization error, so without this alias an in-flight run
-    /// would silently restart from Decompose.
-    #[test]
-    fn legacy_verification_checkpoint_deserializes_as_synthesis() {
-        let stage: ResearchStage = serde_json::from_str(r#""verification""#).unwrap();
-        assert_eq!(stage, ResearchStage::Synthesis);
-        assert_eq!(
-            serde_json::to_string(&stage).unwrap(),
-            r#""synthesis""#,
-            "new checkpoints must serialize the collapsed name"
-        );
-    }
-
     /// Direct resume test for `resume_research_run`: a job
     /// checkpointed at stage=Synthesis with pre-populated verification
     /// resumes — it re-enters the orchestrator, synthesizes from the
@@ -3592,6 +3558,21 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn resume_research_run_continues_at_synthesis_stage() {
+        // Pre-collapse blobs stored stage="verification"; without this alias the
+        // state fails to deserialize and the run silently restarts from Decompose.
+        let legacy: ResearchStage =
+            serde_json::from_str(r#""verification""#).expect("the old stage reads");
+        assert_eq!(
+            legacy,
+            ResearchStage::Synthesis,
+            "the collapsed stage is Synthesis"
+        );
+        assert_eq!(
+            serde_json::to_string(&legacy).expect("the stage serializes"),
+            r#""synthesis""#,
+            "new checkpoints write the collapsed name"
+        );
+
         crate::util::test::init_management_test_stores().await;
         // One synthesis call (the only LLM work left at stage=Synthesis).
         let fake = crate::util::test::FakeProvider::new()
@@ -3766,165 +3747,293 @@ mod tests {
         );
     }
 
+    /// Which research stage is driven into provider exhaustion.
+    enum FailOpenStage {
+        Synthesize,
+        Annotate,
+    }
+
+    struct FailOpenCase {
+        name: &'static str,
+        stage: FailOpenStage,
+    }
+
     #[tokio::test]
     #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
-    async fn test_synthesis_truncated_output_is_marked_and_transport_fails_open() {
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        let ws = crate::workspace::test_ws_named("/tmp/test_ws", "research_synth_truncated");
-        let acc = AccumulatedEvidence::default();
+    async fn provider_failure_fail_open_cases() {
+        for case in [
+            FailOpenCase {
+                name: "synthesis delivers the last produced output and marks truncation",
+                stage: FailOpenStage::Synthesize,
+            },
+            FailOpenCase {
+                name: "a failed confirm pass keeps every mutating claim as weak",
+                stage: FailOpenStage::Annotate,
+            },
+        ] {
+            let _policy_guard =
+                crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+            match case.stage {
+                FailOpenStage::Synthesize => {
+                    let ws =
+                        crate::workspace::test_ws_named("/tmp/test_ws", "research_synth_truncated");
+                    let acc = AccumulatedEvidence::default();
 
-        // Every attempt provider-truncated (finish_reason=length): the last
-        // produced output wins, marked — never silent success.
-        let fake = crate::util::test::FakeProvider::new()
-            .ok_with_finish("report part one", Some("length"))
-            .ok_with_finish("report part two", Some("length"))
-            .ok_with_finish("compressed final", Some("length"));
-        let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
-        let _provider_guard = crate::util::test::install_fake_provider(provider);
-        let out = synthesize(&ws, "q", &acc, None, "test_run")
-            .await
-            .expect("last produced output must be delivered");
-        assert_eq!(out.text, "compressed final");
-        assert!(
-            out.marker
-                .as_deref()
-                .is_some_and(|m| m.contains("truncated")),
-            "truncated delivery must carry the explicit marker: {:?}",
-            out.marker
-        );
+                    // Every attempt provider-truncated (finish_reason=length): the last
+                    // produced output wins, marked — never silent success.
+                    let fake = crate::util::test::FakeProvider::new()
+                        .ok_with_finish("report part one", Some("length"))
+                        .ok_with_finish("report part two", Some("length"))
+                        .ok_with_finish("compressed final", Some("length"));
+                    let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
+                    let _provider_guard = crate::util::test::install_fake_provider(provider);
+                    let out = synthesize(&ws, "q", &acc, None, "test_run")
+                        .await
+                        .expect("last produced output must be delivered");
+                    assert_eq!(out.text, "compressed final", "[{}]", case.name);
+                    assert!(
+                        out.marker
+                            .as_deref()
+                            .is_some_and(|m| m.contains("truncated")),
+                        "[{}] truncated delivery must carry the explicit marker: {:?}",
+                        case.name,
+                        out.marker
+                    );
 
-        // A clean (non-truncated) attempt wins immediately without a marker.
-        let fake = crate::util::test::FakeProvider::new()
-            .ok_with_finish("part one", Some("length"))
-            .ok("complete report");
-        let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
-        let _provider_guard = crate::util::test::install_fake_provider(provider);
-        let out = synthesize(&ws, "q", &acc, None, "test_run")
-            .await
-            .expect("clean completion wins");
-        assert_eq!(out.text, "complete report");
-        assert!(out.marker.is_none(), "clean completion is unmarked");
+                    // A clean (non-truncated) attempt wins immediately without a marker.
+                    let fake = crate::util::test::FakeProvider::new()
+                        .ok_with_finish("part one", Some("length"))
+                        .ok("complete report");
+                    let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
+                    let _provider_guard = crate::util::test::install_fake_provider(provider);
+                    let out = synthesize(&ws, "q", &acc, None, "test_run")
+                        .await
+                        .expect("clean completion wins");
+                    assert_eq!(out.text, "complete report", "[{}]", case.name);
+                    assert!(
+                        out.marker.is_none(),
+                        "[{}] clean completion is unmarked",
+                        case.name
+                    );
 
-        // All transport failures → no usable output → Err (the caller's
-        // partial-report fail-open path).
-        let fake = crate::util::test::FakeProvider::new()
-            .err(crate::retry::FailureClass::Transport, "outage")
-            .err(crate::retry::FailureClass::Transport, "outage")
-            .err(crate::retry::FailureClass::Transport, "outage");
-        let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
-        let _provider_guard = crate::util::test::install_fake_provider(provider);
-        let err = synthesize(&ws, "q", &acc, None, "test_run")
-            .await
-            .expect_err("transport exhaustion must error into the partial-report path");
-        assert!(err.to_string().contains("no usable output"), "{err}");
+                    // All transport failures → no usable output → Err (the caller's
+                    // partial-report fail-open path).
+                    let fake = crate::util::test::FakeProvider::new()
+                        .err(crate::retry::FailureClass::Transport, "outage")
+                        .err(crate::retry::FailureClass::Transport, "outage")
+                        .err(crate::retry::FailureClass::Transport, "outage");
+                    let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
+                    let _provider_guard = crate::util::test::install_fake_provider(provider);
+                    let err = synthesize(&ws, "q", &acc, None, "test_run")
+                        .await
+                        .expect_err("transport exhaustion must error into the partial-report path");
+                    assert!(
+                        err.to_string().contains("no usable output"),
+                        "[{}] {err}",
+                        case.name
+                    );
+                }
+                FailOpenStage::Annotate => {
+                    let ws = crate::workspace::test_ws_named(
+                        "/tmp/test_ws",
+                        "research_annotate_fail_open",
+                    );
+                    let mut acc = AccumulatedEvidence::default();
+                    acc.claims.push(claim("alpha is true", "u1", "medium"));
+                    let pending = vec![
+                        claim("alpha is true (restated)", "u2", "high"),
+                        claim("beta contradicts alpha", "u3", "high"),
+                    ];
+                    // Script: annotation pass OK (pending 0 = duplicate, pending 1 =
+                    // contradicts), then the confirm pass hits only transport failures.
+                    let annotation_json = r#"{"annotations": [{"new_id": 0, "verdict": "duplicate", "existing_id": 0}, {"new_id": 1, "verdict": "contradicts", "existing_id": 0, "contradiction": "alpha vs beta differ"}]}"#;
+                    let fake = crate::util::test::FakeProvider::new()
+                        .ok(annotation_json)
+                        .err(crate::retry::FailureClass::Transport, "confirm outage")
+                        .err(crate::retry::FailureClass::Transport, "confirm outage")
+                        .err(crate::retry::FailureClass::Transport, "confirm outage");
+                    let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
+                    let _provider_guard = crate::util::test::install_fake_provider(provider);
+                    let mut markers = Vec::new();
+                    let novel = annotate_round(
+                        &ws,
+                        &mut acc,
+                        &pending,
+                        &mut markers,
+                        "test_run",
+                        "question",
+                    )
+                    .await;
+                    assert_eq!(
+                        novel, 1,
+                        "[{}] only the weak contradiction counts as novel — the weak duplicate never does",
+                        case.name
+                    );
+                    assert_eq!(
+                        acc.claims.len(),
+                        3,
+                        "[{}] both mutating claims stay standalone — never dropped",
+                        case.name
+                    );
+                    assert_eq!(acc.weak.duplicates, vec![(1, 0)], "[{}]", case.name);
+                    assert_eq!(acc.weak.contradictions, vec![(2, 0)], "[{}]", case.name);
+                    assert!(
+                        acc.claims[0]
+                            .contradictions
+                            .contains(&"alpha vs beta differ".to_string()),
+                        "[{}] the weak contradiction keeps its note — verification still qualifies it",
+                        case.name
+                    );
+                    assert!(
+                        markers.iter().any(|m| m.contains("confirmation failed")),
+                        "[{}] the confirm failure is never silent: {markers:?}",
+                        case.name
+                    );
+                }
+            }
+        }
     }
 
-    #[test]
-    fn test_validate_gap_list_traces_to_plan() {
-        let plan = MergedPlan {
-            sub_questions: vec![
-                MergedSubQuestion {
-                    question: "What is the price of X?".into(),
-                    evidence_needed: "pricing page".into(),
-                    risk: "low".into(),
-                    from_id: 0,
-                    also_ids: vec![],
-                },
-                MergedSubQuestion {
-                    question: "Who maintains X?".into(),
-                    evidence_needed: "repo metadata".into(),
-                    risk: "medium".into(),
-                    from_id: 1,
-                    also_ids: vec![],
-                },
-            ],
-            dropped: vec![],
-        };
-        let in_range = GapList {
-            gaps: vec![Gap {
-                kind: "unanswered".into(),
-                item: "exact price".into(),
-                traces_to: 0,
-            }],
-        };
-        assert!(validate_gap_list(&in_range, &plan).is_ok());
-        let out_of_range = GapList {
-            gaps: vec![Gap {
-                kind: "unanswered".into(),
-                item: "unrelated".into(),
-                traces_to: 5,
-            }],
-        };
-        assert!(
-            validate_gap_list(&out_of_range, &plan).is_err(),
-            "out-of-range traces_to is rejected — index-range validation guarantees traceability"
-        );
+    /// One structural validation gate.
+    enum ValidationGate {
+        GapTracesToPlan,
+        MergedPlanCoverage,
     }
 
+    struct ValidationGateCase {
+        name: &'static str,
+        gate: ValidationGate,
+    }
+
+    #[expect(clippy::too_many_lines)]
     #[test]
-    fn test_validate_merged_plan_coverage() {
-        let sq = |q: &str| SubQuestion {
-            question: q.into(),
-            evidence_needed: "e".into(),
-            risk: "low".into(),
-        };
-        let plans = vec![
-            DecompositionPlan {
-                sub_questions: vec![sq("q1"), sq("q2")],
+    fn validation_gate_cases() {
+        for case in [
+            ValidationGateCase {
+                name: "a gap's traces_to must index the merged plan",
+                gate: ValidationGate::GapTracesToPlan,
             },
-            DecompositionPlan {
-                sub_questions: vec![sq("q1"), sq("q3")],
+            ValidationGateCase {
+                name: "every sub-question is placed exactly once",
+                gate: ValidationGate::MergedPlanCoverage,
             },
-        ];
-        // Global flat ids: plan 0: q1=0 q2=1; plan 1: q1=2 q3=3.
-        let base = |also: bool, dropped: bool| MergedPlan {
-            sub_questions: vec![
-                MergedSubQuestion {
-                    question: String::new(),
-                    evidence_needed: String::new(),
-                    risk: String::new(),
-                    from_id: 0,
-                    also_ids: if also { vec![2] } else { vec![] },
-                },
-                MergedSubQuestion {
-                    question: String::new(),
-                    evidence_needed: String::new(),
-                    risk: String::new(),
-                    from_id: 1,
-                    also_ids: vec![],
-                },
-            ],
-            dropped: if dropped {
-                vec![DroppedSubQuestion { id: 3 }]
-            } else {
-                vec![]
-            },
-        };
-        assert!(
-            validate_merged_plan(&base(true, true), &plans).is_ok(),
-            "full coverage via from_id + also_ids + dropped"
-        );
-        assert!(
-            validate_merged_plan(&base(false, true), &plans).is_err(),
-            "silent dropout: plan 1's q1 (id 2) is never covered"
-        );
-        assert!(
-            validate_merged_plan(&base(true, false), &plans).is_err(),
-            "silent dropout: q3 (id 3) is never covered"
-        );
-        let mut bad = base(true, true);
-        bad.sub_questions[0].from_id = 9;
-        assert!(
-            validate_merged_plan(&bad, &plans).is_err(),
-            "out-of-range from_id is rejected"
-        );
-        let mut bad = base(true, true);
-        bad.sub_questions[1].from_id = 0;
-        assert!(
-            validate_merged_plan(&bad, &plans).is_err(),
-            "duplicate placement (id 0 twice) is rejected"
-        );
+        ] {
+            match case.gate {
+                ValidationGate::GapTracesToPlan => {
+                    let plan = MergedPlan {
+                        sub_questions: vec![
+                            MergedSubQuestion {
+                                question: "What is the price of X?".into(),
+                                evidence_needed: "pricing page".into(),
+                                risk: "low".into(),
+                                from_id: 0,
+                                also_ids: vec![],
+                            },
+                            MergedSubQuestion {
+                                question: "Who maintains X?".into(),
+                                evidence_needed: "repo metadata".into(),
+                                risk: "medium".into(),
+                                from_id: 1,
+                                also_ids: vec![],
+                            },
+                        ],
+                        dropped: vec![],
+                    };
+                    let in_range = GapList {
+                        gaps: vec![Gap {
+                            kind: "unanswered".into(),
+                            item: "exact price".into(),
+                            traces_to: 0,
+                        }],
+                    };
+                    assert!(
+                        validate_gap_list(&in_range, &plan).is_ok(),
+                        "[{}]",
+                        case.name
+                    );
+                    let out_of_range = GapList {
+                        gaps: vec![Gap {
+                            kind: "unanswered".into(),
+                            item: "unrelated".into(),
+                            traces_to: 5,
+                        }],
+                    };
+                    assert!(
+                        validate_gap_list(&out_of_range, &plan).is_err(),
+                        "[{}] out-of-range traces_to is rejected — index-range validation guarantees traceability",
+                        case.name
+                    );
+                }
+                ValidationGate::MergedPlanCoverage => {
+                    let sq = |q: &str| SubQuestion {
+                        question: q.into(),
+                        evidence_needed: "e".into(),
+                        risk: "low".into(),
+                    };
+                    let plans = vec![
+                        DecompositionPlan {
+                            sub_questions: vec![sq("q1"), sq("q2")],
+                        },
+                        DecompositionPlan {
+                            sub_questions: vec![sq("q1"), sq("q3")],
+                        },
+                    ];
+                    // Global flat ids: plan 0: q1=0 q2=1; plan 1: q1=2 q3=3.
+                    let base = |also: bool, dropped: bool| MergedPlan {
+                        sub_questions: vec![
+                            MergedSubQuestion {
+                                question: String::new(),
+                                evidence_needed: String::new(),
+                                risk: String::new(),
+                                from_id: 0,
+                                also_ids: if also { vec![2] } else { vec![] },
+                            },
+                            MergedSubQuestion {
+                                question: String::new(),
+                                evidence_needed: String::new(),
+                                risk: String::new(),
+                                from_id: 1,
+                                also_ids: vec![],
+                            },
+                        ],
+                        dropped: if dropped {
+                            vec![DroppedSubQuestion { id: 3 }]
+                        } else {
+                            vec![]
+                        },
+                    };
+                    assert!(
+                        validate_merged_plan(&base(true, true), &plans).is_ok(),
+                        "[{}] full coverage via from_id + also_ids + dropped",
+                        case.name
+                    );
+                    assert!(
+                        validate_merged_plan(&base(false, true), &plans).is_err(),
+                        "[{}] silent dropout: plan 1's q1 (id 2) is never covered",
+                        case.name
+                    );
+                    assert!(
+                        validate_merged_plan(&base(true, false), &plans).is_err(),
+                        "[{}] silent dropout: q3 (id 3) is never covered",
+                        case.name
+                    );
+                    let mut bad = base(true, true);
+                    bad.sub_questions[0].from_id = 9;
+                    assert!(
+                        validate_merged_plan(&bad, &plans).is_err(),
+                        "[{}] out-of-range from_id is rejected",
+                        case.name
+                    );
+                    let mut bad = base(true, true);
+                    bad.sub_questions[1].from_id = 0;
+                    assert!(
+                        validate_merged_plan(&bad, &plans).is_err(),
+                        "[{}] duplicate placement (id 0 twice) is rejected",
+                        case.name
+                    );
+                }
+            }
+        }
     }
 
     // ── Orchestrator helpers (no provider needed) ───────────────────────
@@ -4007,135 +4116,162 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_apply_annotations_contradicts_appends_and_links() {
-        // A contradicting claim is never deduped away: it is appended AND
-        // linked to the existing claim so the verification gate targets both
-        // sides of the dispute.
-        let mut m = annotations_matrix(
-            claim("alpha costs $100 in 2024", "u1", "medium"),
-            claim("alpha costs $200 in 2024", "u2", "high"),
-            "contradicts",
-            Some("price differs: $200 vs $100"),
-            "confirm",
-        );
-        let novel = m.acc.apply_annotations(&m.pass, &m.pending, &m.confirm);
-        assert_eq!(novel, 1, "a contradicting claim is new evidence");
-        assert_eq!(
-            m.acc.claims.len(),
-            2,
-            "the contradiction is preserved, never merged away"
-        );
-        assert_eq!(
-            m.acc.claims[0].contradictions,
-            vec!["price differs: $200 vs $100"],
-            "the existing claim carries the contradiction note — the verification gate fires"
-        );
-        assert!(
-            m.acc.claims[1]
-                .contradictions
-                .contains(&"alpha costs $100 in 2024".to_string()),
-            "the new claim links back to the existing one"
-        );
+    /// One verdict × confirm matrix scenario: the two claims, the annotation
+    /// verdicts, and everything the applied result must show.
+    struct AnnotationsCase {
+        name: &'static str,
+        existing: Claim,
+        pending: Claim,
+        verdict: &'static str,
+        contradiction: Option<&'static str>,
+        confirm: &'static str,
+        novel: usize,
+        claims_len: usize,
+        existing_contradictions: &'static [&'static str],
+        links_back_to: Option<&'static str>,
+        weak_duplicates: &'static [(usize, usize)],
+        weak_contradictions: &'static [(usize, usize)],
+        merged_confidence: Option<&'static str>,
+        merged_source: Option<&'static str>,
     }
 
+    #[expect(clippy::too_many_lines)]
     #[test]
-    fn test_apply_annotations_merges_sources_and_upgrades_confidence() {
-        // A duplicate merges into the existing claim: confidence upgraded,
-        // sources joined deduplicated — including multi-source '; ' joins on
-        // both sides (duplicate entries must never appear in the merged list).
-        let mut m = annotations_matrix(
-            claim("alpha is true", "u1; u2", "low"),
-            claim("alpha is true", "u2; u3", "high"),
-            "duplicate",
-            None,
-            "confirm",
-        );
-        let novel = m.acc.apply_annotations(&m.pass, &m.pending, &m.confirm);
-        assert_eq!(novel, 0, "a duplicate is never counted as novel");
-        assert_eq!(
-            m.acc.claims.len(),
-            1,
-            "a duplicate is never dropped — it merges into the existing claim"
-        );
-        let c = &m.acc.claims[0];
-        assert_eq!(
-            c.confidence, "high",
-            "a higher-confidence re-statement upgrades the merged claim"
-        );
-        assert_eq!(
-            c.source, "u1; u2; u3",
-            "sources merge across rounds without duplicates"
-        );
-    }
-
-    #[test]
-    fn test_apply_annotations_weak_duplicate_stays_standalone() {
-        // A weak duplicate (confirm pass rejected / unclear / failed) is never
-        // merged and never counts as novel: it stays standalone with a hint in
-        // the side structure — "keep weak, clarify later".
-        let mut m = annotations_matrix(
-            claim("alpha is true", "u1", "medium"),
-            claim("alpha is true (restated)", "u2", "high"),
-            "duplicate",
-            None,
-            "reject",
-        );
-        let novel = m.acc.apply_annotations(&m.pass, &m.pending, &m.confirm);
-        assert_eq!(novel, 0, "a weak duplicate is never counted as novel");
-        assert_eq!(
-            m.acc.claims.len(),
-            2,
-            "the weak duplicate stays standalone — never merged"
-        );
-        assert_eq!(
-            m.acc.weak.duplicates,
-            vec![(1, 0)],
-            "the suspected relation is recorded in the side structure"
-        );
-        assert!(
-            m.acc.weak.contradictions.is_empty(),
-            "only duplicate hints apply here"
-        );
-    }
-
-    #[test]
-    fn test_apply_annotations_weak_contradiction_keeps_notes_marks_unconfirmed() {
-        // A weak contradiction keeps the bidirectional notes (both sides
-        // qualify for the verification gate) but records the unconfirmed
-        // relation in the side structure — never in the note text.
-        let mut m = annotations_matrix(
-            claim("alpha costs $100 in 2024", "u1", "medium"),
-            claim("alpha costs $200 in 2024", "u2", "high"),
-            "contradicts",
-            Some("price differs: $200 vs $100"),
-            "reject",
-        );
-        let novel = m.acc.apply_annotations(&m.pass, &m.pending, &m.confirm);
-        assert_eq!(novel, 1, "a contradiction is new evidence even when weak");
-        assert_eq!(
-            m.acc.claims[0].contradictions,
-            vec!["price differs: $200 vs $100"],
-            "the existing claim keeps its contradiction note"
-        );
-        assert!(
-            m.acc.claims[1]
-                .contradictions
-                .contains(&"alpha costs $100 in 2024".to_string()),
-            "the new claim links back to the existing one"
-        );
-        assert_eq!(
-            m.acc.weak.contradictions,
-            vec![(1, 0)],
-            "the unconfirmed relation lives in the side structure"
-        );
-        assert!(
-            m.acc
-                .claims
+    fn apply_annotations_cases() {
+        for case in [
+            AnnotationsCase {
+                name: "a contradiction is appended and linked to the existing claim",
+                existing: claim("alpha costs $100 in 2024", "u1", "medium"),
+                pending: claim("alpha costs $200 in 2024", "u2", "high"),
+                verdict: "contradicts",
+                contradiction: Some("price differs: $200 vs $100"),
+                confirm: "confirm",
+                // A contradicting claim is new evidence, never deduped away.
+                novel: 1,
+                claims_len: 2,
+                existing_contradictions: &["price differs: $200 vs $100"],
+                links_back_to: Some("alpha costs $100 in 2024"),
+                weak_duplicates: &[],
+                weak_contradictions: &[],
+                merged_confidence: None,
+                merged_source: None,
+            },
+            AnnotationsCase {
+                name: "a duplicate merges sources and upgrades confidence",
+                existing: claim("alpha is true", "u1; u2", "low"),
+                pending: claim("alpha is true", "u2; u3", "high"),
+                verdict: "duplicate",
+                contradiction: None,
+                confirm: "confirm",
+                novel: 0,
+                claims_len: 1,
+                existing_contradictions: &[],
+                links_back_to: None,
+                weak_duplicates: &[],
+                weak_contradictions: &[],
+                merged_confidence: Some("high"),
+                merged_source: Some("u1; u2; u3"),
+            },
+            AnnotationsCase {
+                name: "a weak duplicate stays standalone with a side-structure hint",
+                existing: claim("alpha is true", "u1", "medium"),
+                pending: claim("alpha is true (restated)", "u2", "high"),
+                verdict: "duplicate",
+                contradiction: None,
+                confirm: "reject",
+                novel: 0,
+                claims_len: 2,
+                existing_contradictions: &[],
+                links_back_to: None,
+                weak_duplicates: &[(1, 0)],
+                weak_contradictions: &[],
+                merged_confidence: None,
+                merged_source: None,
+            },
+            AnnotationsCase {
+                name: "a weak contradiction keeps both notes and is recorded unconfirmed",
+                existing: claim("alpha costs $100 in 2024", "u1", "medium"),
+                pending: claim("alpha costs $200 in 2024", "u2", "high"),
+                verdict: "contradicts",
+                contradiction: Some("price differs: $200 vs $100"),
+                confirm: "reject",
+                novel: 1,
+                claims_len: 2,
+                existing_contradictions: &["price differs: $200 vs $100"],
+                links_back_to: Some("alpha costs $100 in 2024"),
+                weak_duplicates: &[],
+                weak_contradictions: &[(1, 0)],
+                merged_confidence: None,
+                merged_source: None,
+            },
+        ] {
+            let mut m = annotations_matrix(
+                case.existing,
+                case.pending,
+                case.verdict,
+                case.contradiction,
+                case.confirm,
+            );
+            let novel = m.acc.apply_annotations(&m.pass, &m.pending, &m.confirm);
+            assert_eq!(novel, case.novel, "[{}] novel count", case.name);
+            assert_eq!(
+                m.acc.claims.len(),
+                case.claims_len,
+                "[{}] claim count",
+                case.name
+            );
+            let expected_notes: Vec<String> = case
+                .existing_contradictions
                 .iter()
-                .all(|c| c.contradictions.iter().all(|n| !n.contains("unconfirmed"))),
-            "weakness never leaks into note text"
-        );
+                .map(|note| (*note).to_string())
+                .collect();
+            assert_eq!(
+                m.acc.claims[0].contradictions, expected_notes,
+                "[{}] the existing claim's notes",
+                case.name
+            );
+            if let Some(existing) = case.links_back_to {
+                assert!(
+                    m.acc.claims[1]
+                        .contradictions
+                        .contains(&existing.to_string()),
+                    "[{}] the new claim must link back to the existing one",
+                    case.name
+                );
+            }
+            assert_eq!(
+                m.acc.weak.duplicates, case.weak_duplicates,
+                "[{}] weak duplicates",
+                case.name
+            );
+            assert_eq!(
+                m.acc.weak.contradictions, case.weak_contradictions,
+                "[{}] weak contradictions",
+                case.name
+            );
+            if let Some(confidence) = case.merged_confidence {
+                assert_eq!(
+                    m.acc.claims[0].confidence, confidence,
+                    "[{}] merged confidence",
+                    case.name
+                );
+            }
+            if let Some(source) = case.merged_source {
+                assert_eq!(
+                    m.acc.claims[0].source, source,
+                    "[{}] merged sources",
+                    case.name
+                );
+            }
+            assert!(
+                m.acc
+                    .claims
+                    .iter()
+                    .all(|c| c.contradictions.iter().all(|n| !n.contains("unconfirmed"))),
+                "[{}] weakness never leaks into note text",
+                case.name
+            );
+        }
     }
 
     #[test]
@@ -4177,65 +4313,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
-    async fn test_annotate_round_confirm_failure_fail_open() {
-        // End-to-end fail-open: the annotation pass succeeds, the confirm pass
-        // fails entirely (transport) — every mutating verdict becomes weak
-        // with the CONFIRM_FAILED marker; claims are never dropped, never
-        // all-novel fallback.
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        let ws = crate::workspace::test_ws_named("/tmp/test_ws", "research_annotate_fail_open");
-        let mut acc = AccumulatedEvidence::default();
-        acc.claims.push(claim("alpha is true", "u1", "medium"));
-        let pending = vec![
-            claim("alpha is true (restated)", "u2", "high"),
-            claim("beta contradicts alpha", "u3", "high"),
-        ];
-        // Script: annotation pass OK (pending 0 = duplicate, pending 1 =
-        // contradicts), then the confirm pass hits only transport failures.
-        let annotation_json = r#"{"annotations": [{"new_id": 0, "verdict": "duplicate", "existing_id": 0}, {"new_id": 1, "verdict": "contradicts", "existing_id": 0, "contradiction": "alpha vs beta differ"}]}"#;
-        let fake = crate::util::test::FakeProvider::new()
-            .ok(annotation_json)
-            .err(crate::retry::FailureClass::Transport, "confirm outage")
-            .err(crate::retry::FailureClass::Transport, "confirm outage")
-            .err(crate::retry::FailureClass::Transport, "confirm outage");
-        let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
-        let _provider_guard = crate::util::test::install_fake_provider(provider);
-        let mut markers = Vec::new();
-        let novel = annotate_round(
-            &ws,
-            &mut acc,
-            &pending,
-            &mut markers,
-            "test_run",
-            "question",
-        )
-        .await;
-        assert_eq!(
-            novel, 1,
-            "only the weak contradiction counts as novel — the weak duplicate never does"
-        );
-        assert_eq!(
-            acc.claims.len(),
-            3,
-            "both mutating claims stay standalone — never dropped"
-        );
-        assert_eq!(acc.weak.duplicates, vec![(1, 0)]);
-        assert_eq!(acc.weak.contradictions, vec![(2, 0)]);
-        assert!(
-            acc.claims[0]
-                .contradictions
-                .contains(&"alpha vs beta differ".to_string()),
-            "the weak contradiction keeps its note — verification still qualifies it"
-        );
-        assert!(
-            markers.iter().any(|m| m.contains("confirmation failed")),
-            "the confirm failure is never silent: {markers:?}"
-        );
-    }
-
     #[test]
     fn test_resolve_round_members_with_timeouts_preserves_timed_out() {
         // The TimedOut distinction survives until the wrap-up stage: only
@@ -4258,14 +4335,14 @@ mod tests {
         assert!(runs.iter().all(|r| matches!(r, AnalystRun::NoResponse)));
         assert_eq!(timed_out.len(), 1, "only the TimedOut member is recovered");
         assert_eq!(timed_out[0].agent_id, "a1", "snapshot is index-parallel");
-    }
 
-    #[test]
-    fn test_render_recovered_findings_section_is_separate_and_marked() {
-        // The empty set renders nothing (boot path), and recovered findings
-        // render in their own English-marked section — never merged into the
-        // evidence list.
-        assert_eq!(render_recovered_findings(&[]), "");
+        // An empty set renders nothing, and recovered findings get their own
+        // section marked unverified — never merged into the evidence list.
+        assert_eq!(
+            render_recovered_findings(&[]),
+            "",
+            "an empty set renders nothing"
+        );
         let recovered = vec![AnalystFindings {
             claims: vec![Claim {
                 claim: "found claim".into(),
@@ -4277,13 +4354,26 @@ mod tests {
         }];
         let out = render_recovered_findings(&recovered);
         assert!(
-            out.contains("## Recovered from timed-out analysts"),
-            "{out}"
+            out.starts_with("\n## Recovered from timed-out analysts"),
+            "recovered findings get their own section: {out}"
         );
-        assert!(out.contains("deadline exceeded, unverified"), "{out}");
-        assert!(out.contains("found claim"), "{out}");
-        assert!(out.contains("contradictions: counter"), "{out}");
-        assert!(out.contains("still open"), "{out}");
+        assert!(
+            !out.contains("### Evidence Gathered So Far"),
+            "never merged into the evidence list: {out}"
+        );
+        assert!(
+            out.contains("deadline exceeded, unverified"),
+            "the section is marked unverified: {out}"
+        );
+        assert!(out.contains("found claim"), "the claim is carried: {out}");
+        assert!(
+            out.contains("contradictions: counter"),
+            "the contradiction is carried: {out}"
+        );
+        assert!(
+            out.contains("still open"),
+            "the unanswered question is carried: {out}"
+        );
     }
 
     #[test]

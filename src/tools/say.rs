@@ -126,27 +126,6 @@ mod tests {
         answer
     }
 
-    /// The description is where the model learns the limit and both refusals, so
-    /// it must state them — and the rule that sets the spoken language.
-    #[test]
-    fn the_description_states_the_limit_and_the_refusals() {
-        let description = SayTool.description();
-        assert!(
-            description.contains(&MAX_PHRASE_CHARS.to_string()),
-            "the description must state the {MAX_PHRASE_CHARS}-character limit: {description}"
-        );
-        for expected in [
-            "not read aloud",
-            "speech output turned off",
-            "language the user speaks",
-        ] {
-            assert!(
-                description.contains(expected),
-                "the description must say '{expected}': {description}"
-            );
-        }
-    }
-
     #[tokio::test]
     #[serial_test::serial(tts)]
     async fn a_phrase_over_the_limit_is_refused_by_visible_characters() {

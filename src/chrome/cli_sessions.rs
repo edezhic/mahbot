@@ -520,40 +520,67 @@ mod tests {
         assert_eq!(due_for_close(&records, LIFETIME_MS - 1), None);
     }
 
+    /// A call's mark is set by the call that creates the session and guards it while it runs.
     #[test]
-    fn a_marked_session_is_never_due_while_its_call_runs() {
-        let mut records = Records::new();
-        let mut busy = record(0, false);
-        // This process is the one running "the call", so the mark is live.
-        busy.in_flight = vec![InFlight::new(0)];
-        records.insert("mahbot-chrome-busy".to_string(), busy);
-        assert_eq!(due_for_close(&records, LIFETIME_MS), None);
+    fn a_call_mark_is_set_at_creation_and_guards_the_session_while_it_runs() {
+        {
+            let case = "a marked session is never due while its call runs";
+            let mut records = Records::new();
+            let mut busy = record(0, false);
+            // This process is the one running "the call", so the mark is live.
+            busy.in_flight = vec![InFlight::new(0)];
+            records.insert("mahbot-chrome-busy".to_string(), busy);
+            assert_eq!(
+                due_for_close(&records, LIFETIME_MS),
+                None,
+                "case {case}: a live mark keeps the session, however old it is"
+            );
 
-        // A mark past its own deadline is stale whatever the process table says.
-        let mut expired = record(0, false);
-        expired.in_flight = vec![InFlight {
-            pid: std::process::id(),
-            until_ms: 1,
-        }];
-        records.insert("mahbot-chrome-expired".to_string(), expired);
-        assert_eq!(
-            due_for_close(&records, LIFETIME_MS).as_deref(),
-            Some("mahbot-chrome-expired")
-        );
-    }
+            // A mark past its own deadline is stale whatever the process table says.
+            let mut expired = record(0, false);
+            expired.in_flight = vec![InFlight {
+                pid: std::process::id(),
+                until_ms: 1,
+            }];
+            records.insert("mahbot-chrome-expired".to_string(), expired);
+            assert_eq!(
+                due_for_close(&records, LIFETIME_MS).as_deref(),
+                Some("mahbot-chrome-expired"),
+                "case {case}: an expired mark is stale whatever the process table says"
+            );
+        }
 
-    #[test]
-    fn the_mark_is_set_only_by_the_call_that_creates_the_session() {
-        let mut records = Records::new();
-        let created = apply_use(&mut records, "mahbot-chrome-a", true, 10).unwrap();
-        assert!(created.created && created.marked && created.kept);
-        let later = apply_use(&mut records, "mahbot-chrome-a", false, 20).unwrap();
-        assert!(!later.marked && later.kept);
-        assert_eq!(records["mahbot-chrome-a"].last_used_ms, 20);
+        {
+            let case = "the mark is set only by the call that creates the session";
+            let mut records = Records::new();
+            let created = apply_use(&mut records, "mahbot-chrome-a", true, 10).unwrap();
+            assert!(
+                created.created && created.marked && created.kept,
+                "case {case}: the call that creates a session marks and keeps it"
+            );
+            let later = apply_use(&mut records, "mahbot-chrome-a", false, 20).unwrap();
+            assert!(
+                !later.marked && later.kept,
+                "case {case}: a later call neither re-marks nor un-keeps the session"
+            );
+            assert_eq!(
+                records["mahbot-chrome-a"].last_used_ms, 20,
+                "case {case}: a later call still refreshes the use"
+            );
 
-        let plain = apply_use(&mut records, "mahbot-chrome-b", false, 30).unwrap();
-        assert!(!plain.marked && !plain.kept);
-        assert!(apply_use(&mut records, "mahbot-chrome-b", true, 40).is_err());
-        assert!(apply_use(&mut records, "mahbot-chrome-a", true, 50).is_ok());
+            let plain = apply_use(&mut records, "mahbot-chrome-b", false, 30).unwrap();
+            assert!(
+                !plain.marked && !plain.kept,
+                "case {case}: a call that creates no session marks none"
+            );
+            assert!(
+                apply_use(&mut records, "mahbot-chrome-b", true, 40).is_err(),
+                "case {case}: only the call that created a session may mark it"
+            );
+            assert!(
+                apply_use(&mut records, "mahbot-chrome-a", true, 50).is_ok(),
+                "case {case}: the creating call may mark its own session again"
+            );
+        }
     }
 }

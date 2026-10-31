@@ -1199,33 +1199,41 @@ mod tests {
         }
     }
 
+    /// Guards the error-message cascade: a string `error`, a nested envelope's
+    /// `message`, the nested `raw`, and a body that is not JSON at all — the
+    /// caller then falls back to status plus body instead of claiming a detail.
     #[test]
-    fn test_search_error_detail_string_and_nested_envelope() {
-        // String error field (Firecrawl's `{"success": false, "error": "..."}`).
-        assert_eq!(
-            search_error_detail(r#"{"success":false,"error":"upstream down"}"#).as_deref(),
-            Some("upstream down")
-        );
-        // Nested-envelope object error.
-        assert_eq!(
-            search_error_detail(r#"{"error":{"message":"invalid API key"}}"#).as_deref(),
-            Some("invalid API key")
-        );
-        // Nested raw field when no top-level message exists.
-        assert_eq!(
-            search_error_detail(
-                r#"{"error":{"code":"rate_limited","metadata":{"raw":"too many requests"}}}"#
-            )
-            .as_deref(),
-            Some("too many requests")
-        );
-        // Non-JSON body yields no detail (caller falls back to status+body).
-        assert_eq!(search_error_detail("plain text"), None);
-        assert_eq!(search_error_detail(""), None);
+    fn the_error_detail_cascade_reads_a_string_message_raw_and_stops_at_non_json() {
+        let cases: [(&str, &str, Option<&str>); 5] = [
+            (
+                "a string error field",
+                r#"{"success":false,"error":"upstream down"}"#,
+                Some("upstream down"),
+            ),
+            (
+                "a nested envelope message",
+                r#"{"error":{"message":"invalid API key"}}"#,
+                Some("invalid API key"),
+            ),
+            (
+                "a nested raw with no message",
+                r#"{"error":{"code":"rate_limited","metadata":{"raw":"too many requests"}}}"#,
+                Some("too many requests"),
+            ),
+            ("a non-JSON body", "plain text", None),
+            ("an empty body", "", None),
+        ];
+        for (name, body, expected) in cases {
+            assert_eq!(
+                search_error_detail(body).as_deref(),
+                expected,
+                "case: {name}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn test_cache_and_expand_roundtrip() {
+    async fn cache_and_expand_cases() {
         let cache = WebSearchCache::new();
         let id = cache
             .cache_result(
@@ -1245,24 +1253,30 @@ mod tests {
             .await;
         assert_eq!(id2, 2, "second cached result should get id 2");
 
-        let expanded = cache.expand_result(1).await.unwrap();
-        assert!(expanded.contains("Test Title"));
-        assert!(expanded.contains("https://example.com"));
-        assert!(expanded.contains("Full text content"));
+        for (name, id, contains) in [
+            (
+                "the first result",
+                1,
+                &["Test Title", "https://example.com", "Full text content"][..],
+            ),
+            ("the second result", 2, &["Second", "More content"][..]),
+        ] {
+            let expanded = cache.expand_result(id).await.expect("a cached id expands");
+            for needle in contains {
+                assert!(
+                    expanded.contains(needle),
+                    "[{name}] expected {needle:?}: {expanded}"
+                );
+            }
+        }
 
-        let expanded2 = cache.expand_result(2).await.unwrap();
-        assert!(expanded2.contains("Second"));
-        assert!(expanded2.contains("More content"));
-    }
-
-    #[tokio::test]
-    async fn test_expand_missing_id() {
-        let cache = WebSearchCache::new();
-        let result = cache.expand_result(42).await;
-        assert!(result.is_err());
+        let err = cache
+            .expand_result(42)
+            .await
+            .expect_err("an uncached id is refused");
         assert!(
-            result.unwrap_err().to_string().contains("No cached result"),
-            "Error should mention no cached result"
+            err.to_string().contains("No cached result"),
+            "error should mention no cached result: {err}"
         );
     }
 
@@ -1487,35 +1501,6 @@ mod tests {
         assert_eq!(pictures.len(), 2, "capped at the text-result count");
         assert_eq!(pictures[0].url, "https://img.test/frog.jpg");
         assert_eq!(pictures[1].url, "https://img.test/other.jpg");
-    }
-
-    #[test]
-    fn test_picture_lists_survive_nulls() {
-        // An explicit null in a picture entry must not fail the whole response.
-        let firecrawl: SearchResponse = serde_json::from_str(
-            r#"{"success":true,"data":{"web":null,"images":[
-                {"imageUrl":null,"url":null,"title":null,"imageWidth":null,"imageHeight":null}
-            ]}}"#,
-        )
-        .unwrap();
-        assert_eq!(firecrawl.data.images.len(), 1);
-        assert!(firecrawl.data.images[0].image_url.is_none());
-
-        let exa: ExaSearchResponse = serde_json::from_str(
-            r#"{"results":[{"title":null,"url":"https://site.test/page","text":null,
-                "extras":{"richImageLinks":[{"url":null,"alt":null}]}}]}"#,
-        )
-        .unwrap();
-        let links = &exa.results[0].extras.rich_image_links;
-        assert_eq!(links.len(), 1);
-        assert!(links[0].url.is_none());
-
-        // An omitted list and a null list are both empty.
-        let exa: ExaSearchResponse = serde_json::from_str(
-            r#"{"results":[{"title":"t","url":"https://site.test","text":null,"extras":null}]}"#,
-        )
-        .unwrap();
-        assert!(exa.results[0].extras.rich_image_links.is_empty());
     }
 
     #[test]

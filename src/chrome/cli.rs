@@ -3948,22 +3948,36 @@ mod tests {
         assert_eq!(eval_result(&resp(bare.clone())), Some(&bare));
     }
 
+    /// A bare session name is prefixed exactly once, and no name at all yields
+    /// an ephemeral CLI-namespaced session.
     #[test]
-    fn resolve_session_named_prefixing_is_idempotent() {
-        let (name, ephemeral) = resolve_session(Some("foo"));
-        assert_eq!(name, "mahbot-chrome-foo");
-        assert!(!ephemeral);
+    fn resolve_session_prefixes_a_bare_name_once() {
+        {
+            let case = "resolve session named prefixing is idempotent";
+            let (name, ephemeral) = resolve_session(Some("foo"));
+            assert_eq!(
+                name, "mahbot-chrome-foo",
+                "case {case}: a bare name gains the namespace"
+            );
+            assert!(!ephemeral, "case {case}: a named session is not ephemeral");
 
-        let (name, ephemeral) = resolve_session(Some("mahbot-chrome-foo"));
-        assert_eq!(name, "mahbot-chrome-foo");
-        assert!(!ephemeral);
-    }
+            let (name, ephemeral) = resolve_session(Some("mahbot-chrome-foo"));
+            assert_eq!(
+                name, "mahbot-chrome-foo",
+                "case {case}: an already-prefixed name is left alone"
+            );
+            assert!(!ephemeral, "case {case}: a named session is not ephemeral");
+        }
 
-    #[test]
-    fn resolve_session_ephemeral_uses_cli_prefix() {
-        let (name, ephemeral) = resolve_session(None);
-        assert!(name.starts_with(CLI_EPHEMERAL_PREFIX));
-        assert!(ephemeral);
+        {
+            let case = "resolve session ephemeral uses cli prefix";
+            let (name, ephemeral) = resolve_session(None);
+            assert!(
+                name.starts_with(CLI_EPHEMERAL_PREFIX),
+                "case {case}: no name yields the CLI's ephemeral prefix: {name}"
+            );
+            assert!(ephemeral, "case {case}: it is ephemeral");
+        }
     }
 
     /// The alphabet is chrome-use's own for `session stop`
@@ -4121,188 +4135,112 @@ mod tests {
         assert_eq!(resolve_session_target("link-enricher-7"), "link-enricher-7");
     }
 
+    /// The session subcommands parse into their own actions and reject what is not theirs.
     #[test]
-    fn session_status_parses_and_rejects() {
-        // status parses into SessionStatus.
-        let inv = parse_action(&["session".into(), "status".into(), "docs".into()])
-            .expect("session status parses");
-        match inv.action {
-            Action::SessionStatus { name } => assert_eq!(name, "docs"),
-            _ => panic!("expected SessionStatus"),
-        }
+    fn session_parsing_accepts_its_shapes_and_rejects_the_rest() {
+        {
+            let case = "session status parses and rejects";
+            // status parses into SessionStatus.
+            let inv = parse_action(&["session".into(), "status".into(), "docs".into()])
+                .expect("session status parses");
+            match inv.action {
+                Action::SessionStatus { name } => {
+                    assert_eq!(name, "docs", "case {case}: the name is the positional");
+                }
+                _ => panic!("case {case}: expected SessionStatus"),
+            }
 
-        // The global --session flag is rejected for session subcommands.
-        let err = parse_action(&[
-            "session".into(),
-            "status".into(),
-            "docs".into(),
-            "--session".into(),
-            "x".into(),
-        ])
-        .err()
-        .expect("--session must be rejected for session subcommands");
-        assert_eq!(err, "--session is not valid for session stop/status/list");
-
-        // `--force` is `stop`'s flag alone (the declaration the parser reads): the other
-        // subcommands accept no flags.
-        let allowed: Vec<&CliFlag> = declared_flags("session").iter().collect();
-        let err = parse_session(
-            &["status".into(), "docs".into(), "--force".into()],
-            &allowed,
-        )
-        .err()
-        .expect("--force must be rejected for session status");
-        assert_eq!(err, "unknown flag --force");
-
-        // Extra positionals are rejected for status.
-        assert!(parse_session(&["status".into(), "a".into(), "b".into()], &allowed).is_err());
-
-        // An unknown sub names both verbs.
-        let err = parse_action(&["session".into(), "destroy".into(), "docs".into()])
+            // The global --session flag is rejected for session subcommands.
+            let err = parse_action(&[
+                "session".into(),
+                "status".into(),
+                "docs".into(),
+                "--session".into(),
+                "x".into(),
+            ])
             .err()
-            .expect("unknown sub must be rejected");
-        assert!(
-            err.contains(
-                "unknown session subcommand 'destroy' (expected 'stop', 'status' or 'list')"
-            ),
-            "unexpected error: {err}"
-        );
-    }
+            .expect("--session must be rejected for session subcommands");
+            assert_eq!(
+                err, "--session is not valid for session stop/status/list",
+                "case {case}: --session is not a session subcommand's flag"
+            );
 
-    #[test]
-    fn session_listed_handles_both_shapes() {
-        // Latest shape: the top-level `sessions` array of objects (lands in
-        // `extra`), listed by name.
-        let latest: ChromeResponse = serde_json::from_value(json!({
-            "ok": true, "sessions": [{ "name": "mahbot-chrome-docs" }]
-        }))
-        .expect("deserialize latest shape");
-        assert!(session_listed(&latest, "mahbot-chrome-docs"));
-        assert!(!session_listed(&latest, "mahbot-chrome-other"));
+            // `--force` is `stop`'s flag alone (the declaration the parser reads): the other
+            // subcommands accept no flags.
+            let allowed: Vec<&CliFlag> = declared_flags("session").iter().collect();
+            let err = parse_session(
+                &["status".into(), "docs".into(), "--force".into()],
+                &allowed,
+            )
+            .err()
+            .expect("--force must be rejected for session status");
+            assert_eq!(
+                err, "unknown flag --force",
+                "case {case}: --force belongs to stop alone"
+            );
 
-        // Legacy shape: `data.sessions` array of strings.
-        let legacy: ChromeResponse = serde_json::from_value(json!({
-            "success": true, "data": { "sessions": ["mahbot-chrome-docs"] }
-        }))
-        .expect("deserialize legacy shape");
-        assert!(session_listed(&legacy, "mahbot-chrome-docs"));
+            // Extra positionals are rejected for status.
+            assert!(
+                parse_session(&["status".into(), "a".into(), "b".into()], &allowed).is_err(),
+                "case {case}: status takes one name"
+            );
 
-        // An explicit failure verdict rules the target out.
-        let failed: ChromeResponse =
-            serde_json::from_value(json!({ "success": false })).expect("deserialize failure");
-        assert!(!session_listed(&failed, "mahbot-chrome-docs"));
-
-        // No sessions key at all → not listed.
-        let no_sessions: ChromeResponse =
-            serde_json::from_value(json!({ "success": true, "data": {} }))
-                .expect("deserialize empty payload");
-        assert!(!session_listed(&no_sessions, "mahbot-chrome-docs"));
-    }
-
-    #[test]
-    fn protected_stop_note_targets_only_protected_wedges() {
-        // A wedge-shaped failure on a protected target gets the note — with
-        // the full actionable command, so no stitching with the shared hint.
-        let mut msg = "session unresponsive: no response within 45s".to_string();
-        append_protected_stop_note(&mut msg, "agent-tab-1");
-        assert!(
-            msg.ends_with("(protected namespace: stopping 'agent-tab-1' requires `session stop agent-tab-1 --force`)"),
-            "note missing: {msg}"
-        );
-
-        // An ordinary session's stop needs no --force — no note.
-        let mut msg = "session unresponsive: no response within 45s".to_string();
-        append_protected_stop_note(&mut msg, "mahbot-chrome-docs");
-        assert_eq!(msg, "session unresponsive: no response within 45s");
-
-        // A non-wedge failure on a protected target keeps its honest cause.
-        let mut msg = "element not found".to_string();
-        append_protected_stop_note(&mut msg, "agent-tab-1");
-        assert_eq!(msg, "element not found");
-    }
-
-    #[test]
-    fn envelope_layers_accurate_remediation() {
-        // The envelope itself does not carry the session-wedge text — that is
-        // applied after dispatch, where the session name is known (see
-        // `recover_session_wedge`). A wedge message passes through untouched.
-        let env = StepFailure {
-            kind: OutKind::Environment,
-            message: "session unresponsive: no response within 45s".to_string(),
+            // An unknown sub names both verbs.
+            let err = parse_action(&["session".into(), "destroy".into(), "docs".into()])
+                .err()
+                .expect("unknown sub must be rejected");
+            assert!(
+                err.contains(
+                    "unknown session subcommand 'destroy' (expected 'stop', 'status' or 'list')"
+                ),
+                "case {case}: unexpected error: {err}"
+            );
         }
-        .envelope(
-            "session",
-            json!({ "session": "mahbot-chrome-docs" }),
-            StepClocks::probe(SESSION_STOP_TIMEOUT),
-        );
-        assert_eq!(
-            env.payload.get("error").and_then(Value::as_str),
-            Some("session unresponsive: no response within 45s")
-        );
 
-        // A non-wedge message is returned untouched too.
-        let env = StepFailure {
-            kind: OutKind::Environment,
-            message: "relay isn't connected".to_string(),
-        }
-        .envelope(
-            "session",
-            json!({ "session": "mahbot-chrome-docs" }),
-            StepClocks::probe(SESSION_STOP_TIMEOUT),
-        );
-        assert_eq!(
-            env.payload.get("error").and_then(Value::as_str),
-            Some("relay isn't connected")
-        );
+        {
+            let case = "session listed handles both shapes";
+            // Latest shape: the top-level `sessions` array of objects (lands in
+            // `extra`), listed by name.
+            let latest: ChromeResponse = serde_json::from_value(json!({
+                "ok": true, "sessions": [{ "name": "mahbot-chrome-docs" }]
+            }))
+            .expect("deserialize latest shape");
+            assert!(
+                session_listed(&latest, "mahbot-chrome-docs"),
+                "case {case}: the latest shape lists the session"
+            );
+            assert!(
+                !session_listed(&latest, "mahbot-chrome-other"),
+                "case {case}: a name it does not carry is not listed"
+            );
 
-        // An orphaned-tab error still picks up its unreachable-tab guidance here:
-        // it is the one remediation the envelope owns, because it is the one state
-        // nothing recovers (the tab itself is the product's to close, never the
-        // agent's to touch).
-        let env = StepFailure {
-            kind: OutKind::Environment,
-            message: "the tab this session was driving can no longer be resolved".to_string(),
-        }
-        .envelope(
-            "open",
-            json!({ "url": "https://x" }),
-            StepClocks::operation(),
-        );
-        let err = env
-            .payload
-            .get("error")
-            .and_then(Value::as_str)
-            .expect("error present");
-        assert!(
-            err.contains("the product closes a session's tabs itself"),
-            "got: {err}"
-        );
+            // Legacy shape: `data.sessions` array of strings.
+            let legacy: ChromeResponse = serde_json::from_value(json!({
+                "success": true, "data": { "sessions": ["mahbot-chrome-docs"] }
+            }))
+            .expect("deserialize legacy shape");
+            assert!(
+                session_listed(&legacy, "mahbot-chrome-docs"),
+                "case {case}: the legacy shape lists the session too"
+            );
 
-        // A Timeout deadline kill of a product probe reports the probe's own
-        // bound, and says it is a product-side bound rather than chrome-use's
-        // verdict.
-        let clocks = StepClocks::probe(SESSION_PROBE_TIMEOUT);
-        let env = StepFailure {
-            kind: OutKind::Timeout,
-            message: String::new(),
+            // An explicit failure verdict rules the target out.
+            let failed: ChromeResponse =
+                serde_json::from_value(json!({ "success": false })).expect("deserialize failure");
+            assert!(
+                !session_listed(&failed, "mahbot-chrome-docs"),
+                "case {case}: a failure verdict rules the target out"
+            );
+
+            // No sessions key at all → not listed.
+            let no_sessions: ChromeResponse =
+                serde_json::from_value(json!({ "success": true, "data": {} }))
+                    .expect("deserialize empty payload");
+            assert!(
+                !session_listed(&no_sessions, "mahbot-chrome-docs"),
+                "case {case}: no sessions key lists nothing"
+            );
         }
-        .envelope(
-            "session",
-            json!({ "session": "mahbot-chrome-docs" }),
-            clocks,
-        );
-        let expected = deadline_error(
-            clocks.call.chrome_side,
-            clocks.call.kill,
-            "the step did not complete",
-        );
-        assert_eq!(
-            env.payload.get("error").and_then(Value::as_str),
-            Some(expected.as_str())
-        );
-        assert_eq!(env.payload["timeout_ms"], 20_000);
-        assert!(expected.contains("the product's own bound for the step"));
-        assert!(!expected.contains("rode above"));
     }
 
     #[test]
@@ -4377,303 +4315,315 @@ mod tests {
         assert_eq!(env.payload["error"], "condition not met");
     }
 
+    /// The spawn-level classification, case by case: the envelope decides over the
+    /// exit code (a failed expect assertion arrives as `success:true` with exit 1
+    /// and its verdict in `data`), a browser chrome-use launched itself is never a
+    /// success, an unparseable or truncated answer names itself, and the canned
+    /// stale-relay hint is stripped from Timeout-classified text only.
+    #[expect(clippy::too_many_lines)]
     #[test]
-    fn wedge_recovery_note_reports_what_was_done_or_the_manual_flow() {
-        // The automatic recovery stopped the session: its own summary, and no
-        // manual flow.
-        let stopped = wedge_recovery_note(SessionRecovery::Stopped);
-        assert_eq!(stopped, SessionRecovery::Stopped.summary());
-        assert!(!stopped.contains("recover with"), "got: {stopped}");
-        // The stop was issued but never confirmed, or could not be started: the
-        // summary itself carries that, and the manual flow is named — the only
-        // place it is.
-        for recovery in [SessionRecovery::Unanswered, SessionRecovery::NotStarted] {
-            let note = wedge_recovery_note(recovery);
-            assert!(note.starts_with(recovery.summary()), "got: {note}");
-            assert!(note.contains(SESSION_RECOVERY_FLOW), "got: {note}");
-            assert!(!note.contains("could not run"), "got: {note}");
+    fn classify_step_output_decides_from_the_envelope_and_sanitises() {
+        /// What a case's outcome must be.
+        enum Want {
+            /// Any success.
+            Ok,
+            /// The expect verdict read back out of the returned data.
+            Verdict {
+                pass: bool,
+                timed_out: bool,
+                actual: Option<Value>,
+            },
+            /// A failure with this kind and message.
+            Fail(OutKind, String),
+            /// A failure of this kind, whatever its message.
+            FailKind(OutKind),
         }
-    }
 
-    #[test]
-    fn append_error_note_extends_the_error_text_only() {
-        let timeout_error = "deadline reached after 92000ms — the step did not complete";
-        let mut env = out_env(
-            "open",
-            false,
-            OutKind::Timeout,
-            json!({ "url": "https://x", "error": timeout_error }),
-        );
-        append_error_note(&mut env, "what was done");
-        assert_eq!(
-            env.payload.get("error").and_then(Value::as_str),
-            Some(format!("{timeout_error} — what was done").as_str())
-        );
-        // Other payload keys and an error-less payload are untouched.
-        let mut env = out_env("open", false, OutKind::Ok, json!({ "url": "https://x" }));
-        append_error_note(&mut env, "what was done");
-        assert!(env.payload.get("error").is_none());
-    }
+        struct Case {
+            name: &'static str,
+            expect_style: bool,
+            truncated: bool,
+            exit_code: Option<i32>,
+            status_success: bool,
+            stdout: Vec<u8>,
+            stderr: String,
+            want: Want,
+        }
 
-    /// Direct pin of the spawn-level classification, including the crux of the
-    /// expect contract: a failed assertion arrives as `success:true` with
-    /// exit 1 and the verdict in `data`.
-    #[test]
-    fn classify_step_output_pins_envelope_over_exit_code() {
         let envelope = |body: Value| serde_json::to_vec(&body).expect("serialize envelope");
-        let outcome = |r: &StepOutcome| match r {
-            Ok(resp) => Ok(resp.data.clone()),
-            Err(f) => Err((f.kind, f.message.clone())),
-        };
-
-        // expect pass=false: success:true + exit 1 → the verdict is returned.
-        let resp = classify_step_output(
-            true,
-            false,
-            Some(1),
-            false,
-            &envelope(
-                json!({"success": true, "data": {"pass": false, "actual": 3, "timedOut": true}}),
-            ),
-            "",
-        )
-        .expect("expect verdict must survive the non-zero exit");
-        assert_eq!(
-            resp.data
-                .as_ref()
-                .and_then(expect_outcome)
-                .map(|o| (o.pass, o.timed_out, o.actual)),
-            Some((false, true, Some(json!(3))))
-        );
-
-        // …but only for expect: the same payload on another action is a
-        // generic failure (fallback message, no envelope error).
-        let r = classify_step_output(
-            false,
-            false,
-            Some(1),
-            false,
-            &envelope(json!({"success": true, "data": {"pass": false}})),
-            "",
-        );
-        assert_eq!(
-            outcome(&r),
-            Err((OutKind::Error, "chrome-use exited with code 1".into()))
-        );
-
-        // expect un-evaluable (no browser): success:false + exit 2 → environment.
-        let r = classify_step_output(
-            true,
-            false,
-            Some(2),
-            false,
-            &envelope(
-                json!({"success": false, "error": "Browser not launched", "code": "browser_not_launched"}),
-            ),
-            "",
-        );
-        assert_eq!(
-            outcome(&r),
-            Err((OutKind::Environment, "Browser not launched".into()))
-        );
-
-        // Honest timeout classification on a failed wait.
-        let r = classify_step_output(
-            false,
-            false,
-            Some(1),
-            false,
-            &envelope(json!({"success": false, "error": "Wait timed out after 15000ms"})),
-            "",
-        );
-        assert_eq!(
-            outcome(&r),
-            Err((OutKind::Timeout, "Wait timed out after 15000ms".into()))
-        );
-
-        // Happy path: exit 0 + success envelope.
-        assert!(
-            outcome(&classify_step_output(
-                false,
-                false,
-                Some(0),
-                true,
-                &envelope(json!({"success": true, "data": {}})),
-                ""
-            ))
-            .is_ok()
-        );
-
-        // Unparseable stdout: zero exit → non-JSON error; non-zero → stderr fallback.
-        let r = classify_step_output(false, false, Some(0), true, b"garbage", "");
-        assert_eq!(
-            outcome(&r),
-            Err((OutKind::Error, "chrome-use returned non-JSON output".into()))
-        );
-        let r = classify_step_output(
-            false,
-            false,
-            Some(1),
-            false,
-            b"garbage",
-            "relay is not connected",
-        );
-        assert_eq!(
-            outcome(&r),
-            Err((OutKind::Environment, "relay is not connected".into()))
-        );
-    }
-
-    /// The canned stale-relay hint is stripped from Timeout-classified
-    /// failures only — envelope `error` text and the stderr fallback alike —
-    /// while non-Timeout messages keep it verbatim.
-    #[test]
-    fn classify_step_output_strips_canned_relay_hint() {
-        let envelope = |body: Value| serde_json::to_vec(&body).expect("serialize envelope");
-        let outcome = |r: &StepOutcome| match r {
-            Ok(resp) => Ok(resp.data.clone()),
-            Err(f) => Err((f.kind, f.message.clone())),
-        };
         let hint = "Hint: the session's browser connection is unresponsive (likely a stale \
                     relay/service-worker mid-session). Reconnect with `connect`, or close the \
                     session and reopen it.";
-
-        // Timeout envelope: hint stripped, honest prefix kept.
-        let r = classify_step_output(
-            false,
-            false,
-            Some(1),
-            false,
-            &envelope(
-                json!({"success": false, "error": format!("Wait timed out after 15000ms. {hint}")}),
-            ),
-            "",
-        );
-        assert_eq!(
-            outcome(&r),
-            Err((OutKind::Timeout, "Wait timed out after 15000ms".into()))
-        );
-
-        // A non-timeout envelope carrying the hint keeps it verbatim (kind Error,
-        // not stripped — only Timeout-classified messages are rewritten).
-        let r = classify_step_output(
-            false,
-            false,
-            Some(1),
-            false,
-            &envelope(json!({"success": false, "error": format!("some other failure. {hint}")})),
-            "",
-        );
-        assert_eq!(
-            outcome(&r),
-            Err((OutKind::Error, format!("some other failure. {hint}")))
-        );
-
-        // The stderr fallback is classified and sanitized too: a timeout
-        // phrasing with the canned hint in stderr → hint stripped.
-        let r = classify_step_output(
-            false,
-            false,
-            Some(1),
-            false,
-            b"garbage",
-            &format!("Wait timed out after 15000ms. {hint}"),
-        );
-        assert_eq!(
-            outcome(&r),
-            Err((OutKind::Timeout, "Wait timed out after 15000ms".into()))
-        );
-    }
-
-    /// A successful envelope carrying chrome-use's browser-replacement note is a
-    /// failure, never a quiet success — and it is deliberately NOT the
-    /// daemon-down path (the daemon is fine; the connection to the real browser
-    /// was lost). The benign degraded-success warnings keep today's behaviour.
-    #[test]
-    fn classify_step_output_fails_a_self_launched_browser() {
-        let envelope = |body: Value| serde_json::to_vec(&body).expect("serialize envelope");
-        let note = "This session's previous browser is gone (its browser connection was dead) \
+        let replacement = "This session's previous browser is gone (its browser connection was dead) \
                     and a fresh one was launched for this command";
-        let r = classify_step_output(
-            false,
-            false,
-            Some(0),
-            true,
-            &envelope(json!({"success": true, "warning": note})),
-            "",
-        );
-        let Err(f) = r else {
-            panic!("a browser chrome-use started itself must not classify as success")
-        };
-        assert_eq!(f.kind, OutKind::Environment);
-        assert_eq!(f.message, self_launched_browser_cli_error(note));
 
-        // The expect-style success path (envelope trusted over a non-zero exit)
-        // applies the same rule.
-        let r = classify_step_output(
-            true,
-            false,
-            Some(1),
-            false,
-            &envelope(json!({"success": true, "warning": note, "data": {"pass": true}})),
-            "",
-        );
-        let Err(f) = r else {
-            panic!("a browser chrome-use started itself must not classify as success")
-        };
-        assert_eq!(f.kind, OutKind::Environment);
+        let cases = [
+            Case {
+                // expect pass=false: success:true + exit 1 → the verdict is returned.
+                name: "expect_verdict_survives_a_non_zero_exit",
+                expect_style: true,
+                truncated: false,
+                exit_code: Some(1),
+                status_success: false,
+                stdout: envelope(
+                    json!({"success": true, "data": {"pass": false, "actual": 3, "timedOut": true}}),
+                ),
+                stderr: String::new(),
+                want: Want::Verdict {
+                    pass: false,
+                    timed_out: true,
+                    actual: Some(json!(3)),
+                },
+            },
+            Case {
+                // …but only for expect: the same payload on another action is a
+                // generic failure (fallback message, no envelope error).
+                name: "same_payload_outside_expect_is_a_generic_failure",
+                expect_style: false,
+                truncated: false,
+                exit_code: Some(1),
+                status_success: false,
+                stdout: envelope(json!({"success": true, "data": {"pass": false}})),
+                stderr: String::new(),
+                want: Want::Fail(OutKind::Error, "chrome-use exited with code 1".into()),
+            },
+            Case {
+                // expect un-evaluable (no browser): success:false + exit 2 → environment.
+                name: "expect_un_evaluable_is_an_environment_failure",
+                expect_style: true,
+                truncated: false,
+                exit_code: Some(2),
+                status_success: false,
+                stdout: envelope(
+                    json!({"success": false, "error": "Browser not launched", "code": "browser_not_launched"}),
+                ),
+                stderr: String::new(),
+                want: Want::Fail(OutKind::Environment, "Browser not launched".into()),
+            },
+            Case {
+                // Honest timeout classification on a failed wait.
+                name: "failed_wait_is_a_timeout",
+                expect_style: false,
+                truncated: false,
+                exit_code: Some(1),
+                status_success: false,
+                stdout: envelope(
+                    json!({"success": false, "error": "Wait timed out after 15000ms"}),
+                ),
+                stderr: String::new(),
+                want: Want::Fail(OutKind::Timeout, "Wait timed out after 15000ms".into()),
+            },
+            Case {
+                // Happy path: exit 0 + success envelope.
+                name: "success_envelope_on_a_zero_exit",
+                expect_style: false,
+                truncated: false,
+                exit_code: Some(0),
+                status_success: true,
+                stdout: envelope(json!({"success": true, "data": {}})),
+                stderr: String::new(),
+                want: Want::Ok,
+            },
+            Case {
+                // Unparseable stdout: zero exit → non-JSON error.
+                name: "unparseable_stdout_on_a_zero_exit",
+                expect_style: false,
+                truncated: false,
+                exit_code: Some(0),
+                status_success: true,
+                stdout: b"garbage".to_vec(),
+                stderr: String::new(),
+                want: Want::Fail(OutKind::Error, "chrome-use returned non-JSON output".into()),
+            },
+            Case {
+                // Unparseable stdout: non-zero exit → stderr fallback, classified.
+                name: "unparseable_stdout_falls_back_to_classified_stderr",
+                expect_style: false,
+                truncated: false,
+                exit_code: Some(1),
+                status_success: false,
+                stdout: b"garbage".to_vec(),
+                stderr: "relay is not connected".into(),
+                want: Want::Fail(OutKind::Environment, "relay is not connected".into()),
+            },
+            Case {
+                // Timeout envelope: hint stripped, honest prefix kept.
+                name: "timeout_envelope_loses_the_canned_hint",
+                expect_style: false,
+                truncated: false,
+                exit_code: Some(1),
+                status_success: false,
+                stdout: envelope(
+                    json!({"success": false, "error": format!("Wait timed out after 15000ms. {hint}")}),
+                ),
+                stderr: String::new(),
+                want: Want::Fail(OutKind::Timeout, "Wait timed out after 15000ms".into()),
+            },
+            Case {
+                // A non-timeout envelope carrying the hint keeps it verbatim (kind
+                // Error, not stripped — only Timeout-classified messages are
+                // rewritten).
+                name: "non_timeout_envelope_keeps_the_hint",
+                expect_style: false,
+                truncated: false,
+                exit_code: Some(1),
+                status_success: false,
+                stdout: envelope(
+                    json!({"success": false, "error": format!("some other failure. {hint}")}),
+                ),
+                stderr: String::new(),
+                want: Want::Fail(OutKind::Error, format!("some other failure. {hint}")),
+            },
+            Case {
+                // The stderr fallback is classified and sanitized too: a timeout
+                // phrasing with the canned hint in stderr → hint stripped.
+                name: "stderr_fallback_loses_the_canned_hint",
+                expect_style: false,
+                truncated: false,
+                exit_code: Some(1),
+                status_success: false,
+                stdout: b"garbage".to_vec(),
+                stderr: format!("Wait timed out after 15000ms. {hint}"),
+                want: Want::Fail(OutKind::Timeout, "Wait timed out after 15000ms".into()),
+            },
+            Case {
+                // A successful envelope carrying chrome-use's browser-replacement
+                // note is a failure, never a quiet success — and it is
+                // deliberately NOT the daemon-down path (the daemon is fine; the
+                // connection to the real browser was lost).
+                name: "self_launched_browser_note_is_an_environment_failure",
+                expect_style: false,
+                truncated: false,
+                exit_code: Some(0),
+                status_success: true,
+                stdout: envelope(json!({"success": true, "warning": replacement})),
+                stderr: String::new(),
+                want: Want::Fail(
+                    OutKind::Environment,
+                    self_launched_browser_cli_error(replacement),
+                ),
+            },
+            Case {
+                // The expect-style success path (envelope trusted over a non-zero
+                // exit) applies the same rule.
+                name: "self_launched_browser_note_fails_the_expect_style_path",
+                expect_style: true,
+                truncated: false,
+                exit_code: Some(1),
+                status_success: false,
+                stdout: envelope(
+                    json!({"success": true, "warning": replacement, "data": {"pass": true}}),
+                ),
+                stderr: String::new(),
+                want: Want::FailKind(OutKind::Environment),
+            },
+            Case {
+                // A degraded-success warning is NOT browser replacement: the step
+                // still succeeds and the action-specific envelope judges it.
+                name: "degraded_success_warning_stays_a_success",
+                expect_style: false,
+                truncated: false,
+                exit_code: Some(0),
+                status_success: true,
+                stdout: envelope(
+                    json!({"success": true, "warning": "no key listeners on the focused element"}),
+                ),
+                stderr: String::new(),
+                want: Want::Ok,
+            },
+            Case {
+                // An answer the product cut off names the truncation.
+                name: "truncated_answer_names_the_truncation",
+                expect_style: false,
+                truncated: true,
+                exit_code: Some(0),
+                status_success: true,
+                stdout: b"garbage".to_vec(),
+                stderr: String::new(),
+                want: Want::Fail(OutKind::Error, truncated_output_error()),
+            },
+            Case {
+                // A genuinely malformed one keeps the generic text.
+                name: "malformed_answer_keeps_the_generic_text",
+                expect_style: false,
+                truncated: false,
+                exit_code: Some(0),
+                status_success: true,
+                stdout: b"garbage".to_vec(),
+                stderr: String::new(),
+                want: Want::Fail(OutKind::Error, "chrome-use returned non-JSON output".into()),
+            },
+            Case {
+                // A non-zero exit with an unparsed, truncated answer names the
+                // truncation too, instead of the stderr fallback.
+                name: "truncated_answer_beats_the_stderr_fallback",
+                expect_style: false,
+                truncated: true,
+                exit_code: Some(1),
+                status_success: false,
+                stdout: b"garbage".to_vec(),
+                stderr: "some stderr".into(),
+                want: Want::Fail(OutKind::Error, truncated_output_error()),
+            },
+            Case {
+                // …while a genuinely malformed one still falls back to stderr.
+                name: "malformed_answer_falls_back_to_stderr",
+                expect_style: false,
+                truncated: false,
+                exit_code: Some(1),
+                status_success: false,
+                stdout: b"garbage".to_vec(),
+                stderr: "some stderr".into(),
+                want: Want::Fail(OutKind::Error, "some stderr".into()),
+            },
+        ];
 
-        // A degraded-success warning is NOT browser replacement: the step still
-        // succeeds and the action-specific envelope judges it.
-        let r = classify_step_output(
-            false,
-            false,
-            Some(0),
-            true,
-            &envelope(
-                json!({"success": true, "warning": "no key listeners on the focused element"}),
-            ),
-            "",
-        );
-        assert!(r.is_ok());
-    }
-
-    /// An unparseable answer the product itself cut off names the truncation,
-    /// while a genuinely malformed one keeps the generic text — a product
-    /// truncation must never read as chrome-use's malformed output, on a
-    /// non-zero exit too, where the stderr fallback would otherwise claim
-    /// chrome-use's own failure.
-    #[test]
-    fn classify_step_output_names_a_truncated_answer() {
-        let outcome = |r: &StepOutcome| match r {
-            Ok(resp) => Ok(resp.data.clone()),
-            Err(f) => Err((f.kind, f.message.clone())),
-        };
-        let r = classify_step_output(false, true, Some(0), true, b"garbage", "");
-        assert_eq!(outcome(&r), Err((OutKind::Error, truncated_output_error())));
-        let r = classify_step_output(false, false, Some(0), true, b"garbage", "");
-        assert_eq!(
-            outcome(&r),
-            Err((OutKind::Error, "chrome-use returned non-JSON output".into()))
-        );
-        // A non-zero exit with an unparsed, truncated answer names the
-        // truncation too, instead of the stderr fallback.
-        let r = classify_step_output(false, true, Some(1), false, b"garbage", "some stderr");
-        assert_eq!(outcome(&r), Err((OutKind::Error, truncated_output_error())));
-        let r = classify_step_output(false, false, Some(1), false, b"garbage", "some stderr");
-        assert_eq!(outcome(&r), Err((OutKind::Error, "some stderr".into())));
-    }
-
-    #[test]
-    fn network_failure_error_names_code_or_falls_back() {
-        assert_eq!(
-            network_failure_error(Some("ERR_NAME_NOT_RESOLVED")),
-            "Chrome rendered an error page — ERR_NAME_NOT_RESOLVED (DNS resolution failure)"
-        );
-        assert_eq!(
-            network_failure_error(None),
-            "Chrome rendered an error page (site unreachable or refused)"
-        );
+        for case in cases {
+            let r = classify_step_output(
+                case.expect_style,
+                case.truncated,
+                case.exit_code,
+                case.status_success,
+                &case.stdout,
+                &case.stderr,
+            );
+            match case.want {
+                Want::Ok => assert!(r.is_ok(), "{}: must be a success, got {r:?}", case.name),
+                Want::Verdict {
+                    pass,
+                    timed_out,
+                    actual,
+                } => {
+                    let Ok(resp) = r else {
+                        panic!(
+                            "{}: the expect verdict must survive the non-zero exit",
+                            case.name
+                        );
+                    };
+                    assert_eq!(
+                        resp.data.as_ref().and_then(expect_outcome).map(|o| (
+                            o.pass,
+                            o.timed_out,
+                            o.actual
+                        )),
+                        Some((pass, timed_out, actual)),
+                        "{}: verdict",
+                        case.name
+                    );
+                }
+                Want::Fail(kind, message) => assert_eq!(
+                    r.map(|resp| resp.data.clone())
+                        .map_err(|f| (f.kind, f.message.clone())),
+                    Err((kind, message)),
+                    "{}",
+                    case.name
+                ),
+                Want::FailKind(kind) => match r {
+                    Ok(_) => panic!("{}: must not classify as success", case.name),
+                    Err(f) => assert_eq!(f.kind, kind, "{}", case.name),
+                },
+            }
+        }
     }
 
     #[test]
@@ -4890,464 +4840,6 @@ mod tests {
         ));
     }
 
-    #[expect(clippy::too_many_lines)]
-    #[test]
-    fn parse_happy_paths_support_both_flag_forms() {
-        // status takes no args.
-        assert!(matches!(
-            parse_action(&["status".into()])
-                .expect("status parses")
-                .action,
-            Action::Status
-        ));
-
-        // open with `--flag value`.
-        let inv = parse_action(&[
-            "open".into(),
-            "https://example.com".into(),
-            "--expect".into(),
-            ".btn".into(),
-            "--structural".into(),
-            "--timeout".into(),
-            "5".into(),
-        ])
-        .expect("open parses");
-        match inv.action {
-            Action::Open {
-                url,
-                expect,
-                structural,
-                timeout,
-            } => {
-                assert_eq!(url, "https://example.com");
-                assert_eq!(expect.as_deref(), Some(".btn"));
-                assert!(structural);
-                assert_eq!(timeout, Duration::from_secs(5));
-            }
-            _ => panic!("expected Open"),
-        }
-
-        // open with `--flag=value`.
-        let inv = parse_action(&[
-            "open".into(),
-            "https://example.com".into(),
-            "--expect=.btn".into(),
-            "--timeout=3".into(),
-        ])
-        .expect("open parses");
-        match inv.action {
-            Action::Open {
-                expect, timeout, ..
-            } => {
-                assert_eq!(expect.as_deref(), Some(".btn"));
-                assert_eq!(timeout, Duration::from_secs(3));
-            }
-            _ => panic!("expected Open"),
-        }
-
-        // open without --timeout defaults to the whole-operation budget (20 s);
-        // the navigation itself runs to the clock mahbot declares to chrome-use.
-        let inv =
-            parse_action(&["open".into(), "https://example.com".into()]).expect("open parses");
-        match inv.action {
-            Action::Open { timeout, .. } => assert_eq!(timeout, DEFAULT_OPEN_TIMEOUT),
-            _ => panic!("expected Open"),
-        }
-
-        // count / eval: a user `--timeout` is their own bound on the step (no
-        // default), and only a value at or above the clock mahbot declares to
-        // chrome-use parses — anything shorter is refused (see
-        // `timeout_flag_is_capped_below_chrome_use_client_tolerance`), while
-        // wait/expect forward their value as chrome-use's clock.
-        for (action, sel) in [("count", ".x"), ("eval", "1+1")] {
-            let inv = parse_action(&[action.into(), sel.into(), "--timeout=60".into()])
-                .expect("action parses");
-            match inv.action {
-                Action::Count { bound, .. } | Action::Eval { bound, .. } => {
-                    assert_eq!(bound, Some(Duration::from_secs(60)));
-                }
-                _ => panic!("expected a bounded action"),
-            }
-        }
-        // Without --timeout a forwarding-less verb carries no bound at all:
-        // the clock mahbot declares to chrome-use is its clock.
-        let inv = parse_action(&["count".into(), ".x".into()]).expect("count parses");
-        assert!(matches!(inv.action, Action::Count { bound: None, .. }));
-        let inv = parse_action(&["eval".into(), "1+1".into()]).expect("eval parses");
-        assert!(matches!(inv.action, Action::Eval { bound: None, .. }));
-
-        // wait / expect default to the condition deadline they declare AND
-        // forward as their `--timeout`, well under chrome-use's own client
-        // tolerance so the tool's own verdict always fires first.
-        let inv = parse_action(&["wait".into(), ".x".into()]).expect("wait parses");
-        match inv.action {
-            Action::Wait { timeout, .. } => assert_eq!(timeout, DEFAULT_STEP_TIMEOUT),
-            _ => panic!("expected Wait"),
-        }
-
-        // wait with --url / --text targets.
-        let inv = parse_action(&[
-            "wait".into(),
-            "--url".into(),
-            "dashboard".into(),
-            "--timeout=9".into(),
-        ])
-        .expect("wait url parses");
-        match inv.action {
-            Action::Wait { target, timeout } => {
-                assert!(matches!(target, WaitTarget::Url(u) if u == "dashboard"));
-                assert_eq!(timeout, Duration::from_secs(9));
-            }
-            _ => panic!("expected Wait"),
-        }
-        let inv = parse_action(&["wait".into(), "--text".into(), "Loaded".into()])
-            .expect("wait text parses");
-        match inv.action {
-            Action::Wait { target, timeout } => {
-                assert!(matches!(target, WaitTarget::Text(t) if t == "Loaded"));
-                assert_eq!(timeout, DEFAULT_STEP_TIMEOUT);
-            }
-            _ => panic!("expected Wait"),
-        }
-
-        // expect conditions via the forms grammar.
-        let inv = parse_action(&["expect".into(), "#main".into(), "visible".into()])
-            .expect("expect state parses");
-        match inv.action {
-            Action::Expect { cond, timeout } => {
-                assert!(matches!(
-                    cond,
-                    ExpectCond::State { selector, state } if selector == "#main" && state == "visible"
-                ));
-                assert_eq!(timeout, DEFAULT_STEP_TIMEOUT);
-            }
-            _ => panic!("expected Expect"),
-        }
-        let inv = parse_action(&[
-            "expect".into(),
-            "count".into(),
-            ".card".into(),
-            ">=".into(),
-            "3".into(),
-            "--timeout=5".into(),
-        ])
-        .expect("expect count parses");
-        match inv.action {
-            Action::Expect { cond, timeout } => {
-                assert!(matches!(
-                    cond,
-                    ExpectCond::Count { selector, op, n } if selector == ".card" && op == ">=" && n == 3
-                ));
-                assert_eq!(timeout, Duration::from_secs(5));
-            }
-            _ => panic!("expected Expect"),
-        }
-        let inv = parse_action(&[
-            "expect".into(),
-            "text".into(),
-            "h1".into(),
-            "contains".into(),
-            "Hello".into(),
-            "World".into(),
-        ])
-        .expect("expect text parses");
-        match inv.action {
-            Action::Expect { cond, timeout } => {
-                assert!(matches!(
-                    cond,
-                    ExpectCond::Text { selector, predicate, value }
-                        if selector == "h1" && predicate == "contains" && value == "Hello World"
-                ));
-                assert_eq!(timeout, DEFAULT_STEP_TIMEOUT);
-            }
-            _ => panic!("expected Expect"),
-        }
-        let inv = parse_action(&[
-            "expect".into(),
-            "url".into(),
-            "contains".into(),
-            "dashboard".into(),
-        ])
-        .expect("expect url parses");
-        match inv.action {
-            Action::Expect { cond, timeout } => {
-                assert!(matches!(
-                    cond,
-                    ExpectCond::Url { predicate, pattern }
-                        if predicate == "contains" && pattern == "dashboard"
-                ));
-                assert_eq!(timeout, DEFAULT_STEP_TIMEOUT);
-            }
-            _ => panic!("expected Expect"),
-        }
-
-        // extract requires --schema-file.
-        let inv = parse_action(&[
-            "extract".into(),
-            "--schema-file=rows.json".into(),
-            "--limit=3".into(),
-        ])
-        .expect("extract parses");
-        match inv.action {
-            Action::Extract {
-                schema_file,
-                limit,
-                bound,
-            } => {
-                assert_eq!(schema_file, "rows.json");
-                assert_eq!(limit, Some(3));
-                assert_eq!(bound, None);
-            }
-            _ => panic!("expected Extract"),
-        }
-
-        // click with --if-present.
-        let inv = parse_action(&["click".into(), ".btn".into(), "--if-present".into()])
-            .expect("click parses");
-        match inv.action {
-            Action::Click {
-                selector,
-                if_present,
-                ..
-            } => {
-                assert_eq!(selector, ".btn");
-                assert!(if_present);
-            }
-            _ => panic!("expected Click"),
-        }
-
-        // global --session anywhere, including before the action.
-        let inv = parse_action(&[
-            "--session".into(),
-            "run-1".into(),
-            "count".into(),
-            ".x".into(),
-        ])
-        .expect("session parses");
-        assert_eq!(inv.session.as_deref(), Some("run-1"));
-        assert!(matches!(inv.action, Action::Count { .. }));
-
-        // session stop with --force.
-        let inv = parse_action(&[
-            "session".into(),
-            "stop".into(),
-            "foo".into(),
-            "--force".into(),
-        ])
-        .expect("session stop parses");
-        match inv.action {
-            Action::SessionStop { name, force } => {
-                assert_eq!(name, "foo");
-                assert!(force);
-            }
-            _ => panic!("expected SessionStop"),
-        }
-    }
-
-    #[test]
-    fn parse_text_input_happy_paths() {
-        // fill inline multi-word text.
-        let inv = parse_action(&["fill".into(), "#q".into(), "hello".into(), "world".into()])
-            .expect("fill inline parses");
-        match inv.action {
-            Action::Fill {
-                selector, source, ..
-            } => {
-                assert_eq!(selector, "#q");
-                assert!(matches!(source, TextInput::Inline(t) if t == "hello world"));
-            }
-            _ => panic!("expected Fill"),
-        }
-
-        // fill with `--file=<path>`.
-        let inv = parse_action(&["fill".into(), "#q".into(), "--file=post.md".into()])
-            .expect("fill --file parses");
-        match inv.action {
-            Action::Fill { source, .. } => {
-                assert!(matches!(source, TextInput::File(p) if p == "post.md"));
-            }
-            _ => panic!("expected Fill"),
-        }
-
-        // fill with a separate `--file <path>` value.
-        let inv = parse_action(&[
-            "fill".into(),
-            "#q".into(),
-            "--file".into(),
-            "post.md".into(),
-        ])
-        .expect("fill --file value parses");
-        match inv.action {
-            Action::Fill { source, .. } => {
-                assert!(matches!(source, TextInput::File(p) if p == "post.md"));
-            }
-            _ => panic!("expected Fill"),
-        }
-
-        // fill --stdin.
-        let inv = parse_action(&["fill".into(), "#q".into(), "--stdin".into()])
-            .expect("fill --stdin parses");
-        match inv.action {
-            Action::Fill { source, .. } => {
-                assert!(matches!(source, TextInput::Stdin));
-            }
-            _ => panic!("expected Fill"),
-        }
-
-        // type with and without --key-events.
-        let inv = parse_action(&["type".into(), "#q".into(), "hi".into()]).expect("type parses");
-        match inv.action {
-            Action::Type {
-                selector,
-                text,
-                key_events,
-                ..
-            } => {
-                assert_eq!(selector, "#q");
-                assert_eq!(text, "hi");
-                assert!(!key_events);
-            }
-            _ => panic!("expected Type"),
-        }
-        let inv = parse_action(&[
-            "type".into(),
-            "#q".into(),
-            "hi".into(),
-            "--key-events".into(),
-        ])
-        .expect("type --key-events parses");
-        match inv.action {
-            Action::Type { key_events, .. } => assert!(key_events),
-            _ => panic!("expected Type"),
-        }
-
-        // press with selector, hold and timeout.
-        let inv = parse_action(&[
-            "press".into(),
-            "Enter".into(),
-            "--selector".into(),
-            "#t".into(),
-            "--hold".into(),
-            "50".into(),
-            "--timeout".into(),
-            "60".into(),
-        ])
-        .expect("press parses");
-        match inv.action {
-            Action::Press {
-                key,
-                selector,
-                hold,
-                bound,
-            } => {
-                assert_eq!(key, "Enter");
-                assert_eq!(selector.as_deref(), Some("#t"));
-                assert_eq!(hold, Some(50));
-                assert_eq!(bound, Some(Duration::from_secs(60)));
-            }
-            _ => panic!("expected Press"),
-        }
-    }
-
-    /// `--` stays a true end-of-options terminator: every token after it is
-    /// verbatim text, even one that names a flag. (Single-dash text no longer
-    /// needs the shield — see [`fill_type_accept_single_dash_text`] — but the
-    /// terminator behavior itself is unchanged.)
-    #[test]
-    fn parse_dash_separator_takes_text_verbatim() {
-        let inv = parse_action(&["fill".into(), "#q".into(), "--".into(), "--foo".into()])
-            .expect("fill -- separator parses");
-        match inv.action {
-            Action::Fill { source, .. } => {
-                assert!(matches!(source, TextInput::Inline(t) if t == "--foo"));
-            }
-            _ => panic!("expected Fill"),
-        }
-
-        let inv = parse_action(&[
-            "type".into(),
-            "#q".into(),
-            "--".into(),
-            "--session".into(),
-            "sneaky".into(),
-            "rest".into(),
-        ])
-        .expect("type with --session-looking text parses");
-        match inv.action {
-            Action::Type { selector, text, .. } => {
-                assert_eq!(selector, "#q");
-                assert_eq!(text, "--session sneaky rest");
-            }
-            _ => panic!("expected Type"),
-        }
-    }
-
-    /// Single-dash text is accepted naturally in fill/type (they have no
-    /// single-dash flags, so any `-token` is literal text), while other
-    /// actions keep rejecting it as an unknown flag.
-    #[test]
-    fn fill_type_accept_single_dash_text() {
-        let inv = parse_action(&["fill".into(), "#q".into(), "-tail".into()]).expect("fill parses");
-        match inv.action {
-            Action::Fill { source, .. } => {
-                assert!(matches!(source, TextInput::Inline(t) if t == "-tail"));
-            }
-            _ => panic!("expected Fill"),
-        }
-
-        // A `--session` after the text still binds globally.
-        let inv = parse_action(&[
-            "fill".into(),
-            "#q".into(),
-            "-tail".into(),
-            "--session".into(),
-            "abc".into(),
-        ])
-        .expect("fill with trailing --session parses");
-        assert_eq!(inv.session.as_deref(), Some("abc"));
-        match inv.action {
-            Action::Fill { source, .. } => {
-                assert!(matches!(source, TextInput::Inline(t) if t == "-tail"));
-            }
-            _ => panic!("expected Fill"),
-        }
-
-        let inv =
-            parse_action(&["type".into(), "#q".into(), "-dashprobe".into()]).expect("type parses");
-        match inv.action {
-            Action::Type { text, .. } => assert_eq!(text, "-dashprobe"),
-            _ => panic!("expected Type"),
-        }
-
-        // Other actions still reject single-dash tokens as unknown flags, and
-        // fill/type still reject unknown double-dash flags.
-        assert!(parse_action(&["count".into(), ".x".into(), "-bogus".into()]).is_err());
-        assert!(parse_action(&["open".into(), "https://x".into(), "-bogus".into()]).is_err());
-        assert!(parse_action(&["fill".into(), "#q".into(), "--bogus".into()]).is_err());
-    }
-
-    /// The resolved session lands as a top-level stdout field, under the name a person
-    /// reads (the record's namespace prefix is not part of it).
-    #[test]
-    fn surface_session_adds_top_level_field() {
-        let mut env = out_env("fill", true, OutKind::Ok, json!({ "selector": "#q" }));
-        surface_session(&mut env, "mahbot-chrome-abc");
-        assert_eq!(env.payload["session"], json!("abc"));
-        let wire: Value = serde_json::from_str(&env.to_json()).expect("wire json");
-        assert_eq!(wire["session"], json!("abc"));
-        assert_eq!(wire["kind"], json!("ok"));
-    }
-
-    /// The inline-text argv shield: a leading-dash value rides after `--` so
-    /// chrome-use's arg preprocessor forwards it verbatim.
-    #[test]
-    fn text_value_argv_shields_leading_dash_text() {
-        assert_eq!(text_value_argv("hello"), vec!["hello"]);
-        assert_eq!(text_value_argv("--foo"), vec!["--", "--foo"]);
-        assert_eq!(text_value_argv("-5"), vec!["--", "-5"]);
-        assert_eq!(text_value_argv(""), vec![""]);
-    }
-
     #[test]
     fn parse_rejects_usage_errors() {
         assert!(parse_action(&["bogus".into()]).is_err());
@@ -5421,119 +4913,210 @@ mod tests {
         );
     }
 
-    /// Usage rejections for the text-input actions.
+    /// `--` stays a true end-of-options terminator: every token after it is
+    /// verbatim text, even one that names a flag.
     #[test]
-    fn parse_rejects_text_input_usage_errors() {
-        // fill: exactly one text source.
-        assert!(parse_action(&["fill".into(), "#q".into()]).is_err()); // none
-        assert!(
-            parse_action(&[
-                "fill".into(),
-                "#q".into(),
-                "a".into(),
-                "--file".into(),
-                "f".into()
-            ])
-            .is_err()
-        ); // inline + --file
-        assert!(parse_action(&["fill".into(), "#q".into(), "a".into(), "--stdin".into()]).is_err()); // inline + --stdin
-        assert!(
-            parse_action(&[
-                "fill".into(),
-                "#q".into(),
-                "--stdin".into(),
-                "--file".into(),
-                "f".into()
-            ])
-            .is_err()
-        ); // --stdin + --file
-        assert!(parse_action(&["type".into(), "#q".into()]).is_err()); // missing text
-        assert!(parse_action(&["press".into(), "Enter".into(), "extra".into()]).is_err()); // extra positional
-        assert!(
-            parse_action(&[
-                "press".into(),
-                "Enter".into(),
-                "--hold".into(),
-                "abc".into()
-            ])
-            .is_err()
-        ); // non-numeric hold
-        assert!(parse_action(&["press".into(), "Enter".into(), "--selector".into()]).is_err()); // missing value
+    fn parse_dash_separator_takes_text_verbatim() {
+        // Post-`--` tokens are verbatim text, never scanned for `--session` by
+        // either layer.
+        let after_dash = argv(&["fill", "#q", "--", "--session", "sneaky", "rest"]);
+        let (session, _, remaining) =
+            extract_global_flags(&after_dash).expect("the terminator parses");
+        assert_eq!(session, None, "--session after -- is text, not a binding");
+        assert_eq!(remaining, after_dash, "every post--- token stays verbatim");
+        let inv =
+            parse_action(&argv(&["fill", "#q", "--", "--foo"])).expect("fill -- separator parses");
+        match inv.action {
+            Action::Fill { source, .. } => assert!(
+                matches!(source, TextInput::Inline(t) if t == "--foo"),
+                "fill takes the post--- token as inline text"
+            ),
+            _ => panic!("expected Fill"),
+        }
+        let inv = parse_action(&argv(&["type", "#q", "--", "--session", "sneaky", "rest"]))
+            .expect("type with --session-looking text parses");
+        assert_eq!(inv.session, None, "--session is never bound after --");
+        match inv.action {
+            Action::Type { text, .. } => assert_eq!(
+                text, "--session sneaky rest",
+                "parse_flags_text takes them as positionals"
+            ),
+            _ => panic!("expected Type"),
+        }
     }
 
+    /// Single-dash text is accepted naturally in fill/type (they have no
+    /// single-dash flags, so any `-token` is literal text), while other
+    /// actions keep rejecting it as an unknown flag.
     #[test]
-    fn text_input_ok_envelope_clean_success() {
-        let base = json!({ "selector": "#q" });
-        let resp = ChromeResponse {
-            success: Some(true),
-            data: Some(json!({ "value": "filled" })),
-            ..ChromeResponse::default()
-        };
-        let env = text_input_ok_envelope("fill", &base, resp);
-        assert!(env.ok);
-        assert_eq!(env.kind, OutKind::Ok);
-        assert_eq!(env.payload["data"]["value"], json!("filled"));
-        assert!(env.payload.get("warning").is_none());
-    }
-
-    /// chrome-use emits `readBack` on EVERY readable `type` success and
-    /// `keyListeners` on every listener-dependent `press` — they are not the
-    /// degraded signal. Without chrome-use's `warning` field these are clean
-    /// successes (rc 0).
-    #[test]
-    fn text_input_ok_envelope_read_back_and_key_listeners_without_warning_are_ok() {
-        let typed = ChromeResponse {
-            success: Some(true),
-            data: Some(json!({ "typed": "hi", "readBack": "hi" })),
-            ..ChromeResponse::default()
-        };
-        let env = text_input_ok_envelope("type", &json!({ "selector": "#q", "text": "hi" }), typed);
-        assert!(env.ok);
-        assert_eq!(env.kind, OutKind::Ok);
-
-        let press = ChromeResponse {
-            success: Some(true),
-            data: Some(json!({ "key": "ArrowDown", "keyListeners": 3 })),
-            ..ChromeResponse::default()
-        };
-        let env = text_input_ok_envelope("press", &json!({ "key": "ArrowDown" }), press);
-        assert!(env.ok);
-        assert_eq!(env.kind, OutKind::Ok);
-    }
-
-    #[test]
-    fn text_input_ok_envelope_warning_in_data_is_error() {
-        let base = json!({ "selector": "#q", "text": "hi" });
-        let resp = ChromeResponse {
-            success: Some(true),
-            data: Some(json!({
-                "typed": "hi", "readBack": "h",
-                "warning": "the field does not contain what was typed",
-            })),
-            ..ChromeResponse::default()
-        };
-        let env = text_input_ok_envelope("type", &base, resp);
-        assert!(!env.ok);
-        assert_eq!(env.kind, OutKind::Error);
+    fn fill_type_accept_single_dash_text() {
+        let inv = parse_action(&argv(&["fill", "#q", "-tail"])).expect("fill parses");
+        match inv.action {
+            Action::Fill { source, .. } => assert!(
+                matches!(source, TextInput::Inline(t) if t == "-tail"),
+                "fill takes -tail as inline text"
+            ),
+            _ => panic!("expected Fill"),
+        }
+        // A `--session` after the text still binds globally.
+        let inv = parse_action(&argv(&["fill", "#q", "-tail", "--session", "abc"]))
+            .expect("fill with trailing --session parses");
         assert_eq!(
-            env.payload["warning"],
-            json!("the field does not contain what was typed")
+            inv.session.as_deref(),
+            Some("abc"),
+            "a later --session still binds"
+        );
+        match inv.action {
+            Action::Fill { source, .. } => assert!(
+                matches!(source, TextInput::Inline(t) if t == "-tail"),
+                "the trailing flag does not become text"
+            ),
+            _ => panic!("expected Fill"),
+        }
+        let inv = parse_action(&argv(&["type", "#q", "-dashprobe"])).expect("type parses");
+        match inv.action {
+            Action::Type { text, .. } => {
+                assert_eq!(text, "-dashprobe", "type takes a single-dash token as text");
+            }
+            _ => panic!("expected Type"),
+        }
+        // Other actions still reject single-dash tokens as unknown flags, and
+        // fill/type still reject unknown double-dash flags.
+        assert!(
+            parse_action(&argv(&["count", ".x", "-bogus"])).is_err(),
+            "count still refuses a single-dash token"
+        );
+        assert!(
+            parse_action(&argv(&["open", "https://x", "-bogus"])).is_err(),
+            "open still refuses a single-dash token"
+        );
+        assert!(
+            parse_action(&argv(&["fill", "#q", "--bogus"])).is_err(),
+            "fill still refuses an unknown double-dash flag"
         );
     }
 
+    /// The resolved session lands as a top-level stdout field, under the name a person
+    /// reads (the record's namespace prefix is not part of it).
     #[test]
-    fn text_input_ok_envelope_warning_at_top_level_is_error() {
-        let base = json!({ "key": "Enter" });
-        let resp = ChromeResponse {
-            success: Some(true),
-            data: Some(json!({})),
-            extra: serde_json::Map::from_iter([("warning".to_string(), json!("no key listeners"))]),
-            ..ChromeResponse::default()
-        };
-        let env = text_input_ok_envelope("press", &base, resp);
-        assert!(!env.ok);
-        assert_eq!(env.kind, OutKind::Error);
-        assert_eq!(env.payload["warning"], json!("no key listeners"));
+    fn surface_session_adds_top_level_field() {
+        let mut env = out_env("fill", true, OutKind::Ok, json!({ "selector": "#q" }));
+        surface_session(&mut env, "mahbot-chrome-abc");
+        assert_eq!(
+            env.payload["session"],
+            json!("abc"),
+            "the namespace prefix is not part of the name"
+        );
+        let wire: Value = serde_json::from_str(&env.to_json()).expect("wire json");
+        assert_eq!(wire["session"], json!("abc"), "the field is on the wire");
+        assert_eq!(wire["kind"], json!("ok"), "the payload stays flattened");
+    }
+
+    /// A text input's read-back and key-listener notes are expected; a warning
+    /// in the data or at the top level makes the envelope an error.
+    #[test]
+    fn a_text_input_envelope_is_ok_unless_a_warning_says_otherwise() {
+        {
+            let case = "text input ok envelope clean success";
+            let base = json!({ "selector": "#q" });
+            let resp = ChromeResponse {
+                success: Some(true),
+                data: Some(json!({ "value": "filled" })),
+                ..ChromeResponse::default()
+            };
+            let env = text_input_ok_envelope("fill", &base, resp);
+            assert!(env.ok, "case {case}: a clean success stays a success");
+            assert_eq!(env.kind, OutKind::Ok, "case {case}: its kind is ok");
+            assert_eq!(
+                env.payload["data"]["value"],
+                json!("filled"),
+                "case {case}: the answer's data is carried"
+            );
+            assert!(
+                env.payload.get("warning").is_none(),
+                "case {case}: no warning is invented"
+            );
+        }
+
+        {
+            let case = "text input ok envelope read back and key listeners without warning are ok";
+            // chrome-use emits `readBack` on EVERY readable `type` success and
+            // `keyListeners` on every listener-dependent `press` — they are not the
+            // degraded signal. Without chrome-use's `warning` field these are clean
+            // successes (rc 0).
+            let typed = ChromeResponse {
+                success: Some(true),
+                data: Some(json!({ "typed": "hi", "readBack": "hi" })),
+                ..ChromeResponse::default()
+            };
+            let env =
+                text_input_ok_envelope("type", &json!({ "selector": "#q", "text": "hi" }), typed);
+            assert!(env.ok, "case {case}: a read-back alone is not degraded");
+            assert_eq!(
+                env.kind,
+                OutKind::Ok,
+                "case {case}: a read-back alone is ok"
+            );
+
+            let press = ChromeResponse {
+                success: Some(true),
+                data: Some(json!({ "key": "ArrowDown", "keyListeners": 3 })),
+                ..ChromeResponse::default()
+            };
+            let env = text_input_ok_envelope("press", &json!({ "key": "ArrowDown" }), press);
+            assert!(
+                env.ok,
+                "case {case}: a key-listener count alone is not degraded"
+            );
+            assert_eq!(
+                env.kind,
+                OutKind::Ok,
+                "case {case}: a key-listener count alone is ok"
+            );
+        }
+
+        {
+            let case = "text input ok envelope warning in data is error";
+            let base = json!({ "selector": "#q", "text": "hi" });
+            let resp = ChromeResponse {
+                success: Some(true),
+                data: Some(json!({
+                    "typed": "hi", "readBack": "h",
+                    "warning": "the field does not contain what was typed",
+                })),
+                ..ChromeResponse::default()
+            };
+            let env = text_input_ok_envelope("type", &base, resp);
+            assert!(!env.ok, "case {case}: a warning in data is not a success");
+            assert_eq!(env.kind, OutKind::Error, "case {case}: it is an error");
+            assert_eq!(
+                env.payload["warning"],
+                json!("the field does not contain what was typed"),
+                "case {case}: the warning is surfaced"
+            );
+        }
+
+        {
+            let case = "text input ok envelope warning at top level is error";
+            let base = json!({ "key": "Enter" });
+            let resp = ChromeResponse {
+                success: Some(true),
+                data: Some(json!({})),
+                extra: serde_json::Map::from_iter([(
+                    "warning".to_string(),
+                    json!("no key listeners"),
+                )]),
+                ..ChromeResponse::default()
+            };
+            let env = text_input_ok_envelope("press", &base, resp);
+            assert!(!env.ok, "case {case}: a top-level warning is not a success");
+            assert_eq!(env.kind, OutKind::Error, "case {case}: it is an error");
+            assert_eq!(
+                env.payload["warning"],
+                json!("no key listeners"),
+                "case {case}: the top-level warning is surfaced"
+            );
+        }
     }
 
     fn upload_payload() -> (Vec<String>, Vec<std::path::PathBuf>) {
@@ -5543,77 +5126,107 @@ mod tests {
         )
     }
 
+    /// An upload envelope reports the delivery it made and every warning beside it.
     #[test]
-    fn upload_envelope_reports_the_counts_and_the_absolute_files() {
-        let (files, resolved) = upload_payload();
-        let kept = ChromeResponse {
-            success: Some(true),
-            data: Some(json!({ "uploaded": 1, "attached": 1, "selector": "#f" })),
-            ..ChromeResponse::default()
-        };
-        let env = upload_ok_envelope("#f", &files, &resolved, &kept, false);
-        assert!(env.ok);
-        assert_eq!(env.kind, OutKind::Ok);
-        assert_eq!(env.payload["uploaded"], json!(1));
-        assert_eq!(env.payload["attached"], json!(1));
-        assert_eq!(env.payload["absolute_files"], json!(["/tmp/a.txt"]));
-        assert!(env.payload.get("warning").is_none());
-        assert!(env.payload.get("note").is_none());
-    }
+    fn an_upload_envelope_reports_delivery_and_its_warnings() {
+        {
+            let case = "upload envelope reports the counts and the absolute files";
+            let (files, resolved) = upload_payload();
+            let kept = ChromeResponse {
+                success: Some(true),
+                data: Some(json!({ "uploaded": 1, "attached": 1, "selector": "#f" })),
+                ..ChromeResponse::default()
+            };
+            let env = upload_ok_envelope("#f", &files, &resolved, &kept, false);
+            assert!(env.ok, "case {case}: a delivered upload is a success");
+            assert_eq!(env.kind, OutKind::Ok, "case {case}: its kind is ok");
+            assert_eq!(
+                env.payload["uploaded"],
+                json!(1),
+                "case {case}: the browser's uploaded count is reported"
+            );
+            assert_eq!(
+                env.payload["attached"],
+                json!(1),
+                "case {case}: the browser's attached count is reported"
+            );
+            assert_eq!(
+                env.payload["absolute_files"],
+                json!(["/tmp/a.txt"]),
+                "case {case}: the absolute files are reported"
+            );
+            assert!(
+                env.payload.get("warning").is_none(),
+                "case {case}: no warning is invented"
+            );
+            assert!(
+                env.payload.get("note").is_none(),
+                "case {case}: no note is invented"
+            );
+        }
 
-    #[test]
-    fn upload_envelope_fails_a_zero_delivery() {
-        let (files, resolved) = upload_payload();
-        let nothing = ChromeResponse {
-            success: Some(true),
-            data: Some(json!({ "uploaded": 0, "attached": 0, "selector": "#f" })),
-            ..ChromeResponse::default()
-        };
-        let env = upload_ok_envelope("#f", &files, &resolved, &nothing, false);
-        assert!(!env.ok);
-        assert_eq!(env.kind, OutKind::Error);
-        assert!(
-            env.payload["error"]
-                .as_str()
-                .unwrap()
-                .contains("nothing reached")
-        );
-    }
+        {
+            let case = "upload envelope fails a zero delivery";
+            let (files, resolved) = upload_payload();
+            let nothing = ChromeResponse {
+                success: Some(true),
+                data: Some(json!({ "uploaded": 0, "attached": 0, "selector": "#f" })),
+                ..ChromeResponse::default()
+            };
+            let env = upload_ok_envelope("#f", &files, &resolved, &nothing, false);
+            assert!(!env.ok, "case {case}: a stated zero is not a success");
+            assert_eq!(env.kind, OutKind::Error, "case {case}: it is an error");
+            assert!(
+                env.payload["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("nothing reached"),
+                "case {case}: the error says nothing reached the page: {:?}",
+                env.payload["error"]
+            );
+        }
 
-    #[test]
-    fn upload_envelope_notes_a_skipped_one_file_check() {
-        let (files, resolved) = upload_payload();
-        let kept = ChromeResponse {
-            success: Some(true),
-            data: Some(json!({ "uploaded": 1, "attached": 1, "selector": "#f" })),
-            ..ChromeResponse::default()
-        };
-        let env = upload_ok_envelope("#f", &files, &resolved, &kept, true);
-        assert_eq!(
-            env.payload["note"],
-            json!(crate::chrome::files::unchecked_several_files_note())
-        );
-    }
+        {
+            let case = "upload envelope notes a skipped one file check";
+            let (files, resolved) = upload_payload();
+            let kept = ChromeResponse {
+                success: Some(true),
+                data: Some(json!({ "uploaded": 1, "attached": 1, "selector": "#f" })),
+                ..ChromeResponse::default()
+            };
+            let env = upload_ok_envelope("#f", &files, &resolved, &kept, true);
+            assert_eq!(
+                env.payload["note"],
+                json!(crate::chrome::files::unchecked_several_files_note()),
+                "case {case}: the skipped check is a note on the success"
+            );
+        }
 
-    #[test]
-    fn upload_envelope_keeps_a_consumed_input_a_success_with_its_warning() {
-        let (files, resolved) = upload_payload();
-        let consumed = ChromeResponse {
-            success: Some(true),
-            data: Some(json!({
-                "uploaded": 1, "attached": 0,
-                "warning": "upload events were delivered, but the file input is now empty",
-            })),
-            ..ChromeResponse::default()
-        };
-        let env = upload_ok_envelope("#f", &files, &resolved, &consumed, false);
-        assert!(env.ok);
-        assert_eq!(env.kind, OutKind::Ok);
-        assert_eq!(env.payload["attached"], json!(0));
-        assert_eq!(
-            env.payload["warning"],
-            json!("upload events were delivered, but the file input is now empty")
-        );
+        {
+            let case = "upload envelope keeps a consumed input a success with its warning";
+            let (files, resolved) = upload_payload();
+            let consumed = ChromeResponse {
+                success: Some(true),
+                data: Some(json!({
+                    "uploaded": 1, "attached": 0,
+                    "warning": "upload events were delivered, but the file input is now empty",
+                })),
+                ..ChromeResponse::default()
+            };
+            let env = upload_ok_envelope("#f", &files, &resolved, &consumed, false);
+            assert!(env.ok, "case {case}: a consumed input is still a success");
+            assert_eq!(env.kind, OutKind::Ok, "case {case}: its kind stays ok");
+            assert_eq!(
+                env.payload["attached"],
+                json!(0),
+                "case {case}: the browser's attached count is kept honest"
+            );
+            assert_eq!(
+                env.payload["warning"],
+                json!("upload events were delivered, but the file input is now empty"),
+                "case {case}: the warning is surfaced"
+            );
+        }
     }
 
     #[test]

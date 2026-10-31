@@ -2179,22 +2179,6 @@ fn encode_png(cap: Capture) -> anyhow::Result<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Minimal payload per variant, used to build a canonical tagged action
-    /// (`{"name": payload}`) for the deserialization half of the lockstep check.
-    fn action_payload(name: &str) -> Value {
-        match name {
-            "observe" | "screenshot" | "windows" | "apps" | "cursor" => json!({}),
-            "zoom" => json!({"region": [0, 0, 1, 1]}),
-            "click" => json!({"x": 1, "y": 1}),
-            "type" => json!({"text": "x"}),
-            "press" => json!({"keys": "a"}),
-            "scroll" => json!({"direction": "down"}),
-            "drag" => json!({"from": [0, 0], "to": [1, 1]}),
-            "wait" => json!({"seconds": 1}),
-            other => panic!("no lockstep payload for {other}"),
-        }
-    }
-
     fn unread_explorer() -> core::UnreadWindows {
         core::UnreadWindows {
             app_name: "Explorer".to_string(),
@@ -2226,147 +2210,204 @@ mod tests {
         }
     }
 
-    /// The unread note sits on its own line, so it can neither run into the last
-    /// window line nor claim that an application has nothing listed when it does.
-    #[test]
-    fn window_listing_puts_each_unread_note_on_its_own_line() {
-        let listing = core::WindowListing {
-            windows: vec![window_info("Start", false, Some(2))],
-            unread: vec![unread_explorer()],
-            frontmost: Some("Chrome".to_string()),
-            order: core::WindowOrder::All,
-        };
-        assert_eq!(
-            render_windows(&listing, &["w1".to_string()], None),
-            "[w1] #2 Chrome — \"Start\" 800x600 @ (0, 0)\n\
-             frontmost application: Chrome\n\
-             windows not listed for Explorer: one read timed out"
-        );
-        // A listing where nothing could be read is a failure, not "no windows".
-        let nothing = core::WindowListing {
-            windows: Vec::new(),
-            unread: vec![unread_explorer()],
-            frontmost: None,
-            order: core::WindowOrder::Unknown,
-        };
-        assert_eq!(
-            render_windows(&nothing, &[], None),
-            "no windows could be read\n\
-             frontmost application: unknown — the application in front could not be named\n\
-             windows not listed for Explorer: one read timed out"
-        );
+    /// A minimal payload that deserializes each action variant, used by the
+    /// schema lockstep: every declared field has a slot in the variant.
+    fn action_payload(name: &str) -> Value {
+        match name {
+            "observe" | "screenshot" | "windows" | "apps" | "cursor" => json!({}),
+            "zoom" => json!({"region": [0, 0, 1, 1]}),
+            "click" => json!({"x": 1, "y": 1}),
+            "type" => json!({"text": "x"}),
+            "press" => json!({"keys": "a"}),
+            "scroll" => json!({"direction": "down"}),
+            "drag" => json!({"from": [0, 0], "to": [1, 1]}),
+            "wait" => json!({"seconds": 1}),
+            other => panic!("no lockstep payload for {other}"),
+        }
     }
 
-    /// A listing says what the platform could establish about the set: a front-to-back
-    /// order only where it is attributable to the windows listed, the focused window of
-    /// the requested application, and whether that application is the one in front.
-    #[test]
-    fn window_listing_states_order_focus_and_the_application_in_front() {
-        let unordered = core::WindowListing {
-            windows: vec![window_info("Inbox", false, None)],
-            unread: Vec::new(),
-            frontmost: Some("Notes".to_string()),
-            order: core::WindowOrder::Unknown,
-        };
-        assert_eq!(
-            render_windows(&unordered, &["w1".to_string()], Some(&app("Chrome"))),
-            "[w1] Chrome — \"Inbox\" 800x600 @ (0, 0)\n\
-             front-to-back order: unknown — the platform could not attribute one to the windows \
-             listed\n\
-             Chrome is not frontmost — Notes is"
-        );
-
-        // The frontmost application's own listing marks its focused window.
-        let focused = core::WindowListing {
-            windows: vec![window_info("Inbox", true, Some(1))],
-            unread: Vec::new(),
-            frontmost: Some("Chrome".to_string()),
-            order: core::WindowOrder::All,
-        };
-        assert_eq!(
-            render_windows(&focused, &["w1".to_string()], Some(&app("Chrome"))),
-            "[w1] #1 Chrome — \"Inbox\" 800x600 @ (0, 0) [focused]\nChrome is frontmost"
-        );
-
-        // Where the platform cannot name the frontmost application, the listing says so.
-        let unknown = core::WindowListing {
-            windows: vec![window_info("Inbox", false, None)],
-            unread: Vec::new(),
-            frontmost: None,
-            order: core::WindowOrder::Unknown,
-        };
-        assert!(
-            render_windows(&unknown, &["w1".to_string()], Some(&app("Chrome"))).contains(
-                "whether Chrome is frontmost: unknown — the application in front could not be named"
-            )
-        );
+    /// One listing and what the rendered answer must say: the whole text when the
+    /// case is exact, or the fragments a longer one must carry.
+    struct ListingCase {
+        name: &'static str,
+        /// `(title, focused, rank)` of each window, in the order listed.
+        windows: &'static [(&'static str, bool, Option<usize>)],
+        unread: bool,
+        frontmost: Option<&'static str>,
+        order: core::WindowOrder,
+        /// The refs the answer prints for the listed windows.
+        refs: &'static [&'static str],
+        /// The application the request named, when it named one.
+        app: Option<&'static str>,
+        exact: Option<&'static str>,
+        present: &'static [&'static str],
     }
 
-    /// A listing's order statement says which kind of incompleteness it is: a partial order
-    /// counts what it covers, a failed read of the list names the read, and neither claims a
-    /// platform incapability.
+    #[expect(clippy::too_many_lines)]
     #[test]
-    fn a_partial_or_unread_order_says_which_it_is() {
-        let partial = core::WindowListing {
-            windows: vec![
-                window_info("Inbox", false, Some(1)),
-                window_info("Sent", false, None),
-                window_info("Drafts", false, None),
-            ],
-            unread: Vec::new(),
-            frontmost: Some("Chrome".to_string()),
-            order: core::WindowOrder::Partial,
-        };
-        assert!(
-            render_windows(&partial, &["w1".into(), "w2".into(), "w3".into()], None).contains(
-                "front-to-back order: given for 1 of the 3 listed windows (#1 is in front); 2 \
-                     have no on-screen entry"
-            )
-        );
-        let none_ranked = core::WindowListing {
-            windows: vec![
-                window_info("Inbox", false, None),
-                window_info("Sent", false, None),
-                window_info("Drafts", false, None),
-            ],
-            order: core::WindowOrder::Partial,
-            ..partial
-        };
-        assert!(
-            render_windows(&none_ranked, &["w1".into(), "w2".into(), "w3".into()], None).contains(
-                "front-to-back order: unknown — no listed window has an on-screen entry to be \
-                 ranked by"
-            )
-        );
-        // A list that could not be read is a failed read, not a fact about the windows.
-        let unread = core::WindowListing {
-            windows: vec![window_info("Inbox", false, None)],
-            unread: Vec::new(),
-            frontmost: Some("Chrome".to_string()),
-            order: core::WindowOrder::Unread,
-        };
-        assert!(render_windows(&unread, &["w1".to_string()], None).contains(
-            "front-to-back order: unknown — the list it is attributed from could not be read \
-                 this time"
-        ));
-    }
-
-    /// The applications listing names what is in front, including an application it
-    /// could not list among those shown.
-    #[test]
-    fn an_app_listing_names_the_frontmost_application_even_unlisted() {
-        assert_eq!(
-            frontmost_line(Some("Mail"), &["Mail", "Notes"]),
-            "frontmost application: Mail"
-        );
-        assert_eq!(
-            frontmost_line(Some("Dock"), &["Mail"]),
-            "frontmost application: Dock (not in the list above)"
-        );
-        assert_eq!(
-            frontmost_line(None, &["Mail"]),
-            "frontmost application: unknown — the application in front could not be named"
-        );
+    fn window_listing_cases() {
+        let cases = [
+            // The unread note sits on its own line, so it can neither run into the
+            // last window line nor claim that an application has nothing listed when
+            // it does.
+            ListingCase {
+                name: "an_unread_note_has_its_own_line",
+                windows: &[("Start", false, Some(2))],
+                unread: true,
+                frontmost: Some("Chrome"),
+                order: core::WindowOrder::All,
+                refs: &["w1"],
+                app: None,
+                exact: Some(
+                    "[w1] #2 Chrome — \"Start\" 800x600 @ (0, 0)\n\
+                     frontmost application: Chrome\n\
+                     windows not listed for Explorer: one read timed out",
+                ),
+                present: &[],
+            },
+            // A listing where nothing could be read is a failure, not "no windows".
+            ListingCase {
+                name: "a_listing_where_nothing_could_be_read",
+                windows: &[],
+                unread: true,
+                frontmost: None,
+                order: core::WindowOrder::Unknown,
+                refs: &[],
+                app: None,
+                exact: Some(
+                    "no windows could be read\n\
+                     frontmost application: unknown — the application in front could not be named\n\
+                     windows not listed for Explorer: one read timed out",
+                ),
+                present: &[],
+            },
+            // The order is stated only where it is attributable to the windows listed.
+            ListingCase {
+                name: "an_unordered_listing_says_so_and_names_the_application_in_front",
+                windows: &[("Inbox", false, None)],
+                unread: false,
+                frontmost: Some("Notes"),
+                order: core::WindowOrder::Unknown,
+                refs: &["w1"],
+                app: Some("Chrome"),
+                exact: Some(
+                    "[w1] Chrome — \"Inbox\" 800x600 @ (0, 0)\n\
+                     front-to-back order: unknown — the platform could not attribute one to the windows \
+                     listed\n\
+                     Chrome is not frontmost — Notes is",
+                ),
+                present: &[],
+            },
+            // The frontmost application's own listing marks its focused window.
+            ListingCase {
+                name: "the_frontmost_applications_own_listing_marks_its_focused_window",
+                windows: &[("Inbox", true, Some(1))],
+                unread: false,
+                frontmost: Some("Chrome"),
+                order: core::WindowOrder::All,
+                refs: &["w1"],
+                app: Some("Chrome"),
+                exact: Some(
+                    "[w1] #1 Chrome — \"Inbox\" 800x600 @ (0, 0) [focused]\nChrome is frontmost",
+                ),
+                present: &[],
+            },
+            // A partial order counts what it covers.
+            ListingCase {
+                name: "a_partial_order_counts_what_it_covers",
+                windows: &[
+                    ("Inbox", false, Some(1)),
+                    ("Sent", false, None),
+                    ("Drafts", false, None),
+                ],
+                unread: false,
+                frontmost: Some("Chrome"),
+                order: core::WindowOrder::Partial,
+                refs: &["w1", "w2", "w3"],
+                app: None,
+                exact: None,
+                present: &[
+                    "front-to-back order: given for 1 of the 3 listed windows (#1 is in front); 2 \
+                     have no on-screen entry",
+                ],
+            },
+            ListingCase {
+                name: "a_partial_order_with_no_ranked_window_says_so",
+                windows: &[
+                    ("Inbox", false, None),
+                    ("Sent", false, None),
+                    ("Drafts", false, None),
+                ],
+                unread: false,
+                frontmost: Some("Chrome"),
+                order: core::WindowOrder::Partial,
+                refs: &["w1", "w2", "w3"],
+                app: None,
+                exact: None,
+                present: &[
+                    "front-to-back order: unknown — no listed window has an on-screen entry to be \
+                     ranked by",
+                ],
+            },
+            // An application in front that the listing could not show is named all the
+            // same, with the note that it is not among those listed.
+            ListingCase {
+                name: "a_frontmost_application_the_listing_could_not_show",
+                windows: &[("Inbox", false, Some(1))],
+                unread: false,
+                frontmost: Some("Dock"),
+                order: core::WindowOrder::All,
+                refs: &["w1"],
+                app: None,
+                exact: None,
+                present: &["frontmost application: Dock (not in the list above)"],
+            },
+            // A list that could not be read is a failed read, not a fact about the
+            // windows.
+            ListingCase {
+                name: "an_unread_list_is_not_a_fact_about_the_windows",
+                windows: &[("Inbox", false, None)],
+                unread: false,
+                frontmost: Some("Chrome"),
+                order: core::WindowOrder::Unread,
+                refs: &["w1"],
+                app: None,
+                exact: None,
+                present: &[
+                    "front-to-back order: unknown — the list it is attributed from could not be read \
+                     this time",
+                ],
+            },
+        ];
+        for case in cases {
+            let listing = core::WindowListing {
+                windows: case
+                    .windows
+                    .iter()
+                    .map(|(title, focused, rank)| window_info(title, *focused, *rank))
+                    .collect(),
+                unread: if case.unread {
+                    vec![unread_explorer()]
+                } else {
+                    Vec::new()
+                },
+                frontmost: case.frontmost.map(str::to_string),
+                order: case.order,
+            };
+            let refs: Vec<String> = case.refs.iter().map(ToString::to_string).collect();
+            let app = case.app.map(app);
+            let answer = render_windows(&listing, &refs, app.as_ref());
+            if let Some(exact) = case.exact {
+                assert_eq!(answer, exact, "{}: the rendered listing", case.name);
+            }
+            for expected in case.present {
+                assert!(
+                    answer.contains(expected),
+                    "{}: the listing does not say {expected:?}: {answer}",
+                    case.name
+                );
+            }
+        }
     }
 
     /// One canonical tagged action, normalized and parsed as `execute` does.

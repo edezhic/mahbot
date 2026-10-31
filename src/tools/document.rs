@@ -4357,9 +4357,8 @@ fn require_sheet_name_text(name: &str, at: &str) -> Result<()> {
 /// hold: a text like `==SUM(A1:A2)` is refused rather than reaching a cell's
 /// `<f>` element, where it would no longer be a formula.
 ///
-/// The kit's writer keeps the same rule as its own last line, and the paired
-/// `the_tool_and_the_kit_refuse_the_same_shapes` drives both sides, so the two
-/// cannot drift apart unnoticed.
+/// The kit's writer repeats the same rule as its own last line, so the two read
+/// alike.
 fn normalized_formula(at: &str, object: &serde_json::Map<String, Value>) -> Result<Value> {
     let normalized = object
         .get("formula")

@@ -882,12 +882,6 @@ impl<'a> TicketBuilder<'a> {
         self
     }
 
-    /// Set the reporter (default: `"test"`).
-    pub(crate) fn reporter(mut self, reporter: impl Into<String>) -> Self {
-        self.reporter = reporter.into();
-        self
-    }
-
     /// Create the ticket with the accumulated parameters.
     pub(crate) async fn create(self) -> anyhow::Result<String> {
         let (store, params) = self.into_parts();
@@ -1311,6 +1305,30 @@ pub(crate) fn rel_source_path(manifest_dir: &Path, file: &Path) -> String {
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// The one table assertion the case tables in this crate share: every
+/// `contains` needle is present in `result` and every `not_contains` needle
+/// absent, naming the case whose row broke — the name is the only thing a
+/// reader of a table-driven failure has to go on.
+pub(crate) fn assert_contains_not_contains(
+    name: &str,
+    result: &str,
+    contains: &[&str],
+    not_contains: &[&str],
+) {
+    for needle in contains {
+        assert!(
+            result.contains(needle),
+            "[{name}] expected contains {needle:?}\n  got: {result:?}",
+        );
+    }
+    for needle in not_contains {
+        assert!(
+            !result.contains(needle),
+            "[{name}] expected NOT contains {needle:?}\n  got: {result:?}",
+        );
+    }
 }
 
 // ── EnvVarGuard tests ─────────────────────────────────────────────────

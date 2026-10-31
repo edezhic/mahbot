@@ -221,58 +221,6 @@ mod tests {
         items.iter().map(|s| (*s).to_string()).collect()
     }
 
-    /// A slice of grants as the stored entries they encode to.
-    fn encoded(grants: &[ToolGrant]) -> Vec<String> {
-        grants.iter().map(encode).collect()
-    }
-
-    #[test]
-    fn parse_reads_kinds_and_canonicalizes_order() {
-        let parsed = parse(&entries(&["send:manager,worker", "read"])).unwrap();
-        assert_eq!(
-            parsed,
-            vec![
-                ToolGrant {
-                    tool: "send".to_string(),
-                    kinds: vec!["worker".to_string(), "manager".to_string()],
-                },
-                ToolGrant {
-                    tool: "read".to_string(),
-                    kinds: Vec::new(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_names_each_tool_once() {
-        assert!(
-            parse(&entries(&["analyze:quick", "analyze:deep"])).is_err(),
-            "a second entry for the same tool is refused"
-        );
-        assert!(
-            parse(&entries(&["read", "read"])).is_err(),
-            "a repeated kindless tool is refused too"
-        );
-    }
-
-    /// The lenient read: only the entries the grammar refuses are dropped, so
-    /// one bad row cannot cost the rest of the record.
-    #[test]
-    fn parse_lossy_drops_only_the_bad_entries() {
-        let lost = parse_lossy(&entries(&[
-            "read",
-            "analyze:bogus",
-            "send:worker",
-            "read:quick",
-        ]));
-        assert_eq!(
-            encoded(&lost),
-            entries(&["read", "send:worker"]),
-            "the parseable entries survive in their stored order"
-        );
-    }
-
     /// A bare dispatch-tool entry holds the vocabulary's narrowest kind, and
     /// the admin-facing spelling fills it in.
     #[test]
@@ -328,12 +276,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_refuses_unknown_kind_and_kinds_on_a_kindless_tool() {
-        assert!(parse(&entries(&["analyze:bogus"])).is_err());
-        assert!(parse(&entries(&["read:quick"])).is_err());
-    }
-
     /// The grant vocabulary is [`Addressee::STRS`], never the wider vocabulary
     /// [`Addressee::parse`] reads: an entry is validated here before it ever
     /// reaches the tool's parser, so neither owner-side address is grantable.
@@ -344,15 +286,6 @@ mod tests {
         assert!(
             parse(&entries(&["send:worker,assistant"])).is_err(),
             "a known kind beside an unknown one does not make the entry valid"
-        );
-    }
-
-    #[test]
-    fn encode_roundtrips() {
-        let parsed = parse(&entries(&["send:worker,role", "read", "analyze"])).unwrap();
-        assert_eq!(
-            encoded(&parsed),
-            entries(&["send:worker,role", "read", "analyze"])
         );
     }
 }

@@ -3179,81 +3179,99 @@ mod tests {
         assert!(is_advertised());
     }
 
+    /// A reporting gap is neither health nor a named cause: an Unknown verdict claims neither
+    /// that the connection is fine nor that it is ruled out, promises no cause-specific repair
+    /// and spends no restart — and an action is still dispatched on it, with the snapshot served
+    /// as the facts it did establish say.
     #[tokio::test]
-    async fn unknown_is_not_health_but_is_not_a_classified_cause() {
-        // The tool did not answer, so nothing was established. That must not sit
-        // in the health cache as "fine", must not be reported as a named cause,
-        // and must not drive a restart.
-        let _guard = with_health_test_lock().await;
-        reset_health();
-        set_readiness_snapshot(None);
-        set_health(ProbeOutcome::Unknown);
-        let msg = daemon_down_message();
-        assert!(msg.contains("did not answer"), "got: {msg}");
-        assert!(msg.contains("nothing could be established"), "got: {msg}");
-        // The launch/restart tails belong to classified causes — an Unknown
-        // must not promise a cause-specific repair.
-        assert!(!msg.contains("relay is down"), "got: {msg}");
-        assert!(!msg.contains("not installed"), "got: {msg}");
-        // An Unknown verdict has no classified cause, so `refusal_message` adds
-        // nothing to the gate's own facts — and no report tail either: the gate is
-        // shared with the page rasteriser, so the agent's sentence is the chrome
-        // tool's to add.
-        let refusal = refusal_message("the facts");
-        assert_eq!(refusal, "the facts");
+    async fn a_reporting_gap_is_neither_health_nor_a_cause() {
+        {
+            let case = "unknown is not health but is not a classified cause";
+            // The tool did not answer, so nothing was established. That must not sit
+            // in the health cache as "fine", must not be reported as a named cause,
+            // and must not drive a restart.
+            let _guard = with_health_test_lock().await;
+            reset_health();
+            set_readiness_snapshot(None);
+            set_health(ProbeOutcome::Unknown);
+            let msg = daemon_down_message();
+            assert!(msg.contains("did not answer"), "case {case}: got: {msg}");
+            assert!(
+                msg.contains("nothing could be established"),
+                "case {case}: got: {msg}"
+            );
+            // The launch/restart tails belong to classified causes — an Unknown
+            // must not promise a cause-specific repair.
+            assert!(!msg.contains("relay is down"), "case {case}: got: {msg}");
+            assert!(!msg.contains("not installed"), "case {case}: got: {msg}");
+            // An Unknown verdict has no classified cause, so `refusal_message` adds
+            // nothing to the gate's own facts — and no report tail either: the gate is
+            // shared with the page rasteriser, so the agent's sentence is the chrome
+            // tool's to add.
+            let refusal = refusal_message("the facts");
+            assert_eq!(refusal, "the facts", "case {case}");
 
-        // The tool DID answer and a fact inside its answer was missing: the
-        // snapshot's own refusal is accurate and must be what the caller reads —
-        // never the false claim that the CLI stayed silent.
-        let answered = Readiness {
-            answered: true,
-            relay_up: None,
-            ..Readiness::default()
-        };
-        set_readiness_snapshot(Some(answered));
-        let msg = daemon_down_message();
-        assert!(!msg.contains("did not answer"), "got: {msg}");
-        assert!(
-            msg.contains("whether the extension relay is up"),
-            "got: {msg}"
-        );
-        assert!(msg.contains("re-checking continues"), "got: {msg}");
-        // …and a CLASSIFIED verdict's cause IS appended to the gate's facts — as a
-        // cause, still without the chrome tool's report tail.
-        set_health(ProbeOutcome::Down(ProbeFailure::RelayDown));
-        let msg = refusal_message("the facts");
-        assert!(msg.starts_with("the facts "), "got: {msg}");
-        assert!(msg.contains("relay is down"), "got: {msg}");
-        assert!(!msg.contains("Report it as it came"), "got: {msg}");
-        set_readiness_snapshot(None);
-        reset_health();
+            // The tool DID answer and a fact inside its answer was missing: the
+            // snapshot's own refusal is accurate and must be what the caller reads —
+            // never the false claim that the CLI stayed silent.
+            let answered = Readiness {
+                answered: true,
+                relay_up: None,
+                ..Readiness::default()
+            };
+            set_readiness_snapshot(Some(answered));
+            let msg = daemon_down_message();
+            assert!(!msg.contains("did not answer"), "case {case}: got: {msg}");
+            assert!(
+                msg.contains("whether the extension relay is up"),
+                "case {case}: got: {msg}"
+            );
+            assert!(
+                msg.contains("re-checking continues"),
+                "case {case}: got: {msg}"
+            );
+            // …and a CLASSIFIED verdict's cause IS appended to the gate's facts — as a
+            // cause, still without the chrome tool's report tail.
+            set_health(ProbeOutcome::Down(ProbeFailure::RelayDown));
+            let msg = refusal_message("the facts");
+            assert!(msg.starts_with("the facts "), "case {case}: got: {msg}");
+            assert!(msg.contains("relay is down"), "case {case}: got: {msg}");
+            assert!(
+                !msg.contains("Report it as it came"),
+                "case {case}: got: {msg}"
+            );
+            set_readiness_snapshot(None);
+            reset_health();
+        }
+        {
+            let case = "an unestablished snapshot dispatches and spends no restart";
+            // The gate's other half: a snapshot that is neither proven nor blocked —
+            // the tool answered but a decisive key was missing — is NOT a refusal.
+            // The action is dispatched, because a reporting gap must not take both
+            // chrome surfaces out of service, and no restart is spent on it: a restart
+            // destroys session state, so only a cause a fact established may pay for
+            // one. The cached snapshot is served as-is, so no CLI is spawned here.
+            let _guard = with_health_test_lock().await;
+            reset_health();
+            set_readiness_snapshot(Some(Readiness {
+                answered: true,
+                chrome_running: Some(true),
+                display: Some(true),
+                ..Readiness::default()
+            }));
+            assert!(ensure_ready_for_actions().await.is_ok(), "case {case}");
+            let h = health().lock().unwrap_poison();
+            assert_eq!(h.verdict, None, "case {case}");
+            assert_eq!(h.restart_budget.attempts, 0, "case {case}");
+            drop(h);
+            set_readiness_snapshot(None);
+            reset_health();
+        }
     }
 
-    #[tokio::test]
-    async fn an_unestablished_snapshot_dispatches_and_spends_no_restart() {
-        // The gate's other half: a snapshot that is neither proven nor blocked —
-        // the tool answered but a decisive key was missing — is NOT a refusal.
-        // The action is dispatched, because a reporting gap must not take both
-        // chrome surfaces out of service, and no restart is spent on it: a restart
-        // destroys session state, so only a cause a fact established may pay for
-        // one. The cached snapshot is served as-is, so no CLI is spawned here.
-        let _guard = with_health_test_lock().await;
-        reset_health();
-        set_readiness_snapshot(Some(Readiness {
-            answered: true,
-            chrome_running: Some(true),
-            display: Some(true),
-            ..Readiness::default()
-        }));
-        assert!(ensure_ready_for_actions().await.is_ok());
-        let h = health().lock().unwrap_poison();
-        assert_eq!(h.verdict, None);
-        assert_eq!(h.restart_budget.attempts, 0);
-        drop(h);
-        set_readiness_snapshot(None);
-        reset_health();
-    }
-
+    /// The down message names the launch state it actually has: a plain relay drop,
+    /// the non-default-profile caveat after a successful launch, the launch promise,
+    /// the failed-launch backoff, and the paused budget that supersedes it.
     #[tokio::test]
     async fn daemon_down_message_reflects_launch_state() {
         let _guard = with_health_test_lock().await;
@@ -3266,10 +3284,22 @@ mod tests {
         // Every integration cause ends with the one thing the agent does about it.
         set_health(ProbeOutcome::Down(ProbeFailure::RelayDown));
         let msg = daemon_down_message();
-        assert!(msg.contains("relay is down"));
-        assert!(!msg.contains("auto-launched"));
-        assert!(msg.contains("Report it as it came"), "got: {msg}");
-        assert!(msg.contains("leave the repair to the owner"), "got: {msg}");
+        assert!(
+            msg.contains("relay is down"),
+            "the plain relay drop names the relay: {msg}"
+        );
+        assert!(
+            !msg.contains("auto-launched"),
+            "no launch was attempted, so no launch caveat: {msg}"
+        );
+        assert!(
+            msg.contains("Report it as it came"),
+            "the agent reports it as it came: {msg}"
+        );
+        assert!(
+            msg.contains("leave the repair to the owner"),
+            "the repair is the owner's: {msg}"
+        );
 
         // Relay still down after a successful auto-launch — the durable caveat
         // (non-default profile) surfaces instead of the plain relay-drop text.
@@ -3277,16 +3307,28 @@ mod tests {
         set_health(ProbeOutcome::Down(ProbeFailure::RelayDown));
         record_launch_outcome(ChromeLaunchOutcome::Launched);
         let msg = daemon_down_message();
-        assert!(msg.contains("not republishing its relay"));
-        assert!(msg.contains("non-default profile"));
+        assert!(
+            msg.contains("not republishing its relay"),
+            "a launched browser names the relay caveat: {msg}"
+        );
+        assert!(
+            msg.contains("non-default profile"),
+            "the caveat names the non-default profile: {msg}"
+        );
 
         // Chrome not running with no recorded launch — the tail promises a
         // launch, honest whether it fires this cycle or after backoff.
         reset_health();
         set_health(ProbeOutcome::Down(ProbeFailure::ChromeNotRunning));
         let msg = daemon_down_message();
-        assert!(msg.contains("Chrome is not running."));
-        assert!(msg.contains("launches Chrome and keeps retrying"));
+        assert!(
+            msg.contains("Chrome is not running."),
+            "the cause is stated: {msg}"
+        );
+        assert!(
+            msg.contains("launches Chrome and keeps retrying"),
+            "recovery launches Chrome: {msg}"
+        );
 
         // Chrome not running, last launch failed — the failed-attempt cause and
         // the backoff retry tail both appear (the launch budget is not halted),
@@ -3295,12 +3337,18 @@ mod tests {
         set_health(ProbeOutcome::Down(ProbeFailure::ChromeNotRunning));
         record_launch_outcome(ChromeLaunchOutcome::Failed);
         let msg = daemon_down_message();
-        assert!(msg.contains("auto-launch failed on this host"));
+        assert!(
+            msg.contains("auto-launch failed on this host"),
+            "a failed launch names the cause: {msg}"
+        );
         assert!(
             msg.contains("retries the launch with backoff"),
-            "got: {msg}"
+            "the retry is a backoff: {msg}"
         );
-        assert!(!msg.contains("start Chrome manually"), "got: {msg}");
+        assert!(
+            !msg.contains("start Chrome manually"),
+            "no manual step is handed to the agent: {msg}"
+        );
 
         // Same failed launch but the budget is halted (thrash protection) — the
         // cooldown text supersedes the backoff retry promise.
@@ -3309,586 +3357,678 @@ mod tests {
         record_launch_outcome(ChromeLaunchOutcome::Failed);
         health().lock().unwrap_poison().launch_budget.halted = true;
         let msg = daemon_down_message();
-        assert!(msg.contains("Launch attempts are paused"));
-        assert!(!msg.contains("retries the launch with backoff"));
+        assert!(
+            msg.contains("Launch attempts are paused"),
+            "a halted budget is the cooldown: {msg}"
+        );
+        assert!(
+            !msg.contains("retries the launch with backoff"),
+            "the cooldown supersedes the backoff promise: {msg}"
+        );
 
-        // Chrome not running because there is no display — recovery is paused
-        // for this cause instead of spending the launch budget.
-        reset_health();
-        set_health(ProbeOutcome::Down(ProbeFailure::ChromeNotRunning));
-        record_launch_outcome(ChromeLaunchOutcome::NoDisplay);
-        let msg = daemon_down_message();
-        assert!(msg.contains("no display"));
-        assert!(msg.contains("paused on this host"));
-
-        // Absent extension — the cause, the paused recovery tail, and neither an
-        // install step nor a repair path for the agent.
-        reset_health();
-        set_health(ProbeOutcome::Down(ProbeFailure::ExtensionAbsent));
-        let msg = daemon_down_message();
-        assert!(msg.contains("not installed in Chrome"));
-        assert!(msg.contains("is paused for this cause"));
-        assert!(!msg.contains("Web Store"), "got: {msg}");
-        assert!(!msg.contains("chrome://"), "got: {msg}");
-
-        // Wedged daemon — the generic down text plus the restart tail.
-        reset_health();
-        set_health(ProbeOutcome::Down(ProbeFailure::DaemonWedge));
-        let msg = daemon_down_message();
-        assert!(msg.contains("down or unresponsive"));
-        assert!(msg.contains("restarts it automatically"));
         // Leave the singleton pristine for sibling health tests.
         reset_health();
     }
 
-    #[test]
-    fn sustained_health_resets_restart_attempts() {
-        let now = Instant::now();
-        let mut h = DaemonHealth {
-            restart_budget: AttemptBudget {
-                attempts: 2,
-                next_at: Some(now),
-                halted: true,
-                halted_until: Some(now),
-            },
-            ..DaemonHealth::default()
-        };
-        // A transient healthy result (e.g. the post-restart verification probe)
-        // must not reset the budget — a runaway cycle would otherwise reopen a
-        // fresh bounded cycle on every restart.
-        h.apply_outcome(ProbeOutcome::Healthy, now, false);
-        assert_eq!(h.restart_budget.attempts, 2);
-        assert!(h.restart_budget.halted);
-        // The first watchdog healthy seeds the sustained-healthy window…
-        h.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL, true);
-        assert_eq!(h.restart_budget.attempts, 2);
-        assert!(h.healthy_since.is_some());
-        // …but a second healthy before the window elapses still does not reset.
-        h.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL * 2, true);
-        assert_eq!(h.restart_budget.attempts, 2);
-        assert!(h.restart_budget.halted);
-        // Only sustained health across the window opens a fresh bounded cycle.
-        h.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL * 3, true);
-        assert_eq!(h.restart_budget.attempts, 0);
-        assert_eq!(h.restart_budget.next_at, None);
-        assert!(!h.restart_budget.halted);
-        assert!(h.restart_budget.halted_until.is_none());
-        assert_eq!(h.failure(), None);
-    }
-
-    #[test]
-    fn cause_flapping_and_transient_health_do_not_reset_restart_budget() {
-        let now = Instant::now();
-        let mut h = DaemonHealth {
-            restart_budget: AttemptBudget {
-                attempts: 2,
-                next_at: Some(now),
-                ..AttemptBudget::default()
-            },
-            verdict: Some(ProbeOutcome::Down(ProbeFailure::DaemonWedge)),
-            ..DaemonHealth::default()
-        };
-        // A cause flip (wedge → relay-down) must NOT reset the budget —
-        // alternating causes must not evade the 3-attempt halt.
-        h.apply_outcome(ProbeOutcome::Down(ProbeFailure::RelayDown), now, true);
-        assert_eq!(h.failure(), Some(ProbeFailure::RelayDown));
-        assert_eq!(h.restart_budget.attempts, 2);
-        assert!(h.restart_budget.next_at.is_some());
-        // Flapping back and forth accumulates — never resets.
-        h.apply_outcome(ProbeOutcome::Down(ProbeFailure::DaemonWedge), now, true);
-        h.apply_outcome(ProbeOutcome::Down(ProbeFailure::RelayDown), now, true);
-        assert_eq!(h.failure(), Some(ProbeFailure::RelayDown));
-        assert_eq!(h.restart_budget.attempts, 2);
-        // A transient healthy result does not reset either — only sustained
-        // health across the window opens a fresh bounded cycle.
-        h.apply_outcome(ProbeOutcome::Healthy, now, true);
-        assert_eq!(h.restart_budget.attempts, 2);
-        assert!(h.restart_budget.next_at.is_some());
-        h.apply_outcome(ProbeOutcome::Healthy, now + SUSTAINED_HEALTHY_WINDOW, true);
-        assert_eq!(h.failure(), None);
-        assert_eq!(h.restart_budget.attempts, 0);
-        assert_eq!(h.restart_budget.next_at, None);
-        assert!(!h.restart_budget.halted);
-    }
-
-    #[test]
-    fn gate_honors_backoff_before_halt() {
-        let now = Instant::now();
-        let mut h = DaemonHealth::default();
-        assert_eq!(h.gate_restart(now), RecoveryGate::Allowed(1));
-        // 30s backoff before attempt 2.
-        assert_eq!(h.gate_restart(now), RecoveryGate::Backoff);
-        assert_eq!(
-            h.gate_restart(now + RESTART_BACKOFF[0]),
-            RecoveryGate::Allowed(2)
-        );
-        // 2min backoff before attempt 3.
-        let t2 = now + RESTART_BACKOFF[0] + RESTART_BACKOFF[1];
-        assert_eq!(h.gate_restart(t2), RecoveryGate::Allowed(3));
-        // The final 10-min grace is honored before the halt fires.
-        assert_eq!(h.gate_restart(t2), RecoveryGate::Backoff);
-        let t3 = t2 + RESTART_BACKOFF[2];
-        assert_eq!(h.gate_restart(t3), RecoveryGate::Halted);
-        assert!(h.restart_budget.halted);
-        assert_eq!(h.gate_restart(t3), RecoveryGate::Cooldown);
-        // After the cooldown a fresh bounded cycle starts.
-        assert_eq!(h.gate_restart(t3 + HALT_COOLDOWN), RecoveryGate::Allowed(1));
-        assert_eq!(h.restart_budget.attempts, 1);
-        assert!(!h.restart_budget.halted);
-    }
-
-    #[test]
-    fn relay_down_classification_precedence() {
-        // Disabled wins regardless of whether Chrome is running.
-        assert_eq!(
-            classify_relay_down(ExtensionState::Disabled, Some(true)),
-            ProbeFailure::ExtensionDisabled
-        );
-        assert_eq!(
-            classify_relay_down(ExtensionState::Disabled, Some(false)),
-            ProbeFailure::ExtensionDisabled
-        );
-        assert_eq!(
-            classify_relay_down(ExtensionState::Disabled, None),
-            ProbeFailure::ExtensionDisabled
-        );
-        // Absent beats ChromeNotRunning — launching can't fix an uninstalled extension.
-        assert_eq!(
-            classify_relay_down(ExtensionState::Absent, Some(false)),
-            ProbeFailure::ExtensionAbsent
-        );
-        assert_eq!(
-            classify_relay_down(ExtensionState::Absent, None),
-            ProbeFailure::ExtensionAbsent
-        );
-        // Present + no Chrome running → ChromeNotRunning.
-        assert_eq!(
-            classify_relay_down(ExtensionState::Present, Some(false)),
-            ProbeFailure::ChromeNotRunning
-        );
-        // Present + Chrome running (or an inconclusive probe) → transient relay drop.
-        assert_eq!(
-            classify_relay_down(ExtensionState::Present, Some(true)),
-            ProbeFailure::RelayDown
-        );
-        assert_eq!(
-            classify_relay_down(ExtensionState::Present, None),
-            ProbeFailure::RelayDown
-        );
-        // Unknown fails open to the probe; only an explicit no-Chrome proves not running.
-        assert_eq!(
-            classify_relay_down(ExtensionState::Unknown, Some(false)),
-            ProbeFailure::ChromeNotRunning
-        );
-        assert_eq!(
-            classify_relay_down(ExtensionState::Unknown, None),
-            ProbeFailure::RelayDown
-        );
-        // ChromeNotRunning is recoverable (launch), ExtensionAbsent is not.
-        assert!(!ProbeFailure::ChromeNotRunning.is_unfixable());
-        assert!(ProbeFailure::ExtensionAbsent.is_unfixable());
-    }
-
-    #[test]
-    fn extension_state_parsing() {
-        // No `data` at all, or no `chromeExtension` within it → shape-uncertain,
-        // never the unfixable absent cause (fails open as unknown).
-        assert_eq!(
-            extension_state_from(&serde_json::json!({})),
-            ExtensionState::Unknown
-        );
-        assert_eq!(
-            extension_state_from(&serde_json::json!({ "data": {} })),
-            ExtensionState::Unknown
-        );
-        // Explicit null → absent (the CLI reports the extension as not present).
-        assert_eq!(
-            extension_state_from(&serde_json::json!({ "data": { "chromeExtension": null } })),
-            ExtensionState::Absent
-        );
-        // Present with an empty disableReasons, or with no disableReasons at all.
-        assert_eq!(
-            extension_state_from(&serde_json::json!({
-                "data": { "chromeExtension": { "disableReasons": [] } }
-            })),
-            ExtensionState::Present
-        );
-        assert_eq!(
-            extension_state_from(&serde_json::json!({
-                "data": { "chromeExtension": { "enabled": true } }
-            })),
-            ExtensionState::Present
-        );
-        // Disabled when disableReasons is non-empty.
-        assert_eq!(
-            extension_state_from(&serde_json::json!({
-                "data": { "chromeExtension": { "disableReasons": ["user"] } }
-            })),
-            ExtensionState::Disabled
-        );
-    }
-
-    #[test]
-    fn readiness_reports_every_fact_and_refuses_without_a_real_browser() {
-        // The healthy snapshot: every fact established, ready for actions.
-        let status = serde_json::json!({
-            "data": {
-                "cliVersion": "1.5.141",
-                "extension": {
-                    "hostInstalled": true,
-                    "hostHealthy": true,
-                    "relayUp": true,
-                    "profileEmail": "owner@example.com",
-                    "profileId": "abc-123"
-                }
-            }
-        });
-        let browsers = serde_json::json!({
-            "data": { "browsers": [{ "email": "owner@example.com", "id": "abc-123" }] }
-        });
-        let mut ready = Readiness::from_status(Some(&status));
-        ready.chrome_running = Some(true);
-        ready.display = Some(true);
-        ready.real_browser = Readiness::real_browser_from(Some(&browsers));
-        assert!(ready.ready_for_actions());
-        assert_eq!(ready.outcome(), ProbeOutcome::Healthy);
-        let report = ready.report();
-        assert!(report.contains("established:"));
-        assert!(report.contains("established as NOT holding:\n    - nothing"));
-        assert!(report.contains("not established:\n    - nothing"));
-        assert!(report.contains("chrome-use 1.5.141"), "got: {report}");
-        assert!(
-            report.contains("driving the real profile owner@example.com (abc-123)"),
-            "got: {report}"
-        );
-        assert!(
-            report.contains("a real browser is reachable through the relay"),
-            "got: {report}"
-        );
-        // Process presence is reported as a fact, never as health.
-        assert!(
-            report.contains("process presence is not by itself health"),
-            "got: {report}"
-        );
-        assert!(
-            report.contains("this host has a usable display"),
-            "got: {report}"
-        );
-        assert!(
-            report.contains("verdict: ready for actions"),
-            "got: {report}"
-        );
-
-        // An UNANSWERED `browsers` list (`None`, e.g. a subcommand/shape change
-        // in a future chrome-use) is a reporting gap: a decisive fact was never
-        // established, so the connection is NOT proven, the outcome is `Unknown`
-        // rather than health, and no cause is invented from it.
-        let mut unanswered_browsers = ready.clone();
-        unanswered_browsers.real_browser = None;
-        assert!(!unanswered_browsers.ready_for_actions());
-        assert_eq!(unanswered_browsers.outcome(), ProbeOutcome::Unknown);
-        assert!(!unanswered_browsers.blocked());
-
-        // The failure this gate exists for: the relay is up but no real browser
-        // profile is reachable — not ready, and the refusal says plainly what
-        // would have happened otherwise. The established negative is reported
-        // with what the product KNOWS, under "established as NOT holding".
-        let empty = serde_json::json!({ "data": { "browsers": [] } });
-        let mut not_ready = Readiness::from_status(Some(&status));
-        not_ready.chrome_running = Some(true);
-        not_ready.display = Some(true);
-        not_ready.real_browser = Readiness::real_browser_from(Some(&empty));
-        assert!(!not_ready.ready_for_actions());
-        assert_eq!(not_ready.down_cause(), Some(ProbeFailure::RelayDown));
-        assert_eq!(
-            not_ready.outcome(),
-            ProbeOutcome::Down(ProbeFailure::RelayDown)
-        );
-        let not_ready_report = not_ready.report();
-        assert!(
-            not_ready_report.contains(
-                "established as NOT holding:\n    - no real browser profile is reachable through \
-                 the relay"
-            ),
-            "got: {not_ready_report}"
-        );
-        // An established cause is the one verdict that says the connection was
-        // ruled out, so the action is refused rather than attempted.
-        assert!(
-            not_ready_report.contains("verdict: NOT ready for actions"),
-            "got: {not_ready_report}"
-        );
-        assert!(
-            not_ready
-                .refusal()
-                .contains("the work would have gone to a browser chrome-use launches itself"),
-            "got: {}",
-            not_ready.refusal()
-        );
-
-        // A host with NO display is reported as such but refuses nothing: a
-        // usable display is what chrome-use needs to LAUNCH the owner's Chrome,
-        // and a browser already running is still reachable through the relay. The
-        // fact is established, but it is not a decisive one — the connection is
-        // still proven.
-        let mut headless = ready.clone();
-        headless.display = Some(false);
-        assert!(headless.ready_for_actions());
-        assert_eq!(headless.down_cause(), None);
-        assert!(!headless.blocked());
-        let headless_report = headless.report();
-        assert!(
-            headless_report.contains("this host has NO usable display"),
-            "got: {headless_report}"
-        );
-        assert!(
-            headless_report.contains("verdict: ready for actions"),
-            "got: {headless_report}"
-        );
-        // The display blocks nothing even when another DECISIVE fact is missing:
-        // the connection is then not proven (`Unknown`), never ruled out.
-        let mut headless_unproven = headless.clone();
-        headless_unproven.real_browser = None;
-        assert!(!headless_unproven.ready_for_actions());
-        assert_eq!(headless_unproven.outcome(), ProbeOutcome::Unknown);
-        assert!(!headless_unproven.blocked());
-    }
-
-    #[test]
-    fn readiness_never_defaults_a_missing_fact_to_fine() {
-        // Nothing answered: every fact stays unestablished, the verdict is
-        // Unknown rather than Healthy, and no cause is claimed — which is what
-        // keeps an unanswerable probe out of both the health verdict and the
-        // restart budget.
-        let nothing = Readiness::default();
-        assert!(!nothing.answered);
-        assert!(!nothing.ready_for_actions());
-        assert_eq!(nothing.outcome(), ProbeOutcome::Unknown);
-        assert_eq!(nothing.down_cause(), None);
-        let report = nothing.report();
-        assert!(report.contains("established:\n    - nothing"));
-        assert!(report.contains("established as NOT holding:"));
-        assert!(report.contains("not established:"));
-        assert!(
-            report.contains("whether the tool answers `status` at all"),
-            "got: {report}"
-        );
-        // Not proven and nothing ruled out: the verdict must not claim the
-        // connection is fine, and must not claim it is ruled out either.
-        assert!(
-            report.contains("verdict: NOT proven ready for actions"),
-            "got: {report}"
-        );
-        assert!(
-            !report.contains("verdict: NOT ready for actions"),
-            "got: {report}"
-        );
-
-        // A status that answered but carries no extension data at all: every
-        // decisive key is missing, so nothing is established.
-        let bare = serde_json::json!({ "data": { "cliVersion": "1.2.3" } });
-        let mut r = Readiness::from_status(Some(&bare));
-        r.chrome_running = Some(true);
-        assert!(r.answered);
-        assert_eq!(r.relay_up, None);
-        assert_eq!(r.host_installed, None);
-        assert!(!r.ready_for_actions());
-        assert_eq!(r.outcome(), ProbeOutcome::Unknown);
-    }
-
-    #[test]
-    fn readiness_classifies_only_what_a_fact_established() {
-        // Installed host + relay down + a closed browser → ChromeNotRunning, so
-        // the gate launches the owner's Chrome rather than restarting a daemon.
-        let status = serde_json::json!({
-            "data": { "extension": {
-                "hostInstalled": true,
-                "hostHealthy": true,
-                "relayUp": false
-            } }
-        });
-        let mut relay_down = Readiness::from_status(Some(&status));
-        relay_down.extension = Some(ExtensionState::Present);
-        relay_down.chrome_running = Some(false);
-        assert_eq!(
-            relay_down.down_cause(),
-            Some(ProbeFailure::ChromeNotRunning)
-        );
-        // The process fact is reported as the fact it is, stated flatly in the
-        // established-as-NOT-holding list.
-        let report = relay_down.report();
-        assert!(
-            report.contains("    - no Chrome-family process is running"),
-            "got: {report}"
-        );
-        // An absent extension is unfixable — no launch or restart recovers it.
-        let mut absent = relay_down;
-        absent.extension = Some(ExtensionState::Absent);
-        assert_eq!(absent.down_cause(), Some(ProbeFailure::ExtensionAbsent));
-        let absent_cause = absent.down_cause();
-        assert!(absent_cause.is_some_and(ProbeFailure::is_unfixable));
-        // The native-host facts classify before the relay does.
-        let uninstalled =
-            serde_json::json!({ "data": { "extension": { "hostInstalled": false } } });
-        assert_eq!(
-            Readiness::from_status(Some(&uninstalled)).down_cause(),
-            Some(ProbeFailure::NotInstalled)
-        );
-    }
-
-    #[test]
-    fn launch_budget_is_independent_of_restart_budget() {
-        let now = Instant::now();
-        // A halted/exhausted RESTART budget must NOT block a launch — the two
-        // bounded cycles are independent.
-        let mut h = DaemonHealth {
-            restart_budget: AttemptBudget {
-                attempts: MAX_RESTART_ATTEMPTS,
-                halted: true,
-                halted_until: Some(now),
-                ..AttemptBudget::default()
-            },
-            ..DaemonHealth::default()
-        };
-        assert!(matches!(h.gate_launch(now), RecoveryGate::Allowed(_)));
-        assert_eq!(h.launch_budget.attempts, 1);
-        // An exhausted LAUNCH budget still leaves the restart gate open.
-        let mut h2 = DaemonHealth {
-            launch_budget: AttemptBudget {
-                attempts: MAX_LAUNCH_ATTEMPTS,
-                ..AttemptBudget::default()
-            },
-            ..DaemonHealth::default()
-        };
-        assert!(!matches!(h2.gate_launch(now), RecoveryGate::Allowed(_)));
-        assert!(matches!(h2.gate_restart(now), RecoveryGate::Allowed(_)));
-        // Sustained health resets both budgets and clears a recorded launch
-        // outcome (a pending Failed launch must not survive recovery).
-        let mut h3 = DaemonHealth {
-            restart_budget: AttemptBudget {
-                attempts: 2,
-                next_at: Some(now),
-                halted: true,
-                halted_until: Some(now),
-            },
-            launch_budget: AttemptBudget {
-                attempts: 2,
-                next_at: Some(now),
-                halted: true,
-                halted_until: Some(now),
-            },
-            launch_outcome: Some(ChromeLaunchOutcome::Failed),
-            ..DaemonHealth::default()
-        };
-        // The first healthy seeds the sustained-healthy window but does not yet
-        // reset either budget; a healthy observation clears a stale launch record.
-        h3.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL, true);
-        assert_eq!(h3.restart_budget.attempts, 2);
-        assert_eq!(h3.launch_budget.attempts, 2);
-        assert!(h3.restart_budget.halted);
-        assert!(h3.launch_budget.halted);
-        assert_eq!(h3.launch_outcome, None);
-        // A healthy across the sustained window opens fresh bounded cycles.
-        h3.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL * 3, true);
-        assert_eq!(h3.restart_budget.attempts, 0);
-        assert_eq!(h3.launch_budget.attempts, 0);
-        assert!(!h3.restart_budget.halted);
-        assert!(!h3.launch_budget.halted);
-    }
-
-    #[test]
-    fn daemon_unavailable_error_signature_detected() {
-        for msg in [
-            "Failed to read: Resource temporarily unavailable (os error 35) (after 5 retries - daemon may be busy or unresponsive)",
-            "Failed to connect: No such file or directory (os error 2) (after 5 retries - daemon may be busy or unresponsive)",
-            "session unresponsive: no response within 45s",
-            "Daemon failed to start (socket: /tmp/x.sock)",
-            // 1.5.8x-era texts.
-            "session unresponsive: the stuck '__mahbot_probe' daemon was stopped automatically",
-            "Failed to connect: the daemon endpoint for session '__mahbot_probe' disappeared (/tmp/x.sock).",
-            "CDP session is unresponsive after attaching (Connection reset).",
-            "Auto-launch failed: Could not drive your Chrome through the ab-connect extension.",
-        ] {
-            assert!(is_daemon_unavailable_error(msg), "should detect: {msg}");
+    /// Sustained health resets the restart attempts; a flapping cause or a
+    /// transient health reading does not.
+    #[tokio::test]
+    async fn only_sustained_health_resets_the_restart_budget() {
+        {
+            let case = "sustained health resets restart attempts";
+            let now = Instant::now();
+            let mut h = DaemonHealth {
+                restart_budget: AttemptBudget {
+                    attempts: 2,
+                    next_at: Some(now),
+                    halted: true,
+                    halted_until: Some(now),
+                },
+                ..DaemonHealth::default()
+            };
+            // A transient healthy result (e.g. the post-restart verification probe)
+            // must not reset the budget — a runaway cycle would otherwise reopen a
+            // fresh bounded cycle on every restart.
+            h.apply_outcome(ProbeOutcome::Healthy, now, false);
+            assert_eq!(h.restart_budget.attempts, 2, "case {case}");
+            assert!(h.restart_budget.halted, "case {case}");
+            // The first watchdog healthy seeds the sustained-healthy window…
+            h.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL, true);
+            assert_eq!(h.restart_budget.attempts, 2, "case {case}");
+            assert!(h.healthy_since.is_some(), "case {case}");
+            // …but a second healthy before the window elapses still does not reset.
+            h.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL * 2, true);
+            assert_eq!(h.restart_budget.attempts, 2, "case {case}");
+            assert!(h.restart_budget.halted, "case {case}");
+            // Only sustained health across the window opens a fresh bounded cycle.
+            h.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL * 3, true);
+            assert_eq!(h.restart_budget.attempts, 0, "case {case}");
+            assert_eq!(h.restart_budget.next_at, None, "case {case}");
+            assert!(!h.restart_budget.halted, "case {case}");
+            assert!(h.restart_budget.halted_until.is_none(), "case {case}");
+            assert_eq!(h.failure(), None, "case {case}");
         }
-        for msg in [
-            "chrome-use error: Element not found",
-            "chrome-use error: Evaluation error: ReferenceError",
-            "chrome-use error: Navigation failed",
-            // Page-level navigation failure — not a daemon socket problem.
-            "Failed to connect to example.com: Connection timed out",
-        ] {
+        {
+            let case = "cause flapping and transient health do not reset restart budget";
+            let now = Instant::now();
+            let mut h = DaemonHealth {
+                restart_budget: AttemptBudget {
+                    attempts: 2,
+                    next_at: Some(now),
+                    ..AttemptBudget::default()
+                },
+                verdict: Some(ProbeOutcome::Down(ProbeFailure::DaemonWedge)),
+                ..DaemonHealth::default()
+            };
+            // A cause flip (wedge → relay-down) must NOT reset the budget —
+            // alternating causes must not evade the 3-attempt halt.
+            h.apply_outcome(ProbeOutcome::Down(ProbeFailure::RelayDown), now, true);
+            assert_eq!(h.failure(), Some(ProbeFailure::RelayDown), "case {case}");
+            assert_eq!(h.restart_budget.attempts, 2, "case {case}");
+            assert!(h.restart_budget.next_at.is_some(), "case {case}");
+            // Flapping back and forth accumulates — never resets.
+            h.apply_outcome(ProbeOutcome::Down(ProbeFailure::DaemonWedge), now, true);
+            h.apply_outcome(ProbeOutcome::Down(ProbeFailure::RelayDown), now, true);
+            assert_eq!(h.failure(), Some(ProbeFailure::RelayDown), "case {case}");
+            assert_eq!(h.restart_budget.attempts, 2, "case {case}");
+            // A transient healthy result does not reset either — only sustained
+            // health across the window opens a fresh bounded cycle.
+            h.apply_outcome(ProbeOutcome::Healthy, now, true);
+            assert_eq!(h.restart_budget.attempts, 2, "case {case}");
+            assert!(h.restart_budget.next_at.is_some(), "case {case}");
+            h.apply_outcome(ProbeOutcome::Healthy, now + SUSTAINED_HEALTHY_WINDOW, true);
+            assert_eq!(h.failure(), None, "case {case}");
+            assert_eq!(h.restart_budget.attempts, 0, "case {case}");
+            assert_eq!(h.restart_budget.next_at, None, "case {case}");
+            assert!(!h.restart_budget.halted, "case {case}");
+        }
+    }
+
+    /// The two bounded cycles are independent: a halted restart budget does not block a launch,
+    /// an exhausted launch budget leaves the restart gate open, and sustained health opens a
+    /// fresh cycle for both while clearing a stale launch record.
+    #[test]
+    fn the_gates_bound_restarts_and_launches_independently() {
+        {
+            let case = "gate honors backoff before halt";
+            let now = Instant::now();
+            let mut h = DaemonHealth::default();
+            assert_eq!(h.gate_restart(now), RecoveryGate::Allowed(1), "case {case}");
+            // 30s backoff before attempt 2.
+            assert_eq!(h.gate_restart(now), RecoveryGate::Backoff, "case {case}");
+            assert_eq!(
+                h.gate_restart(now + RESTART_BACKOFF[0]),
+                RecoveryGate::Allowed(2),
+                "case {case}"
+            );
+            // 2min backoff before attempt 3.
+            let t2 = now + RESTART_BACKOFF[0] + RESTART_BACKOFF[1];
+            assert_eq!(h.gate_restart(t2), RecoveryGate::Allowed(3), "case {case}");
+            // The final 10-min grace is honored before the halt fires.
+            assert_eq!(h.gate_restart(t2), RecoveryGate::Backoff, "case {case}");
+            let t3 = t2 + RESTART_BACKOFF[2];
+            assert_eq!(h.gate_restart(t3), RecoveryGate::Halted, "case {case}");
+            assert!(h.restart_budget.halted, "case {case}");
+            assert_eq!(h.gate_restart(t3), RecoveryGate::Cooldown, "case {case}");
+            // After the cooldown a fresh bounded cycle starts.
+            assert_eq!(
+                h.gate_restart(t3 + HALT_COOLDOWN),
+                RecoveryGate::Allowed(1),
+                "case {case}"
+            );
+            assert_eq!(h.restart_budget.attempts, 1, "case {case}");
+            assert!(!h.restart_budget.halted, "case {case}");
+        }
+        {
+            let case = "launch budget is independent of restart budget";
+            let now = Instant::now();
+            // A halted/exhausted RESTART budget must NOT block a launch — the two
+            // bounded cycles are independent.
+            let mut h = DaemonHealth {
+                restart_budget: AttemptBudget {
+                    attempts: MAX_RESTART_ATTEMPTS,
+                    halted: true,
+                    halted_until: Some(now),
+                    ..AttemptBudget::default()
+                },
+                ..DaemonHealth::default()
+            };
             assert!(
-                !is_daemon_unavailable_error(msg),
-                "should NOT detect: {msg}"
+                matches!(h.gate_launch(now), RecoveryGate::Allowed(_)),
+                "case {case}"
+            );
+            assert_eq!(h.launch_budget.attempts, 1, "case {case}");
+            // An exhausted LAUNCH budget still leaves the restart gate open.
+            let mut h2 = DaemonHealth {
+                launch_budget: AttemptBudget {
+                    attempts: MAX_LAUNCH_ATTEMPTS,
+                    ..AttemptBudget::default()
+                },
+                ..DaemonHealth::default()
+            };
+            assert!(
+                !matches!(h2.gate_launch(now), RecoveryGate::Allowed(_)),
+                "case {case}"
+            );
+            assert!(
+                matches!(h2.gate_restart(now), RecoveryGate::Allowed(_)),
+                "case {case}"
+            );
+            // Sustained health resets both budgets and clears a recorded launch
+            // outcome (a pending Failed launch must not survive recovery).
+            let mut h3 = DaemonHealth {
+                restart_budget: AttemptBudget {
+                    attempts: 2,
+                    next_at: Some(now),
+                    halted: true,
+                    halted_until: Some(now),
+                },
+                launch_budget: AttemptBudget {
+                    attempts: 2,
+                    next_at: Some(now),
+                    halted: true,
+                    halted_until: Some(now),
+                },
+                launch_outcome: Some(ChromeLaunchOutcome::Failed),
+                ..DaemonHealth::default()
+            };
+            // The first healthy seeds the sustained-healthy window but does not yet
+            // reset either budget; a healthy observation clears a stale launch record.
+            h3.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL, true);
+            assert_eq!(h3.restart_budget.attempts, 2, "case {case}");
+            assert_eq!(h3.launch_budget.attempts, 2, "case {case}");
+            assert!(h3.restart_budget.halted, "case {case}");
+            assert!(h3.launch_budget.halted, "case {case}");
+            assert_eq!(h3.launch_outcome, None, "case {case}");
+            // A healthy across the sustained window opens fresh bounded cycles.
+            h3.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL * 3, true);
+            assert_eq!(h3.restart_budget.attempts, 0, "case {case}");
+            assert_eq!(h3.launch_budget.attempts, 0, "case {case}");
+            assert!(!h3.restart_budget.halted, "case {case}");
+            assert!(!h3.launch_budget.halted, "case {case}");
+        }
+    }
+
+    /// The answer's own extension block parses into the state it establishes, and that state
+    /// classifies the relay-down cause: disabled beats absent beats ChromeNotRunning, an absent
+    /// extension is unfixable, and only the process fact is recoverable.
+    #[test]
+    fn the_extension_state_and_the_cause_it_classifies() {
+        {
+            let case = "relay down classification precedence";
+            // Disabled wins regardless of whether Chrome is running.
+            assert_eq!(
+                classify_relay_down(ExtensionState::Disabled, Some(true)),
+                ProbeFailure::ExtensionDisabled,
+                "case {case}"
+            );
+            assert_eq!(
+                classify_relay_down(ExtensionState::Disabled, Some(false)),
+                ProbeFailure::ExtensionDisabled,
+                "case {case}"
+            );
+            assert_eq!(
+                classify_relay_down(ExtensionState::Disabled, None),
+                ProbeFailure::ExtensionDisabled,
+                "case {case}"
+            );
+            // Absent beats ChromeNotRunning — launching can't fix an uninstalled extension.
+            assert_eq!(
+                classify_relay_down(ExtensionState::Absent, Some(false)),
+                ProbeFailure::ExtensionAbsent,
+                "case {case}"
+            );
+            assert_eq!(
+                classify_relay_down(ExtensionState::Absent, None),
+                ProbeFailure::ExtensionAbsent,
+                "case {case}"
+            );
+            // Present + no Chrome running → ChromeNotRunning.
+            assert_eq!(
+                classify_relay_down(ExtensionState::Present, Some(false)),
+                ProbeFailure::ChromeNotRunning,
+                "case {case}"
+            );
+            // Present + Chrome running (or an inconclusive probe) → transient relay drop.
+            assert_eq!(
+                classify_relay_down(ExtensionState::Present, Some(true)),
+                ProbeFailure::RelayDown,
+                "case {case}"
+            );
+            assert_eq!(
+                classify_relay_down(ExtensionState::Present, None),
+                ProbeFailure::RelayDown,
+                "case {case}"
+            );
+            // Unknown fails open to the probe; only an explicit no-Chrome proves not running.
+            assert_eq!(
+                classify_relay_down(ExtensionState::Unknown, Some(false)),
+                ProbeFailure::ChromeNotRunning,
+                "case {case}"
+            );
+            assert_eq!(
+                classify_relay_down(ExtensionState::Unknown, None),
+                ProbeFailure::RelayDown,
+                "case {case}"
+            );
+            // ChromeNotRunning is recoverable (launch), ExtensionAbsent is not.
+            assert!(
+                !ProbeFailure::ChromeNotRunning.is_unfixable(),
+                "case {case}"
+            );
+            assert!(ProbeFailure::ExtensionAbsent.is_unfixable(), "case {case}");
+        }
+        {
+            let case = "extension state parsing";
+            // No `data` at all, or no `chromeExtension` within it → shape-uncertain,
+            // never the unfixable absent cause (fails open as unknown).
+            assert_eq!(
+                extension_state_from(&serde_json::json!({})),
+                ExtensionState::Unknown,
+                "case {case}"
+            );
+            assert_eq!(
+                extension_state_from(&serde_json::json!({ "data": {} })),
+                ExtensionState::Unknown,
+                "case {case}"
+            );
+            // Explicit null → absent (the CLI reports the extension as not present).
+            assert_eq!(
+                extension_state_from(&serde_json::json!({ "data": { "chromeExtension": null } })),
+                ExtensionState::Absent,
+                "case {case}"
+            );
+            // Present with an empty disableReasons, or with no disableReasons at all.
+            assert_eq!(
+                extension_state_from(&serde_json::json!({
+                    "data": { "chromeExtension": { "disableReasons": [] } }
+                })),
+                ExtensionState::Present,
+                "case {case}"
+            );
+            assert_eq!(
+                extension_state_from(&serde_json::json!({
+                    "data": { "chromeExtension": { "enabled": true } }
+                })),
+                ExtensionState::Present,
+                "case {case}"
+            );
+            // Disabled when disableReasons is non-empty.
+            assert_eq!(
+                extension_state_from(&serde_json::json!({
+                    "data": { "chromeExtension": { "disableReasons": ["user"] } }
+                })),
+                ExtensionState::Disabled,
+                "case {case}"
             );
         }
     }
 
-    #[test]
-    fn relay_unavailable_signature_detected() {
-        for msg in [
-            "The chrome-use extension is installed, but its relay isn't connected.",
-            "Could not drive your Chrome through the ab-connect extension.",
-            "Chrome relay dropped — reconnecting…",
-        ] {
-            assert!(is_relay_unavailable_error(msg), "should detect: {msg}");
+    /// Readiness reports every fact it established and never defaults a missing one.
+    #[tokio::test]
+    #[expect(clippy::too_many_lines)]
+    async fn readiness_reports_every_fact_and_never_defaults_a_missing_one() {
+        {
+            let case = "readiness reports every fact and refuses without a real browser";
+            // The healthy snapshot: every fact established, ready for actions.
+            let status = serde_json::json!({
+                "data": {
+                    "cliVersion": "1.5.141",
+                    "extension": {
+                        "hostInstalled": true,
+                        "hostHealthy": true,
+                        "relayUp": true,
+                        "profileEmail": "owner@example.com",
+                        "profileId": "abc-123"
+                    }
+                }
+            });
+            let browsers = serde_json::json!({
+                "data": { "browsers": [{ "email": "owner@example.com", "id": "abc-123" }] }
+            });
+            let mut ready = Readiness::from_status(Some(&status));
+            ready.chrome_running = Some(true);
+            ready.display = Some(true);
+            ready.real_browser = Readiness::real_browser_from(Some(&browsers));
+            assert!(ready.ready_for_actions(), "case {case}");
+            assert_eq!(ready.outcome(), ProbeOutcome::Healthy, "case {case}");
+            let report = ready.report();
+            assert!(report.contains("established:"), "case {case}");
+            assert!(
+                report.contains("established as NOT holding:\n    - nothing"),
+                "case {case}"
+            );
+            assert!(
+                report.contains("not established:\n    - nothing"),
+                "case {case}"
+            );
+            assert!(
+                report.contains("chrome-use 1.5.141"),
+                "case {case}: got: {report}"
+            );
+            assert!(
+                report.contains("driving the real profile owner@example.com (abc-123)"),
+                "case {case}: got: {report}"
+            );
+            assert!(
+                report.contains("a real browser is reachable through the relay"),
+                "case {case}: got: {report}"
+            );
+            // Process presence is reported as a fact, never as health.
+            assert!(
+                report.contains("process presence is not by itself health"),
+                "case {case}: got: {report}"
+            );
+            assert!(
+                report.contains("this host has a usable display"),
+                "case {case}: got: {report}"
+            );
+            assert!(
+                report.contains("verdict: ready for actions"),
+                "case {case}: got: {report}"
+            );
+
+            // An UNANSWERED `browsers` list (`None`, e.g. a subcommand/shape change
+            // in a future chrome-use) is a reporting gap: a decisive fact was never
+            // established, so the connection is NOT proven, the outcome is `Unknown`
+            // rather than health, and no cause is invented from it.
+            let mut unanswered_browsers = ready.clone();
+            unanswered_browsers.real_browser = None;
+            assert!(!unanswered_browsers.ready_for_actions(), "case {case}");
+            assert_eq!(
+                unanswered_browsers.outcome(),
+                ProbeOutcome::Unknown,
+                "case {case}"
+            );
+            assert!(!unanswered_browsers.blocked(), "case {case}");
+
+            // The failure this gate exists for: the relay is up but no real browser
+            // profile is reachable — not ready, and the refusal says plainly what
+            // would have happened otherwise. The established negative is reported
+            // with what the product KNOWS, under "established as NOT holding".
+            let empty = serde_json::json!({ "data": { "browsers": [] } });
+            let mut not_ready = Readiness::from_status(Some(&status));
+            not_ready.chrome_running = Some(true);
+            not_ready.display = Some(true);
+            not_ready.real_browser = Readiness::real_browser_from(Some(&empty));
+            assert!(!not_ready.ready_for_actions(), "case {case}");
+            assert_eq!(
+                not_ready.down_cause(),
+                Some(ProbeFailure::RelayDown),
+                "case {case}"
+            );
+            assert_eq!(
+                not_ready.outcome(),
+                ProbeOutcome::Down(ProbeFailure::RelayDown),
+                "case {case}"
+            );
+            let not_ready_report = not_ready.report();
+            assert!(
+                not_ready_report.contains(
+                    "established as NOT holding:\n    - no real browser profile is reachable through \
+                     the relay"
+                ),
+                "case {case}: got: {not_ready_report}"
+            );
+            // An established cause is the one verdict that says the connection was
+            // ruled out, so the action is refused rather than attempted.
+            assert!(
+                not_ready_report.contains("verdict: NOT ready for actions"),
+                "case {case}: got: {not_ready_report}"
+            );
+            assert!(
+                not_ready
+                    .refusal()
+                    .contains("the work would have gone to a browser chrome-use launches itself"),
+                "case {case}: got: {}",
+                not_ready.refusal()
+            );
+
+            // A host with NO display is reported as such but refuses nothing: a
+            // usable display is what chrome-use needs to LAUNCH the owner's Chrome,
+            // and a browser already running is still reachable through the relay. The
+            // fact is established, but it is not a decisive one — the connection is
+            // still proven.
+            let mut headless = ready.clone();
+            headless.display = Some(false);
+            assert!(headless.ready_for_actions(), "case {case}");
+            assert_eq!(headless.down_cause(), None, "case {case}");
+            assert!(!headless.blocked(), "case {case}");
+            let headless_report = headless.report();
+            assert!(
+                headless_report.contains("this host has NO usable display"),
+                "case {case}: got: {headless_report}"
+            );
+            assert!(
+                headless_report.contains("verdict: ready for actions"),
+                "case {case}: got: {headless_report}"
+            );
+            // The display blocks nothing even when another DECISIVE fact is missing:
+            // the connection is then not proven (`Unknown`), never ruled out.
+            let mut headless_unproven = headless.clone();
+            headless_unproven.real_browser = None;
+            assert!(!headless_unproven.ready_for_actions(), "case {case}");
+            assert_eq!(
+                headless_unproven.outcome(),
+                ProbeOutcome::Unknown,
+                "case {case}"
+            );
+            assert!(!headless_unproven.blocked(), "case {case}");
         }
-        for msg in [
-            "chrome-use error: Element not found",
-            "Failed to read: Resource temporarily unavailable (os error 35)",
-        ] {
-            assert!(!is_relay_unavailable_error(msg), "should NOT detect: {msg}");
+        {
+            let case = "readiness never defaults a missing fact to fine";
+            // Nothing answered: every fact stays unestablished, the verdict is
+            // Unknown rather than Healthy, and no cause is claimed — which is what
+            // keeps an unanswerable probe out of both the health verdict and the
+            // restart budget.
+            let nothing = Readiness::default();
+            assert!(!nothing.answered, "case {case}");
+            assert!(!nothing.ready_for_actions(), "case {case}");
+            assert_eq!(nothing.outcome(), ProbeOutcome::Unknown, "case {case}");
+            assert_eq!(nothing.down_cause(), None, "case {case}");
+            let report = nothing.report();
+            assert!(
+                report.contains("established:\n    - nothing"),
+                "case {case}"
+            );
+            assert!(
+                report.contains("established as NOT holding:"),
+                "case {case}"
+            );
+            assert!(report.contains("not established:"), "case {case}");
+            assert!(
+                report.contains("whether the tool answers `status` at all"),
+                "case {case}: got: {report}"
+            );
+            // Not proven and nothing ruled out: the verdict must not claim the
+            // connection is fine, and must not claim it is ruled out either.
+            assert!(
+                report.contains("verdict: NOT proven ready for actions"),
+                "case {case}: got: {report}"
+            );
+            assert!(
+                !report.contains("verdict: NOT ready for actions"),
+                "case {case}: got: {report}"
+            );
+
+            // A status that answered but carries no extension data at all: every
+            // decisive key is missing, so nothing is established.
+            let bare = serde_json::json!({ "data": { "cliVersion": "1.2.3" } });
+            let mut r = Readiness::from_status(Some(&bare));
+            r.chrome_running = Some(true);
+            assert!(r.answered, "case {case}");
+            assert_eq!(r.relay_up, None, "case {case}");
+            assert_eq!(r.host_installed, None, "case {case}");
+            assert!(!r.ready_for_actions(), "case {case}");
+            assert_eq!(r.outcome(), ProbeOutcome::Unknown, "case {case}");
+        }
+        {
+            let case = "readiness classifies only what a fact established";
+            // Installed host + relay down + a closed browser → ChromeNotRunning, so
+            // the gate launches the owner's Chrome rather than restarting a daemon.
+            let status = serde_json::json!({
+                "data": { "extension": {
+                    "hostInstalled": true,
+                    "hostHealthy": true,
+                    "relayUp": false
+                } }
+            });
+            let mut relay_down = Readiness::from_status(Some(&status));
+            relay_down.extension = Some(ExtensionState::Present);
+            relay_down.chrome_running = Some(false);
+            assert_eq!(
+                relay_down.down_cause(),
+                Some(ProbeFailure::ChromeNotRunning),
+                "case {case}"
+            );
+            // The process fact is reported as the fact it is, stated flatly in the
+            // established-as-NOT-holding list.
+            let report = relay_down.report();
+            assert!(
+                report.contains("    - no Chrome-family process is running"),
+                "case {case}: got: {report}"
+            );
+            // An absent extension is unfixable — no launch or restart recovers it.
+            let mut absent = relay_down;
+            absent.extension = Some(ExtensionState::Absent);
+            assert_eq!(
+                absent.down_cause(),
+                Some(ProbeFailure::ExtensionAbsent),
+                "case {case}"
+            );
+            let absent_cause = absent.down_cause();
+            assert!(
+                absent_cause.is_some_and(ProbeFailure::is_unfixable),
+                "case {case}"
+            );
+            // The native-host facts classify before the relay does.
+            let uninstalled =
+                serde_json::json!({ "data": { "extension": { "hostInstalled": false } } });
+            assert_eq!(
+                Readiness::from_status(Some(&uninstalled)).down_cause(),
+                Some(ProbeFailure::NotInstalled),
+                "case {case}"
+            );
         }
     }
 
-    #[test]
-    fn daemon_unavailable_code_detected() {
-        assert!(is_daemon_unavailable_code(Some("browser_not_launched")));
-        // Page-level failures share the coarse `connection_failed` code with
-        // daemon-socket problems — the code alone must not fail-fast the
-        // daemon path (the message-text matcher disambiguates).
-        assert!(!is_daemon_unavailable_code(Some("connection_failed")));
-        assert!(!is_daemon_unavailable_code(Some("timeout")));
-        assert!(!is_daemon_unavailable_code(Some("element_not_found")));
-        assert!(!is_daemon_unavailable_code(None));
-    }
-
-    #[test]
-    fn failure_text_classification_is_shared_between_detection_paths() {
-        // The captured combined error (stale tab wrapped in the auto-connect
-        // envelope AND the daemon wrapper) classifies as unreachable-tab, NOT
-        // relay-down or wedge — recovery must not fire for an orphaned tab on
-        // an otherwise-healthy relay.
-        assert_eq!(
-            classify_failure_text(
-                "Auto-launch failed: Could not drive your Chrome through the ab-connect \
-                 extension. The tab this session was driving can no longer be resolved (it \
-                 was closed, or a flaky relay dropped it)"
-            ),
-            Some(ProbeFailure::UnreachableTab)
-        );
-        // Auto-connect failure alone names the relay as the cause (its body
-        // points at `chrome-use extension connect`) — the relay signature wins
-        // over the daemon wrapper it is wrapped in, in both the watchdog and
-        // fail-fast paths, so they never disagree on the cause.
-        assert_eq!(
-            classify_failure_text(
-                "Auto-launch failed: Could not drive your Chrome through the ab-connect extension."
-            ),
-            Some(ProbeFailure::RelayDown)
-        );
-        assert_eq!(
-            classify_failure_text(
-                "Failed to connect: the daemon endpoint for session '__mahbot_probe' \
-                 disappeared (/tmp/x.sock)."
-            ),
-            Some(ProbeFailure::DaemonWedge)
-        );
-        assert_eq!(
-            classify_failure_text("chrome-use error: Element not found"),
-            None
-        );
+    /// A daemon or relay outage is recognised from the error code and the failure
+    /// text alike, and both detection paths share the same classification.
+    #[tokio::test]
+    async fn a_daemon_or_relay_outage_is_recognised_by_code_or_signature() {
+        {
+            let case = "daemon unavailable error signature detected";
+            for msg in [
+                "Failed to read: Resource temporarily unavailable (os error 35) (after 5 retries - daemon may be busy or unresponsive)",
+                "Failed to connect: No such file or directory (os error 2) (after 5 retries - daemon may be busy or unresponsive)",
+                "session unresponsive: no response within 45s",
+                "Daemon failed to start (socket: /tmp/x.sock)",
+                // 1.5.8x-era texts.
+                "session unresponsive: the stuck '__mahbot_probe' daemon was stopped automatically",
+                "Failed to connect: the daemon endpoint for session '__mahbot_probe' disappeared (/tmp/x.sock).",
+                "CDP session is unresponsive after attaching (Connection reset).",
+                "Auto-launch failed: Could not drive your Chrome through the ab-connect extension.",
+            ] {
+                assert!(
+                    is_daemon_unavailable_error(msg),
+                    "case {case}: should detect: {msg}"
+                );
+            }
+            for msg in [
+                "chrome-use error: Element not found",
+                "chrome-use error: Evaluation error: ReferenceError",
+                "chrome-use error: Navigation failed",
+                // Page-level navigation failure — not a daemon socket problem.
+                "Failed to connect to example.com: Connection timed out",
+            ] {
+                assert!(
+                    !is_daemon_unavailable_error(msg),
+                    "case {case}: should NOT detect: {msg}"
+                );
+            }
+        }
+        {
+            let case = "relay unavailable signature detected";
+            for msg in [
+                "The chrome-use extension is installed, but its relay isn't connected.",
+                "Could not drive your Chrome through the ab-connect extension.",
+                "Chrome relay dropped — reconnecting…",
+            ] {
+                assert!(
+                    is_relay_unavailable_error(msg),
+                    "case {case}: should detect: {msg}"
+                );
+            }
+            for msg in [
+                "chrome-use error: Element not found",
+                "Failed to read: Resource temporarily unavailable (os error 35)",
+            ] {
+                assert!(
+                    !is_relay_unavailable_error(msg),
+                    "case {case}: should NOT detect: {msg}"
+                );
+            }
+        }
+        {
+            let case = "daemon unavailable code detected";
+            assert!(
+                is_daemon_unavailable_code(Some("browser_not_launched")),
+                "case {case}"
+            );
+            // Page-level failures share the coarse `connection_failed` code with
+            // daemon-socket problems — the code alone must not fail-fast the
+            // daemon path (the message-text matcher disambiguates).
+            assert!(
+                !is_daemon_unavailable_code(Some("connection_failed")),
+                "case {case}"
+            );
+            assert!(!is_daemon_unavailable_code(Some("timeout")), "case {case}");
+            assert!(
+                !is_daemon_unavailable_code(Some("element_not_found")),
+                "case {case}"
+            );
+            assert!(!is_daemon_unavailable_code(None), "case {case}");
+        }
+        {
+            let case = "failure text classification is shared between detection paths";
+            // The captured combined error (stale tab wrapped in the auto-connect
+            // envelope AND the daemon wrapper) classifies as unreachable-tab, NOT
+            // relay-down or wedge — recovery must not fire for an orphaned tab on
+            // an otherwise-healthy relay.
+            assert_eq!(
+                classify_failure_text(
+                    "Auto-launch failed: Could not drive your Chrome through the ab-connect \
+                     extension. The tab this session was driving can no longer be resolved (it \
+                     was closed, or a flaky relay dropped it)"
+                ),
+                Some(ProbeFailure::UnreachableTab),
+                "case {case}"
+            );
+            // Auto-connect failure alone names the relay as the cause (its body
+            // points at `chrome-use extension connect`) — the relay signature wins
+            // over the daemon wrapper it is wrapped in, in both the watchdog and
+            // fail-fast paths, so they never disagree on the cause.
+            assert_eq!(
+                classify_failure_text(
+                    "Auto-launch failed: Could not drive your Chrome through the ab-connect extension."
+                ),
+                Some(ProbeFailure::RelayDown),
+                "case {case}"
+            );
+            assert_eq!(
+                classify_failure_text(
+                    "Failed to connect: the daemon endpoint for session '__mahbot_probe' \
+                     disappeared (/tmp/x.sock)."
+                ),
+                Some(ProbeFailure::DaemonWedge),
+                "case {case}"
+            );
+            assert_eq!(
+                classify_failure_text("chrome-use error: Element not found"),
+                None,
+                "case {case}"
+            );
+        }
     }
 
     #[test]
@@ -3914,23 +4054,6 @@ mod tests {
                 "kind {kind:?} must classify as transient, not missing"
             );
         }
-    }
-
-    #[test]
-    fn cli_version_parsing_scans_the_real_banner() {
-        // The --version banner ends with a bug-report URL — the version must
-        // be found by scanning, not by assuming the last token.
-        let banner = "chrome-use 1.5.100\n\
-             report bugs / rough edges: https://github.com/leeguooooo/chrome-use/issues";
-        assert_eq!(
-            parse_cli_version(banner),
-            Some(semver::Version::new(1, 5, 100))
-        );
-        assert_eq!(
-            parse_cli_version("chrome-use v1.5.99"),
-            Some(semver::Version::new(1, 5, 99))
-        );
-        assert_eq!(parse_cli_version("chrome-use\nno version here"), None);
     }
 
     #[test]

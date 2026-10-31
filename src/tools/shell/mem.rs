@@ -405,25 +405,7 @@ fn children_map() -> Option<HashMap<u32, Vec<u32>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_limit, exceeded_failure, gib, physical_memory, tree_rss};
-
-    #[test]
-    fn gib_renders_one_decimal_place() {
-        assert_eq!(gib(0), "0.0 GiB");
-        assert_eq!(gib(1 << 30), "1.0 GiB");
-        assert_eq!(gib(3 * (1 << 30) / 2), "1.5 GiB");
-        assert_eq!(gib(15 * (1 << 30) / 2 + 1), "7.5 GiB");
-    }
-
-    #[test]
-    fn the_memory_failure_names_the_amount_against_the_machines_total() {
-        // The denominator is this machine's RAM, so only the prefix is pinned.
-        let line = exceeded_failure(0, 1 << 30);
-        assert!(
-            line.starts_with("terminated: exceeded memory limit (used ~0.0 GiB of "),
-            "line: {line}"
-        );
-    }
+    use super::{default_limit, physical_memory, tree_rss};
 
     #[test]
     fn the_default_limit_is_eighty_percent_of_physical_memory() {

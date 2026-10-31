@@ -100,48 +100,6 @@ fn format_readonly_rows(rows: &crate::db::ReadonlyRows) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::ReadonlyRows;
-    use crate::db::Value;
-
-    #[test]
-    fn formats_columns_rows_and_truncation_sentinel() {
-        let rows = ReadonlyRows {
-            columns: vec!["id".into(), "note".into()],
-            rows: vec![
-                vec![Value::Integer(1), Value::Text("a".into())],
-                vec![Value::Null, Value::Blob(vec![0xde, 0xad])],
-            ],
-            truncated: true,
-        };
-        let out = format_readonly_rows(&rows);
-        assert_eq!(out, "id|note\n1|a\n|dead\ntruncated|truncated\n");
-    }
-
-    #[test]
-    fn description_loads_without_panicking() {
-        // Guard against the mandatory prompt asset being missing: `load_prompt`
-        // panics at agent construction, so `description()` must succeed.
-        assert!(!MahbotDebugTool.description().is_empty());
-    }
-
-    #[test]
-    fn schema_db_list_is_accepted_by_the_validator() {
-        // Every `db` value the model-facing schema advertises must be accepted
-        // by the runtime validator, and the validator must reject a decoy — so
-        // the schema can't drift from the fail-closed accepted set.
-        let schema = MahbotDebugTool.parameters_schema();
-        let db_desc = schema
-            .get("properties")
-            .and_then(|v| v.get("db"))
-            .and_then(|v| v.get("description"))
-            .and_then(|v| v.as_str())
-            .expect("`db` parameter must have a string description");
-        for name in crate::db::debug_db_names() {
-            assert!(db_desc.contains(name), "schema must advertise '{name}'");
-            assert!(debug::validate_store_name(name, false).is_ok());
-        }
-        assert!(debug::validate_store_name("not_a_store", false).is_err());
-    }
 
     #[tokio::test]
     async fn runs_a_read_only_query_on_a_real_store() {

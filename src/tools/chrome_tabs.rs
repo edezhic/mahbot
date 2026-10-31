@@ -1468,16 +1468,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// The door session must stay in the family the product's own session sweeps close:
-    /// that sweep — not this module — is what closes the group when a pass dies before
-    /// [`release_own_session`] reaches it.
-    #[test]
-    fn the_door_session_is_a_mahbot_session_name() {
-        assert!(crate::tools::chrome_daemon::is_mahbot_session_name(
-            OWN_SESSION
-        ));
-    }
-
     /// The stop order rotates one name further along on every call, so a pass's single-stop
     /// slice does not spend itself on the same leading name while the tail never gets a turn;
     /// a lone name is always itself.
@@ -1521,20 +1511,34 @@ mod tests {
         assert!(group_ids_titled(&groups, &names[1]).is_empty());
     }
 
+    /// The sweep plan settles every group by what the browser holds of it.
     #[test]
-    fn plan_splits_gone_unclosable_and_closeable() {
-        let tabs_by_group = HashMap::from([(10, vec![100, 101]), (11, vec![200]), (12, vec![300])]);
-        let owned: HashSet<i64> = [100, 200].into_iter().collect();
-        // name 0: no group                -> Gone
-        // name 1: group holds an owned tab -> closeable
-        // name 2: group holds only tabs the extension no longer holds -> Unclosable
-        let matched = vec![vec![], vec![10], vec![12]];
-        let plan = plan_removal(&matched, &tabs_by_group, &owned, &[false; 3]);
-        assert_eq!(plan.settled[0], Some(TabOutcome::Gone));
-        assert_eq!(plan.settled[1], None);
-        assert_eq!(plan.settled[2], Some(TabOutcome::Unclosable));
-        assert_eq!(plan.tab_ids, vec![100]);
-        assert_eq!(plan.verifying, vec![1]);
+    fn the_plan_settles_every_group_by_what_the_browser_holds() {
+        {
+            let case = "plan splits gone unclosable and closeable";
+            let tabs_by_group =
+                HashMap::from([(10, vec![100, 101]), (11, vec![200]), (12, vec![300])]);
+            let owned: HashSet<i64> = [100, 200].into_iter().collect();
+            // name 0: no group                -> Gone
+            // name 1: group holds an owned tab -> closeable
+            // name 2: group holds only tabs the extension no longer holds -> Unclosable
+            let matched = vec![vec![], vec![10], vec![12]];
+            let plan = plan_removal(&matched, &tabs_by_group, &owned, &[false; 3]);
+            assert_eq!(plan.settled[0], Some(TabOutcome::Gone), "case {case}");
+            assert_eq!(plan.settled[1], None, "case {case}");
+            assert_eq!(plan.settled[2], Some(TabOutcome::Unclosable), "case {case}");
+            assert_eq!(plan.tab_ids, vec![100], "case {case}");
+            assert_eq!(plan.verifying, vec![1], "case {case}");
+        }
+        {
+            let case = "a group with no tabs is gone";
+            let tabs_by_group = HashMap::new();
+            let owned: HashSet<i64> = [100].into_iter().collect();
+            let plan = plan_removal(&[vec![10]], &tabs_by_group, &owned, &[false]);
+            assert_eq!(plan.settled[0], Some(TabOutcome::Gone), "case {case}");
+            assert!(plan.tab_ids.is_empty(), "case {case}");
+            assert!(plan.verifying.is_empty(), "case {case}");
+        }
     }
 
     /// A name whose run registered again while the pass was reading the browser is left
@@ -1559,16 +1563,6 @@ mod tests {
         // would be a pass over a decision the same read already made.
         let absent = plan_removal(&[vec![]], &tabs_by_group, &owned, &[true]);
         assert_eq!(absent.settled[0], Some(TabOutcome::Gone));
-    }
-
-    #[test]
-    fn a_group_with_no_tabs_is_gone() {
-        let tabs_by_group = HashMap::new();
-        let owned: HashSet<i64> = [100].into_iter().collect();
-        let plan = plan_removal(&[vec![10]], &tabs_by_group, &owned, &[false]);
-        assert_eq!(plan.settled[0], Some(TabOutcome::Gone));
-        assert!(plan.tab_ids.is_empty());
-        assert!(plan.verifying.is_empty());
     }
 
     /// Only the extension's own refusal sentence is the browser answering about the tabs. A
@@ -1612,100 +1606,120 @@ mod tests {
         }
     }
 
+    /// The browser's answers parse into what the sweep works from: live groups from the result
+    /// list, tabs indexed by group (ungrouped tabs skipped), and the owned-tab ledger the
+    /// extension reports.
     #[test]
-    fn live_groups_parse_from_the_result_list() {
-        let envelope = json!({
-            "success": true,
-            "data": {
-                "policy": "call-v1",
-                "result": [
-                    {"id": 1_026_066_125, "title": "not-a-session", "windowId": 304_840_673},
-                    {"id": 5, "title": "agent-tab-aaaa-bbbb-a"}
-                ]
-            }
-        });
-        assert_eq!(
-            parse_live_groups(&envelope).expect("groups"),
-            vec![
-                LiveGroup {
-                    id: 1_026_066_125,
-                    title: "not-a-session".to_string(),
-                },
-                LiveGroup {
-                    id: 5,
-                    title: "agent-tab-aaaa-bbbb-a".to_string(),
-                },
-            ]
-        );
-        assert!(parse_live_groups(&json!({"success": true, "data": {}})).is_err());
-        // A listed group the answer does not describe completely makes the whole answer
-        // unreadable: dropping it would read as a group that is gone.
-        assert!(
-            parse_live_groups(&json!({
-                "data": {"result": [{"id": "5", "title": "agent-tab-aaaa-bbbb-a"}]}
-            }))
-            .is_err()
-        );
-        assert!(
-            parse_live_groups(&json!({
-                "data": {"result": [{"id": 5, "title": 7}]}
-            }))
-            .is_err()
-        );
-        assert!(parse_live_groups(&json!({"data": {"result": [{"id": 5}]}})).is_err());
-    }
-
-    #[test]
-    fn owned_tabs_come_from_the_ledger_not_the_stale_group_map() {
-        let envelope = json!({
-            "success": true,
-            "data": {
-                "connected": true,
-                "ownedTabs": [304_864_598, 304_865_350],
-                "groups": [{"id": 1, "name": "stale"}, {"id": 2, "name": "stale"}]
-            }
-        });
-        assert_eq!(
-            parse_owned_tabs(&envelope).expect("ledger"),
-            [304_864_598, 304_865_350].into_iter().collect()
-        );
-        // An entry the answer cannot read as a tab id makes the ledger unreadable rather
-        // than smaller: a swallowed tab would read as one the extension does not hold.
-        assert!(parse_owned_tabs(&json!({"data": {"ownedTabs": [1, "2"]}})).is_err());
-    }
-
-    #[test]
-    fn tabs_are_indexed_by_group_and_ungrouped_tabs_are_skipped() {
-        let envelope = json!({
-            "success": true,
-            "data": {
-                "policy": "call-v1",
-                "result": [
-                    {"id": 1, "groupId": 10, "windowId": 3},
-                    {"id": 2, "groupId": -1, "windowId": 3},
-                    {"id": 3, "groupId": 10, "windowId": 4},
-                    {"id": 4, "groupId": 11, "windowId": 4}
-                ]
-            }
-        });
-        let by_group = parse_tabs_by_group(&envelope).expect("tabs");
-        assert_eq!(by_group.get(&10), Some(&vec![1, 3]));
-        assert_eq!(by_group.get(&11), Some(&vec![4]));
-        assert!(!by_group.contains_key(&-1));
-        // A tab the answer does not describe completely makes the whole answer unreadable:
-        // skipping it would leave its group looking empty, which reads as gone.
-        assert!(
-            parse_tabs_by_group(&json!({
-                "data": {"result": [{"id": 1, "groupId": "10"}]}
-            }))
-            .is_err()
-        );
-        assert!(
-            parse_tabs_by_group(&json!({
-                "data": {"result": [{"id": 1}]}
-            }))
-            .is_err()
-        );
+    #[expect(clippy::too_many_lines)]
+    fn the_browsers_answers_parse_into_groups_tabs_and_owned_tabs() {
+        {
+            let case = "live groups parse from the result list";
+            let envelope = json!({
+                "success": true,
+                "data": {
+                    "policy": "call-v1",
+                    "result": [
+                        {"id": 1_026_066_125, "title": "not-a-session", "windowId": 304_840_673},
+                        {"id": 5, "title": "agent-tab-aaaa-bbbb-a"}
+                    ]
+                }
+            });
+            assert_eq!(
+                parse_live_groups(&envelope).expect("groups"),
+                vec![
+                    LiveGroup {
+                        id: 1_026_066_125,
+                        title: "not-a-session".to_string(),
+                    },
+                    LiveGroup {
+                        id: 5,
+                        title: "agent-tab-aaaa-bbbb-a".to_string(),
+                    },
+                ],
+                "case {case}"
+            );
+            assert!(
+                parse_live_groups(&json!({"success": true, "data": {}})).is_err(),
+                "case {case}"
+            );
+            // A listed group the answer does not describe completely makes the whole answer
+            // unreadable: dropping it would read as a group that is gone.
+            assert!(
+                parse_live_groups(&json!({
+                    "data": {"result": [{"id": "5", "title": "agent-tab-aaaa-bbbb-a"}]}
+                }))
+                .is_err(),
+                "case {case}"
+            );
+            assert!(
+                parse_live_groups(&json!({
+                    "data": {"result": [{"id": 5, "title": 7}]}
+                }))
+                .is_err(),
+                "case {case}"
+            );
+            assert!(
+                parse_live_groups(&json!({"data": {"result": [{"id": 5}]}})).is_err(),
+                "case {case}"
+            );
+        }
+        {
+            let case = "tabs are indexed by group and ungrouped tabs are skipped";
+            let envelope = json!({
+                "success": true,
+                "data": {
+                    "policy": "call-v1",
+                    "result": [
+                        {"id": 1, "groupId": 10, "windowId": 3},
+                        {"id": 2, "groupId": -1, "windowId": 3},
+                        {"id": 3, "groupId": 10, "windowId": 4},
+                        {"id": 4, "groupId": 11, "windowId": 4}
+                    ]
+                }
+            });
+            let by_group = parse_tabs_by_group(&envelope).expect("tabs");
+            assert_eq!(by_group.get(&10), Some(&vec![1, 3]), "case {case}");
+            assert_eq!(by_group.get(&11), Some(&vec![4]), "case {case}");
+            assert!(!by_group.contains_key(&-1), "case {case}");
+            // A tab the answer does not describe completely makes the whole answer unreadable:
+            // skipping it would leave its group looking empty, which reads as gone.
+            assert!(
+                parse_tabs_by_group(&json!({
+                    "data": {"result": [{"id": 1, "groupId": "10"}]}
+                }))
+                .is_err(),
+                "case {case}"
+            );
+            assert!(
+                parse_tabs_by_group(&json!({
+                    "data": {"result": [{"id": 1}]}
+                }))
+                .is_err(),
+                "case {case}"
+            );
+        }
+        {
+            let case = "owned tabs come from the ledger not the stale group map";
+            let envelope = json!({
+                "success": true,
+                "data": {
+                    "connected": true,
+                    "ownedTabs": [304_864_598, 304_865_350],
+                    "groups": [{"id": 1, "name": "stale"}, {"id": 2, "name": "stale"}]
+                }
+            });
+            assert_eq!(
+                parse_owned_tabs(&envelope).expect("ledger"),
+                [304_864_598, 304_865_350].into_iter().collect(),
+                "case {case}"
+            );
+            // An entry the answer cannot read as a tab id makes the ledger unreadable rather
+            // than smaller: a swallowed tab would read as one the extension does not hold.
+            assert!(
+                parse_owned_tabs(&json!({"data": {"ownedTabs": [1, "2"]}})).is_err(),
+                "case {case}"
+            );
+        }
     }
 
     #[test]

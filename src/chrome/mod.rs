@@ -391,22 +391,73 @@ mod tests {
         );
     }
 
+    /// A blank scratch page and a chrome error page are both recognised as page
+    /// failures, while a real page is not.
     #[test]
-    fn blank_page_url_predicate() {
-        // Scratch/about pages that never committed are blank-page failures.
-        assert!(is_blank_page_url("about:blank"));
-        assert!(is_blank_page_url("about:blank#blocked"));
-        assert!(is_blank_page_url(""));
-        // Real pages — even ones that render no text — are NOT blank failures
-        // (image URLs, PDFs, canvas shells).
-        assert!(!is_blank_page_url("https://example.com/image.png"));
-        assert!(!is_blank_page_url("https://example.com/file.pdf"));
-        assert!(!is_blank_page_url("about:srcdoc"));
+    fn page_failure_predicates() {
+        {
+            let case = "blank page url predicate";
+            // Scratch/about pages that never committed are blank-page failures.
+            assert!(
+                is_blank_page_url("about:blank"),
+                "case {case}: a scratch page is a blank failure"
+            );
+            assert!(
+                is_blank_page_url("about:blank#blocked"),
+                "case {case}: a blocked scratch page is a blank failure"
+            );
+            assert!(
+                is_blank_page_url(""),
+                "case {case}: an empty URL is a blank failure"
+            );
+            // Real pages — even ones that render no text — are NOT blank failures
+            // (image URLs, PDFs, canvas shells).
+            assert!(
+                !is_blank_page_url("https://example.com/image.png"),
+                "case {case}: an image URL is a real page"
+            );
+            assert!(
+                !is_blank_page_url("https://example.com/file.pdf"),
+                "case {case}: a PDF is a real page"
+            );
+            assert!(
+                !is_blank_page_url("about:srcdoc"),
+                "case {case}: about:srcdoc is a committed page"
+            );
+        }
+
+        {
+            let case = "chrome error page predicate";
+            assert!(
+                is_chrome_error_page("chrome-error://chromewebdata/"),
+                "case {case}: Chrome's own error page is an error page"
+            );
+            assert!(
+                !is_chrome_error_page("https://example.com/"),
+                "case {case}: a real page is not an error page"
+            );
+        }
     }
 
+    /// A selector is escaped for a single-quoted JS literal: a backslash is
+    /// doubled before the apostrophe it precedes is escaped, so text like
+    /// `it\'s` can neither end the literal nor survive as an escape.
     #[test]
-    fn chrome_error_page_predicate() {
-        assert!(is_chrome_error_page("chrome-error://chromewebdata/"));
-        assert!(!is_chrome_error_page("https://example.com/"));
+    fn escape_js_single_quoted_escapes_backslashes_and_quotes() {
+        assert_eq!(
+            escape_js_single_quoted("it's"),
+            "it\\'s",
+            "a quote is escaped"
+        );
+        assert_eq!(
+            escape_js_single_quoted("a\\b"),
+            "a\\\\b",
+            "a backslash is doubled"
+        );
+        assert_eq!(
+            escape_js_single_quoted("a\\'b"),
+            "a\\\\\\'b",
+            "the backslash before a quote is escaped too"
+        );
     }
 }

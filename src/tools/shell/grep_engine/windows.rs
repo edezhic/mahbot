@@ -988,33 +988,74 @@ mod tests {
         assert_eq!(words[1].value, "a|b");
         assert!(!words[1].redirect);
 
+        // A redirect word is classified through the shared classifier: the
+        // descriptor merge is self-contained, a `>` or `<` is not.
+        // (command, index of the redirect word, needs a target word)
+        let redirects = [
+            ("grep x f 2>&1", 3, false),
+            ("grep x f > out.txt", 3, true),
+            ("grep x < in.txt", 2, true),
+        ];
+        for (command, at, needs_target) in redirects {
+            let words = tokenize(command).expect("balanced quotes");
+            assert!(words[at].redirect, "{command}: word {at} is a redirect");
+            assert_eq!(
+                words[at].needs_target, needs_target,
+                "{command}: target of word {at}"
+            );
+        }
+
         assert!(tokenize("grep \"a").is_none());
     }
 
-    #[test]
-    fn tokenize_classifies_redirects_through_the_shared_classifier() {
-        let words = tokenize("grep x f 2>&1").expect("balanced quotes");
-        let last = words.last().expect("a token");
-        assert!(
-            last.redirect && !last.needs_target,
-            "2>&1 is self-contained"
-        );
-
-        let words = tokenize("grep x f > out.txt").expect("balanced quotes");
-        assert!(words[3].redirect && words[3].needs_target);
-
-        let words = tokenize("grep x < in.txt").expect("balanced quotes");
-        assert!(words[2].redirect && words[2].needs_target);
-    }
-
+    /// [`unquote_word`] is handed token values as well as raw words, so it must
+    /// strip the quoting cmd.exe removed and nothing else: an unquoted `'`, `\`
+    /// or space stays as typed, and `""` inside a span is one literal quote.
     #[test]
     fn unquote_word_is_idempotent_on_token_values() {
-        assert_eq!(unquote_word("\"a b\""), "a b");
-        assert_eq!(unquote_word("\"a\"\"b\""), "a\"b");
-        assert_eq!(unquote_word("a\"\"b"), "ab");
-        assert_eq!(unquote_word("a b"), "a b");
-        assert_eq!(unquote_word("'a'"), "'a'");
-        assert_eq!(unquote_word(""), "");
+        // (token value, the word cmd delivers)
+        let rows = [
+            ("a bare word", "\"a b\"", "a b"),
+            ("a quoted span with a literal quote", "\"a\"\"b\"", "a\"b"),
+            ("an empty span between two letters", "a\"\"b", "ab"),
+            ("no quoting at all", "a b", "a b"),
+            ("single quotes are ordinary characters", "'a'", "'a'"),
+            ("the empty word", "", ""),
+        ];
+        for (name, raw, value) in rows {
+            assert_eq!(unquote_word(raw), value, "{name}: {raw:?}");
+        }
+    }
+
+    /// A walked entry is displayed under the operand's own spelling: the Windows
+    /// separator, and a root that already ends in one keeps exactly that one.
+    #[test]
+    fn traversal_display_joins_with_the_windows_separator() {
+        // (a root, an entry's relative suffix, the display path)
+        let rows = [
+            (
+                "a root with no separator",
+                r"C:\ws",
+                r"src\main.rs",
+                r"C:\ws\src\main.rs",
+            ),
+            (
+                "a root that already ends in one",
+                r"C:\ws\",
+                r"src\main.rs",
+                r"C:\ws\src\main.rs",
+            ),
+            (
+                "a bare separator as the root",
+                "\\",
+                r"src\main.rs",
+                r"\src\main.rs",
+            ),
+            ("a unix-shaped root", "/", "src", "/src"),
+        ];
+        for (name, root, rel, expected) in rows {
+            assert_eq!(traversal_display(root, rel), expected, "{name}");
+        }
     }
 
     #[test]
@@ -1031,21 +1072,6 @@ mod tests {
         for bad in ["%TEMP%", "a!b", "a\"b", "a\nb", "a\rb"] {
             assert!(cmd_quote(bad).is_err(), "{bad:?} must be refused");
         }
-    }
-
-    #[test]
-    fn traversal_display_joins_with_the_windows_separator() {
-        assert_eq!(
-            traversal_display(r"C:\ws", r"src\main.rs"),
-            r"C:\ws\src\main.rs"
-        );
-        // An operand that already ends in a separator keeps exactly that one.
-        assert_eq!(
-            traversal_display(r"C:\ws\", r"src\main.rs"),
-            r"C:\ws\src\main.rs"
-        );
-        assert_eq!(traversal_display("\\", r"src\main.rs"), r"\src\main.rs");
-        assert_eq!(traversal_display("/", "src"), "/src");
     }
 
     #[test]
@@ -1071,9 +1097,13 @@ mod tests {
         assert!(write_spec_file(dir.path(), "{}").is_err());
     }
 
+    /// Which spellings this platform reads as which: a word that names an absolute
+    /// path, an operand that carries a glob outside quotes, and two spellings of one
+    /// directory (its case, separators and verbatim prefix are the same directory).
     #[test]
-    fn is_absolute_word_reads_windows_spellings() {
-        let rows = [
+    fn path_and_word_spellings_are_read_as_windows_writes_them() {
+        // (word, is the word an absolute path)
+        let absolute = [
             (r"C:\ws", true),
             ("C:/ws", true),
             (r"\\srv\share", true),
@@ -1086,8 +1116,41 @@ mod tests {
             ("ws", false),
             ("", false),
         ];
-        for (word, expected) in rows {
-            assert_eq!(is_absolute_word(word), expected, "{word}");
+        for (word, expected) in absolute {
+            assert_eq!(is_absolute_word(word), expected, "absolute? {word:?}");
+        }
+
+        // (operand, does it carry a glob the operand itself does not quote)
+        let globs = [
+            ("*.txt", true),
+            ("a?c", true),
+            ("[ab]c", true),
+            ("\"*.txt\"", false),
+            ("plain.txt", false),
+            ("\"a\"\"*\"", false),
+            ("\"a\"\"b\"*", true),
+        ];
+        for (operand, expected) in globs {
+            assert_eq!(has_unquoted_glob(operand), expected, "glob? {operand:?}");
+        }
+
+        // (one spelling, another spelling of the same directory or not)
+        let spellings = [
+            (r"C:\ws", r"C:\WS\", true),
+            (r"C:\ws", r"\\?\C:\ws", true),
+            ("C:/ws/", r"C:\ws", true),
+            (r"\\?\UNC\srv\share", r"\\SRV\Share", true),
+            (r"C:\ws\a", r"C:\ws", false),
+            // A drive root is not its drive-relative spelling.
+            (r"C:\", "C:", false),
+            (r"C:\", "C:/", true),
+        ];
+        for (left, right, expected) in spellings {
+            assert_eq!(
+                same_spelling(Path::new(left), Path::new(right)),
+                expected,
+                "same? {left:?} {right:?}"
+            );
         }
     }
 
@@ -1139,32 +1202,6 @@ mod tests {
                 "round trip of {pattern}"
             );
         }
-    }
-
-    #[test]
-    fn has_unquoted_glob_respects_quoting() {
-        assert!(has_unquoted_glob("*.txt"));
-        assert!(has_unquoted_glob("a?c"));
-        assert!(has_unquoted_glob("[ab]c"));
-        assert!(!has_unquoted_glob("\"*.txt\""));
-        assert!(!has_unquoted_glob("plain.txt"));
-        assert!(!has_unquoted_glob("\"a\"\"*\""));
-        assert!(has_unquoted_glob("\"a\"\"b\"*"));
-    }
-
-    #[test]
-    fn same_spelling_ignores_case_separators_and_the_verbatim_prefix() {
-        assert!(same_spelling(Path::new(r"C:\ws"), Path::new(r"C:\WS\")));
-        assert!(same_spelling(Path::new(r"C:\ws"), Path::new(r"\\?\C:\ws")));
-        assert!(same_spelling(Path::new("C:/ws/"), Path::new(r"C:\ws")));
-        assert!(same_spelling(
-            Path::new(r"\\?\UNC\srv\share"),
-            Path::new(r"\\SRV\Share")
-        ));
-        assert!(!same_spelling(Path::new(r"C:\ws\a"), Path::new(r"C:\ws")));
-        // A drive root is not its drive-relative spelling.
-        assert!(!same_spelling(Path::new(r"C:\"), Path::new("C:")));
-        assert!(same_spelling(Path::new(r"C:\"), Path::new("C:/")));
     }
 
     #[test]

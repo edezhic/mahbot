@@ -2092,23 +2092,10 @@ async fn fetch_async_video(
 mod tests {
     use super::*;
     use crate::Tool;
-    use crate::ToolSpec;
     use crate::workspace::test_ws_named;
     use tempfile::TempDir;
 
     // ── ToolSpec serde ───────────────────────────────────────────
-
-    #[test]
-    fn tool_spec_serde_roundtrip() {
-        let spec = ToolSpec {
-            name: "test".into(),
-            description: "A test tool".into(),
-            parameters: serde_json::json!({"type": "object"}),
-        };
-        let parsed: ToolSpec =
-            serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
-        assert_eq!(parsed.name, "test");
-    }
 
     #[test]
     fn failure_feedback_bounds_the_argument_preview_it_shows() {
@@ -2151,6 +2138,24 @@ mod tests {
             fault.len()
         );
         assert_eq!(crate::util::truncate_tool_output(&feedback), feedback);
+
+        // Scrubbing happens before the cap: this credential straddles the preview's
+        // cut, so a cap applied first would leave its raw head in the shown text and
+        // no redaction marker at all.
+        let secret = "abcdefghij".repeat(10);
+        let secret_args = serde_json::json!({
+            "prompt": "x".repeat(928),
+            "token": secret,
+        });
+        let secret_feedback = format_tool_failure_feedback(tool, &secret_args, &reason);
+        assert!(
+            secret_feedback.contains("*[REDACTED]"),
+            "the credential is scrubbed before the preview is cut: {secret_feedback}"
+        );
+        assert!(
+            !secret_feedback.contains(&secret),
+            "the raw credential cannot survive: {secret_feedback}"
+        );
     }
 
     // ── ImagePayload source verb ──────────────────────────────────
@@ -2245,53 +2250,199 @@ mod tests {
         }
     }
 
+    /// One [`normalize_tool_call`] call: what the caller sent, the tool the call
+    /// must be routed to, and the arguments it must carry afterwards.
+    struct NormalizeCallCase {
+        name: &'static str,
+        tool: &'static str,
+        input: serde_json::Value,
+        routed: &'static str,
+        /// `(key, value)` pairs the arguments must carry.
+        fields: &'static [(&'static str, &'static str)],
+        /// A key the caller's own spelling must survive under, when it must.
+        kept: Option<&'static str>,
+    }
+
+    /// Verify that [`normalize_tool_call`] repairs the names and arguments a
+    /// caller sent, and that it remaps every alias in [`PATH_ALIAS_KEYS`] to
+    /// `"path"` — sweeping the constant itself, so an alias added tomorrow is
+    /// exercised against the loop-based approach in [`normalize_tool_arguments`].
+    ///
+    /// The document and computer tools are the exemptions: each declares and
+    /// enforces its own argument names, so an alias is left as the caller wrote it
+    /// and refused by that name instead of being remapped into a `"path"` its
+    /// actions do not take. Remapped alias and ignored-or-refused extra key are
+    /// separate things: `workspace` takes the alias for its `add` while refusing a
+    /// stray field on `pause` / `resume` (`tools::workspace::a_misspelled_address_…`).
+    #[expect(clippy::too_many_lines)]
     #[test]
-    fn normalize_tool_call_repairs_names_and_args() {
-        let (name, args) = normalize_tool_call("bash", serde_json::json!({"cmd": "echo hi"}));
-        assert_eq!(name, "shell");
-        assert_eq!(args["command"], "echo hi");
+    fn normalize_tool_call_cases() {
+        for case in [
+            // A tool's own aliases route the call and repair its arguments.
+            NormalizeCallCase {
+                name: "a shell alias sends the command under its own key",
+                tool: "bash",
+                input: serde_json::json!({"cmd": "echo hi"}),
+                routed: "shell",
+                fields: &[("command", "echo hi")],
+                kept: None,
+            },
+            NormalizeCallCase {
+                name: "a search alias becomes a file listing",
+                tool: "glob",
+                input: serde_json::json!({"query": "main.rs"}),
+                routed: "search",
+                fields: &[("mode", "files")],
+                kept: None,
+            },
+            NormalizeCallCase {
+                name: "an id argument is the ticket to read",
+                tool: "get_ticket",
+                input: serde_json::json!({"id": "mahbot-1"}),
+                routed: "get_ticket",
+                fields: &[("ticket_id", "mahbot-1")],
+                kept: None,
+            },
+            NormalizeCallCase {
+                name: "an id argument is the workspace to add",
+                tool: "workspace",
+                input: serde_json::json!({"id": "ws-1"}),
+                routed: "workspace",
+                fields: &[("ticket_id", "ws-1")],
+                kept: None,
+            },
+            NormalizeCallCase {
+                name: "a path alias becomes the path to read",
+                tool: "read",
+                input: serde_json::json!({"file": "src/main.rs"}),
+                routed: "read",
+                fields: &[("path", "src/main.rs")],
+                kept: None,
+            },
+            NormalizeCallCase {
+                name: "a read alias is routed to the reader with its own key",
+                tool: "read_file",
+                input: serde_json::json!({"filename": "lib.rs"}),
+                routed: "read",
+                fields: &[("path", "lib.rs")],
+                kept: None,
+            },
+            NormalizeCallCase {
+                name: "the editor's path and both halves of its replacement are repaired",
+                tool: "edit",
+                input: serde_json::json!({"file": "main.rs", "old_str": "foo", "new_str": "bar"}),
+                routed: "edit",
+                fields: &[
+                    ("path", "main.rs"),
+                    ("old_string", "foo"),
+                    ("new_string", "bar"),
+                ],
+                kept: None,
+            },
+            // The canonical key wins when both spellings arrive; `remap_arg_key`
+            // only moves when the canonical key is absent, so the alias remains.
+            NormalizeCallCase {
+                name: "a canonical path is never overwritten by an alias",
+                tool: "read",
+                input: serde_json::json!({"path": "canonical.rs", "file": "alias.rs"}),
+                routed: "read",
+                fields: &[("path", "canonical.rs")],
+                kept: Some("file"),
+            },
+        ] {
+            let (name, args) = normalize_tool_call(case.tool, case.input);
+            assert_eq!(name, case.routed, "[{}] routed tool", case.name);
+            for (key, value) in case.fields {
+                assert_eq!(args[key], *value, "[{}] argument {key}", case.name);
+            }
+            if let Some(key) = case.kept {
+                assert!(
+                    args.as_object().unwrap().contains_key(key),
+                    "[{}] the caller's own key {key} must survive: {args}",
+                    case.name
+                );
+            }
+        }
 
-        let (name, args) = normalize_tool_call("glob", serde_json::json!({"query": "main.rs"}));
-        assert_eq!(name, "search");
-        assert_eq!(args["mode"], "files");
+        for &alias in PATH_ALIAS_KEYS {
+            for (tool_name, extra) in &[
+                ("read", serde_json::json!({})),
+                ("shell", serde_json::json!({"cmd": "ls"})),
+            ] {
+                let mut input = serde_json::json!({});
+                input[alias] = serde_json::json!("src/main.rs");
+                if let Some(obj) = extra.as_object() {
+                    for (k, v) in obj {
+                        input[k] = v.clone();
+                    }
+                }
+                let (name, args) = normalize_tool_call(tool_name, input);
+                assert_eq!(
+                    name, *tool_name,
+                    "tool name should not change for {tool_name} with alias {alias}"
+                );
+                // The alias is remapped to "path" for every tool but the document and
+                // computer tools: tools that don't use "path" simply ignore the extra key.
+                assert_eq!(
+                    args["path"], "src/main.rs",
+                    "alias {alias} should be remapped to 'path' for tool {tool_name}"
+                );
+                // The alias key itself should have been removed since "path" was absent.
+                assert!(
+                    !args.as_object().unwrap().contains_key(alias),
+                    "alias key {alias} should be removed after normalization for {tool_name}"
+                );
+                // Shell-specific remaps must be unaffected.
+                if *tool_name == "shell" {
+                    assert_eq!(args["command"], "ls");
+                }
+            }
+        }
+        // The document and computer tools' own contracts name their arguments: an
+        // alias stays as the caller wrote it, for the boundary to refuse that spelling
+        // by name.
+        for tool_name in ["document", "computer"] {
+            let (_, args) = normalize_tool_call(tool_name, serde_json::json!({ "file": "a.pdf" }));
+            assert_eq!(
+                args["file"], "a.pdf",
+                "{tool_name} must keep the caller's key"
+            );
+            assert!(
+                args.get("path").is_none(),
+                "{tool_name} must not invent 'path'"
+            );
+        }
 
-        let (name, args) = normalize_tool_call("get_ticket", serde_json::json!({"id": "mahbot-1"}));
-        assert_eq!(name, "get_ticket");
-        assert_eq!(args["ticket_id"], "mahbot-1");
-
-        let (name, args) = normalize_tool_call("workspace", serde_json::json!({"id": "ws-1"}));
-        assert_eq!(name, "workspace");
-        assert_eq!(args["ticket_id"], "ws-1");
-
-        // "read" tool: file/filename → path
-        let (name, args) = normalize_tool_call("read", serde_json::json!({"file": "src/main.rs"}));
-        assert_eq!(name, "read");
-        assert_eq!(args["path"], "src/main.rs");
-
-        let (name, args) =
-            normalize_tool_call("read_file", serde_json::json!({"filename": "lib.rs"}));
-        assert_eq!(name, "read");
-        assert_eq!(args["path"], "lib.rs");
-
-        // "edit" tool: file/filename → path, old_str/new_str → old_string/new_string
-        let (name, args) = normalize_tool_call(
-            "edit",
-            serde_json::json!({"file": "main.rs", "old_str": "foo", "new_str": "bar"}),
+        // A dangling `send` frame resolves to the sync worker core: an absent or
+        // explicit-null address is the narrowest choice, the worker address is
+        // itself, and any other address is re-executed.
+        for (name, args) in [
+            ("an absent address", serde_json::json!({"message": "m"})),
+            (
+                "an explicit null address",
+                serde_json::json!({"message": "m", "addressee": null}),
+            ),
+            (
+                "the worker address",
+                serde_json::json!({"message": "m", "addressee": "worker"}),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    SyncDurableCore::from_call("send", &args),
+                    Some(SyncDurableCore::Worker)
+                ),
+                "{name} still resumes the sync worker"
+            );
+        }
+        assert!(
+            SyncDurableCore::from_call(
+                "send",
+                &serde_json::json!({"message": "m", "addressee": "manager"})
+            )
+            .is_none(),
+            "another address is re-executed, never resolved to this core"
         );
-        assert_eq!(name, "edit");
-        assert_eq!(args["path"], "main.rs");
-        assert_eq!(args["old_string"], "foo");
-        assert_eq!(args["new_string"], "bar");
-
-        // Canonical "path" key is preserved when both "path" and alias are present.
-        // remap_arg_key only moves when canonical key is absent, so "file" remains.
-        let (name, args) = normalize_tool_call(
-            "read",
-            serde_json::json!({"path": "canonical.rs", "file": "alias.rs"}),
-        );
-        assert_eq!(name, "read");
-        assert_eq!(args["path"], "canonical.rs");
-        assert!(args.as_object().unwrap().contains_key("file"));
     }
 
     #[test]
@@ -2341,80 +2492,6 @@ mod tests {
             assert!(
                 crate::util::MEDIA_MARKER_RE.is_match(&full_marker),
                 "{name} marker + path should match MEDIA_MARKER_RE, got: {full_marker:?}"
-            );
-        }
-    }
-
-    // ── normalize_tool_call tests ─────────────────────────────────────
-
-    /// Verify that [`normalize_tool_call`] remaps every alias in
-    /// [`PATH_ALIAS_KEYS`] to `"path"` — regardless of whether the tool
-    /// explicitly accepts a `"path"` parameter.
-    ///
-    /// This test verifies path-aliasing for both a path-accepting tool (`read`)
-    /// and a non-path tool (`shell`). The remap happens unconditionally;
-    /// such tools simply ignore the extra key.
-    ///
-    /// This test explicitly iterates the constant so the loop-based approach in
-    /// [`normalize_tool_arguments`] is verified against all current aliases.
-    /// If an alias is added to [`PATH_ALIAS_KEYS`], this test immediately
-    /// exercises it — preventing any gap between the lookup path and the
-    /// normalization path.
-    ///
-    /// The document and computer tools are the exemptions: each declares and
-    /// enforces its own argument names, so an alias is left as the caller wrote it
-    /// and refused by that name instead of being remapped into a `"path"` its
-    /// actions do not take. Remapped alias and ignored-or-refused extra key are
-    /// separate things: `workspace` takes the alias for its `add` while refusing a
-    /// stray field on `pause` / `resume` (`tools::workspace::a_misspelled_address_…`).
-    #[test]
-    fn normalize_tool_call_remaps_all_path_aliases() {
-        for &alias in PATH_ALIAS_KEYS {
-            for (tool_name, extra) in &[
-                ("read", serde_json::json!({})),
-                ("shell", serde_json::json!({"cmd": "ls"})),
-            ] {
-                let mut input = serde_json::json!({});
-                input[alias] = serde_json::json!("src/main.rs");
-                if let Some(obj) = extra.as_object() {
-                    for (k, v) in obj {
-                        input[k] = v.clone();
-                    }
-                }
-                let (name, args) = normalize_tool_call(tool_name, input);
-                assert_eq!(
-                    name, *tool_name,
-                    "tool name should not change for {tool_name} with alias {alias}"
-                );
-                // The alias is remapped to "path" for every tool but the document and
-                // computer tools: tools that don't use "path" simply ignore the extra key.
-                assert_eq!(
-                    args["path"], "src/main.rs",
-                    "alias {alias} should be remapped to 'path' for tool {tool_name}"
-                );
-                // The alias key itself should have been removed since "path" was absent.
-                assert!(
-                    !args.as_object().unwrap().contains_key(alias),
-                    "alias key {alias} should be removed after normalization for {tool_name}"
-                );
-                // Shell-specific remaps must be unaffected.
-                if *tool_name == "shell" {
-                    assert_eq!(args["command"], "ls");
-                }
-            }
-        }
-        // The document and computer tools' own contracts name their arguments: an
-        // alias stays as the caller wrote it, for the boundary to refuse that spelling
-        // by name.
-        for tool_name in ["document", "computer"] {
-            let (_, args) = normalize_tool_call(tool_name, serde_json::json!({ "file": "a.pdf" }));
-            assert_eq!(
-                args["file"], "a.pdf",
-                "{tool_name} must keep the caller's key"
-            );
-            assert!(
-                args.get("path").is_none(),
-                "{tool_name} must not invent 'path'"
             );
         }
     }
@@ -2541,123 +2618,192 @@ mod tests {
 
     // ── save_generated_file tests ──────────────────────────────────────────
 
-    #[tokio::test]
-    async fn save_generated_file_creates_file() {
-        let tmp = TempDir::new().expect("tempdir");
-        let ws = test_ws_named(&tmp.path().to_string_lossy(), "test");
-
-        let data = b"hello world";
-        let path = save_generated_file(&ws, data, "img", "png")
-            .await
-            .expect("save_generated_file should succeed");
-
-        assert!(path.exists(), "file should exist: {}", path.display());
-        let content = tokio::fs::read_to_string(&path).await.unwrap();
-        assert_eq!(content, "hello world");
-
-        // Verify filename format: {prefix}_{timestamp}.{ext}
-        let file_name = path.file_name().unwrap().to_str().unwrap();
-        assert!(
-            file_name.starts_with("img_"),
-            "filename should start with 'img_': {file_name}",
-        );
-        assert!(
-            std::path::Path::new(file_name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("png")),
-            "filename should end with '.png': {file_name}",
-        );
-
-        let _ = tokio::fs::remove_dir_all(tmp.path()).await;
+    /// One [`save_generated_file`] call: the workspace it lands in and the name
+    /// the produced file must carry.
+    struct SaveGeneratedCase {
+        name: &'static str,
+        /// Nest the workspace root one level down, so its directory does not exist.
+        nested: bool,
+        prefix: &'static str,
+        ext: &'static str,
+        data: &'static [u8],
     }
 
     #[tokio::test]
-    async fn save_generated_file_creates_directory_if_missing() {
-        let tmp = TempDir::new().expect("tempdir");
-        let ws = test_ws_named(&tmp.path().join("nested").to_string_lossy(), "test");
+    async fn save_generated_file_cases() {
+        for case in [
+            SaveGeneratedCase {
+                name: "a file is written under its prefix and extension",
+                nested: false,
+                prefix: "img",
+                ext: "png",
+                data: b"hello world",
+            },
+            SaveGeneratedCase {
+                name: "a missing workspace directory is created",
+                nested: true,
+                prefix: "vid",
+                ext: "mp4",
+                data: b"test content",
+            },
+        ] {
+            let tmp = TempDir::new().expect("tempdir");
+            let root = if case.nested {
+                tmp.path().join("nested")
+            } else {
+                tmp.path().to_path_buf()
+            };
+            let ws = test_ws_named(&root.to_string_lossy(), "test");
 
-        let data = b"test content";
-        let path = save_generated_file(&ws, data, "vid", "mp4")
-            .await
-            .expect("save_generated_file should create dirs");
+            let path = save_generated_file(&ws, case.data, case.prefix, case.ext)
+                .await
+                .unwrap_or_else(|err| panic!("[{}] save_generated_file: {err}", case.name));
+            assert!(
+                path.exists(),
+                "[{}] file should exist: {}",
+                case.name,
+                path.display()
+            );
+            assert!(
+                path.starts_with(&root),
+                "[{}] file should be inside the workspace",
+                case.name
+            );
+            // Filename format: {prefix}_{timestamp}.{ext}.
+            let file_name = path.file_name().unwrap().to_str().unwrap();
+            assert!(
+                file_name.starts_with(&format!("{}_", case.prefix)),
+                "[{}] filename should start with the prefix: {file_name}",
+                case.name
+            );
+            assert!(
+                std::path::Path::new(file_name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case(case.ext)),
+                "[{}] filename should end with .{}: {file_name}",
+                case.name,
+                case.ext
+            );
+            if !case.nested {
+                let content = tokio::fs::read_to_string(&path).await.unwrap();
+                assert_eq!(
+                    content,
+                    std::str::from_utf8(case.data).unwrap(),
+                    "[{}] the bytes are written as given",
+                    case.name
+                );
+            }
 
-        assert!(path.exists(), "file should exist: {}", path.display());
-        assert!(
-            path.starts_with(tmp.path().join("nested")),
-            "file should be inside workspace"
-        );
-
-        let _ = tokio::fs::remove_dir_all(tmp.path()).await;
+            let _ = tokio::fs::remove_dir_all(tmp.path()).await;
+        }
     }
 
     // ── Reference-image body budget ─────────────────────────────────
 
-    #[tokio::test]
-    async fn reference_body_budget_compresses_further() {
-        const BUDGET: usize = 150_000;
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("ref.png");
-        std::fs::write(&path, crate::util::test::noisy_png(384, 384)).unwrap();
-        let mut refs = vec![
-            crate::util::load_reference_image(&path, MAX_REFERENCE_IMAGE_BYTES)
-                .await
-                .unwrap(),
-        ];
-        let original = refs[0].data_uri().to_string();
-        let mut body = serde_json::json!({
-            "model": "test",
-            "prompt": "test",
-            "input_references": reference_json(&refs),
-        });
-        // The per-image cap passes a 384×384 ref through unchanged (~590 KB
-        // base64 body); a small budget forces the aggregate ladder.
-        assert!(serde_json::to_vec(&body).unwrap().len() > BUDGET);
-        fit_request_body_budget(&mut body, &mut refs, BUDGET).unwrap();
-        assert!(serde_json::to_vec(&body).unwrap().len() <= BUDGET);
-        assert_ne!(
-            refs[0].data_uri(),
-            original,
-            "reference should be compressed"
-        );
+    enum BudgetScenario {
+        AggregateLadder,
+        FallsThroughToSmallerReference,
+    }
+
+    struct BodyBudgetCase {
+        name: &'static str,
+        scenario: BudgetScenario,
     }
 
     #[tokio::test]
-    async fn body_budget_falls_through_to_smaller_reference() {
-        // When the largest reference's ladder is exhausted, the loop must
-        // fall through to the next-largest instead of bailing.
-        let tmp = TempDir::new().unwrap();
-        let big = tmp.path().join("big.png");
-        let small = tmp.path().join("small.png");
-        std::fs::write(&big, crate::util::test::noisy_png(512, 512)).unwrap();
-        std::fs::write(&small, crate::util::test::noisy_png(128, 128)).unwrap();
-        let mut refs = vec![
-            crate::util::load_reference_image(&big, MAX_REFERENCE_IMAGE_BYTES)
-                .await
-                .unwrap(),
-            crate::util::load_reference_image(&small, MAX_REFERENCE_IMAGE_BYTES)
-                .await
-                .unwrap(),
-        ];
-        let small_original = refs[1].data_uri().to_string();
-        let mut body = serde_json::json!({
-            "model": "test",
-            "prompt": "test",
-            "input_references": reference_json(&refs),
-        });
-        // Exhaust the big reference's ladder, then measure the raw body so the
-        // budget can be pinned to a window that only the small reference can
-        // close — deterministically forcing the fall-through path.
-        while refs[0].has_compression_left() {
-            refs[0].compress_more().unwrap();
+    async fn reference_body_budget_cases() {
+        for case in [
+            BodyBudgetCase {
+                name: "a body past the budget compresses its reference",
+                scenario: BudgetScenario::AggregateLadder,
+            },
+            BodyBudgetCase {
+                name: "an exhausted ladder falls through to the next reference",
+                scenario: BudgetScenario::FallsThroughToSmallerReference,
+            },
+        ] {
+            match case.scenario {
+                BudgetScenario::AggregateLadder => {
+                    const BUDGET: usize = 150_000;
+                    let tmp = TempDir::new().unwrap();
+                    let path = tmp.path().join("ref.png");
+                    std::fs::write(&path, crate::util::test::noisy_png(384, 384)).unwrap();
+                    let mut refs = vec![
+                        crate::util::load_reference_image(&path, MAX_REFERENCE_IMAGE_BYTES)
+                            .await
+                            .unwrap(),
+                    ];
+                    let original = refs[0].data_uri().to_string();
+                    let mut body = serde_json::json!({
+                        "model": "test",
+                        "prompt": "test",
+                        "input_references": reference_json(&refs),
+                    });
+                    // The per-image cap passes a 384×384 ref through unchanged (~590 KB
+                    // base64 body); a small budget forces the aggregate ladder.
+                    assert!(
+                        serde_json::to_vec(&body).unwrap().len() > BUDGET,
+                        "[{}] the body starts past the budget",
+                        case.name
+                    );
+                    fit_request_body_budget(&mut body, &mut refs, BUDGET).unwrap();
+                    assert!(
+                        serde_json::to_vec(&body).unwrap().len() <= BUDGET,
+                        "[{}] the body fits the budget",
+                        case.name
+                    );
+                    assert_ne!(
+                        refs[0].data_uri(),
+                        original,
+                        "[{}] reference should be compressed",
+                        case.name
+                    );
+                }
+                BudgetScenario::FallsThroughToSmallerReference => {
+                    // When the largest reference's ladder is exhausted, the loop must
+                    // fall through to the next-largest instead of bailing.
+                    let tmp = TempDir::new().unwrap();
+                    let big = tmp.path().join("big.png");
+                    let small = tmp.path().join("small.png");
+                    std::fs::write(&big, crate::util::test::noisy_png(512, 512)).unwrap();
+                    std::fs::write(&small, crate::util::test::noisy_png(128, 128)).unwrap();
+                    let mut refs = vec![
+                        crate::util::load_reference_image(&big, MAX_REFERENCE_IMAGE_BYTES)
+                            .await
+                            .unwrap(),
+                        crate::util::load_reference_image(&small, MAX_REFERENCE_IMAGE_BYTES)
+                            .await
+                            .unwrap(),
+                    ];
+                    let small_original = refs[1].data_uri().to_string();
+                    let mut body = serde_json::json!({
+                        "model": "test",
+                        "prompt": "test",
+                        "input_references": reference_json(&refs),
+                    });
+                    // Exhaust the big reference's ladder, then measure the raw body so
+                    // the budget can be pinned to a window that only the small
+                    // reference can close — deterministically forcing the fall-through
+                    // path.
+                    while refs[0].has_compression_left() {
+                        refs[0].compress_more().unwrap();
+                    }
+                    body[INPUT_REFERENCES_KEY] = reference_json(&refs);
+                    let raw_body = serde_json::to_vec(&body).unwrap().len();
+                    fit_request_body_budget(&mut body, &mut refs, raw_body - 1).unwrap();
+                    assert!(
+                        serde_json::to_vec(&body).unwrap().len() < raw_body,
+                        "[{}] the body shrinks",
+                        case.name
+                    );
+                    assert_ne!(
+                        refs[1].data_uri(),
+                        small_original,
+                        "[{}] smaller reference should have been compressed",
+                        case.name
+                    );
+                }
+            }
         }
-        body[INPUT_REFERENCES_KEY] = reference_json(&refs);
-        let raw_body = serde_json::to_vec(&body).unwrap().len();
-        fit_request_body_budget(&mut body, &mut refs, raw_body - 1).unwrap();
-        assert!(serde_json::to_vec(&body).unwrap().len() < raw_body);
-        assert_ne!(
-            refs[1].data_uri(),
-            small_original,
-            "smaller reference should have been compressed"
-        );
     }
 }

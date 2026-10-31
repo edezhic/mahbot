@@ -5394,37 +5394,15 @@ mod tests {
 
     #[cfg(unix)]
     use crate::util::test::env_lock;
-    use crate::util::test::set_env_var;
     #[cfg(unix)]
     use crate::util::test::wait_for_death;
+    use crate::util::test::{assert_contains_not_contains, set_env_var};
 
     // ── Table-driven test helpers ─────────────────────────────────────
     // These helpers reduce boilerplate for process_shell_output and
     // filter_cargo_test_output test groups. Each case carries its own
     // assertions (contains, not_contains, eq) with a descriptive name
     // so test failures show exactly which scenario broke.
-
-    /// Shared assertion helper: verify that all `contains` strings are present
-    /// and all `not_contains` strings are absent in `result`.
-    fn assert_contains_not_contains(
-        name: &str,
-        result: &str,
-        contains: &[&str],
-        not_contains: &[&str],
-    ) {
-        for &s in contains {
-            assert!(
-                result.contains(s),
-                "[{name}] expected contains {s:?}\n  got: {result:?}",
-            );
-        }
-        for &s in not_contains {
-            assert!(
-                !result.contains(s),
-                "[{name}] expected NOT contains {s:?}\n  got: {result:?}",
-            );
-        }
-    }
 
     /// A test case for [`process_shell_output`] with multi-assertion support.
     #[derive(Default)]
@@ -5487,24 +5465,16 @@ mod tests {
         }
     }
 
-    /// Run [`filter_cargo_test_output`] for each case and assert expectations.
-    fn check_cargo_test_filter(cases: &[CargoTestFilterCase]) {
-        for case in cases {
-            let result = filter_cargo_test_output(case.output, case.exit_code);
-            assert_contains_not_contains(case.name, &result, case.contains, case.not_contains);
-        }
-    }
-
-    // ── Consolidated table-driven tests ───────────────────────────────
+    // ── Table-driven output selection ─────────────────────────────────
     //
-    // Each `_cases` function replaces multiple individual test functions
-    // that followed the same pattern (call process_shell_output →
-    // assert contains/not_contains). Adding a new scenario is a single
-    // struct literal with a descriptive name.
+    // One row per command shape `process_shell_output` is asked about: the
+    // command, the raw output a run would hand it, and what the formatted
+    // result must carry (and must not).
 
     #[test]
     fn cargo_test_filter_cases() {
-        // Cargo test output filter state machine — consolidated table.
+        // Cargo test output filter state machine: the raw output a run hands it
+        // and the lines the filtered result must carry.
         let cases: &[CargoTestFilterCase] = &[
             CargoTestFilterCase {
                 name: "failure block captures failures and panic message",
@@ -5579,16 +5549,18 @@ mod tests {
                 not_contains: &["Compiling"],
             },
         ];
-        check_cargo_test_filter(cases);
+        for case in cases {
+            let result = filter_cargo_test_output(case.output, case.exit_code);
+            assert_contains_not_contains(case.name, &result, case.contains, case.not_contains);
+        }
     }
 
     #[expect(clippy::too_many_lines)]
     #[test]
     fn profile_selection_cases() {
-        // Profile selection/dispatch tests — consolidated table.
-        // Includes detection of correct profiles from canonical commands,
-        // fallback behavior for unknown/builtin-only commands, and chained
-        // command dispatch that selects the first matching segment.
+        // Profile selection and dispatch: the profile a canonical command
+        // selects, the fallback for an unknown or builtin-only one, and chained
+        // commands dispatching on their first matching segment.
         let cases: &[ShellOutputCase] = &[
             ShellOutputCase {
                 name: "cargo --release test triggers state machine",
@@ -5741,86 +5713,7 @@ mod tests {
                 contains: &["some", "output"],
                 ..Default::default()
             },
-        ];
-        check_shell_output(cases);
-    }
-
-    #[test]
-    fn mahbot_surface_lines_bypass_the_line_cap() {
-        // The chrome CLI emits ONE line of JSON; its profile must not apply
-        // GEN_FALLBACK's 500-byte line cap, which would truncate the envelope
-        // mid-JSON and drop the page content.
-        let envelope = format!(
-            r#"{{"schema":1,"action":"open","ok":true,"kind":"ok","content":"{}","url":"https://example.com/"}}"#,
-            "x".repeat(600)
-        );
-        let result = process_shell_output(
-            "mahbot chrome open https://example.com",
-            &envelope,
-            "",
-            0,
-            Duration::from_secs_f64(1.0),
-        );
-        assert_contains_not_contains(
-            "mahbot chrome envelope",
-            &result,
-            &[r#""content":""#],
-            &["more chars on this line"],
-        );
-        assert!(
-            result.contains(&envelope),
-            "envelope line must survive intact"
-        );
-
-        // `mahbot audio transcribe` prints the transcript as ONE line, so the
-        // same cap would cut it off after the first 500 bytes — the harm the
-        // chrome case above exists to prevent.
-        let transcript = "x".repeat(600);
-        let result = process_shell_output(
-            "mahbot audio transcribe --input voice.wav",
-            &transcript,
-            "",
-            0,
-            Duration::from_secs_f64(1.0),
-        );
-        assert_contains_not_contains(
-            "mahbot audio transcript",
-            &result,
-            &[&transcript],
-            &["more chars on this line"],
-        );
-
-        // The one profile covers the CLI's other prose families too, whose
-        // answers can be just as long a single line (a role or key listing): it
-        // must come through intact as well.
-        let prose = format!("custom-role `{}`: write, read, verify", "x".repeat(600));
-        let result = process_shell_output(
-            "mahbot config list-custom-roles",
-            &prose,
-            "",
-            0,
-            Duration::from_secs_f64(1.0),
-        );
-        assert_contains_not_contains(
-            "mahbot config answer",
-            &result,
-            &["custom-role"],
-            &["more chars on this line"],
-        );
-        assert!(
-            result.contains(&prose),
-            "config answer line must survive intact"
-        );
-    }
-
-    #[expect(clippy::too_many_lines)]
-    #[test]
-    fn tool_profile_cases() {
-        // Specific tool profile tests — consolidated table.
-        // Covers strip, on_empty, and transform behaviors of named
-        // tool profiles (git, docker, df, du, make, rsync, tsc, gh,
-        // terraform, pytest, and the generic fallback pipeline).
-        let cases: &[ShellOutputCase] = &[
+            // ── Named tool profiles ──
             ShellOutputCase {
                 name: "git diff no changes via on_empty",
                 command: "git diff",
@@ -5927,17 +5820,7 @@ mod tests {
                 contains: &["collected"],
                 ..Default::default()
             },
-        ];
-        check_shell_output(cases);
-    }
-
-    #[test]
-    fn compact_ls_cases() {
-        // ls compaction profile tests — consolidated table.
-        // compact_ls transforms `ls -la` output into a compact summary.
-        // Plain `ls` (no -l) and chained/piped commands are excluded
-        // from compaction via standalone_only and selection logic.
-        let cases: &[ShellOutputCase] = &[
+            // ── `ls` compaction ──
             ShellOutputCase {
                 name: "empty directory shows (empty)",
                 command: "ls -la",
@@ -5985,14 +5868,7 @@ mod tests {
                 not_contains: &["Summary:"],
                 ..Default::default()
             },
-        ];
-        check_shell_output(cases);
-    }
-
-    #[test]
-    fn cargo_build_cases() {
-        // Cargo build/check profile tests — consolidated table.
-        let cases: &[ShellOutputCase] = &[
+            // ── Cargo build/check ──
             ShellOutputCase {
                 name: "cargo build strips Compiling, preserves errors",
                 command: "cargo build",
@@ -6081,6 +5957,74 @@ mod tests {
             },
         ];
         check_shell_output(cases);
+    }
+
+    #[test]
+    fn mahbot_surface_lines_bypass_the_line_cap() {
+        // The chrome CLI emits ONE line of JSON; its profile must not apply
+        // GEN_FALLBACK's 500-byte line cap, which would truncate the envelope
+        // mid-JSON and drop the page content.
+        let envelope = format!(
+            r#"{{"schema":1,"action":"open","ok":true,"kind":"ok","content":"{}","url":"https://example.com/"}}"#,
+            "x".repeat(600)
+        );
+        let result = process_shell_output(
+            "mahbot chrome open https://example.com",
+            &envelope,
+            "",
+            0,
+            Duration::from_secs_f64(1.0),
+        );
+        assert_contains_not_contains(
+            "mahbot chrome envelope",
+            &result,
+            &[r#""content":""#],
+            &["more chars on this line"],
+        );
+        assert!(
+            result.contains(&envelope),
+            "envelope line must survive intact"
+        );
+
+        // `mahbot audio transcribe` prints the transcript as ONE line, so the
+        // same cap would cut it off after the first 500 bytes — the harm the
+        // chrome case above exists to prevent.
+        let transcript = "x".repeat(600);
+        let result = process_shell_output(
+            "mahbot audio transcribe --input voice.wav",
+            &transcript,
+            "",
+            0,
+            Duration::from_secs_f64(1.0),
+        );
+        assert_contains_not_contains(
+            "mahbot audio transcript",
+            &result,
+            &[&transcript],
+            &["more chars on this line"],
+        );
+
+        // The one profile covers the CLI's other prose families too, whose
+        // answers can be just as long a single line (a role or key listing): it
+        // must come through intact as well.
+        let prose = format!("custom-role `{}`: write, read, verify", "x".repeat(600));
+        let result = process_shell_output(
+            "mahbot config list-custom-roles",
+            &prose,
+            "",
+            0,
+            Duration::from_secs_f64(1.0),
+        );
+        assert_contains_not_contains(
+            "mahbot config answer",
+            &result,
+            &["custom-role"],
+            &["more chars on this line"],
+        );
+        assert!(
+            result.contains(&prose),
+            "config answer line must survive intact"
+        );
     }
 
     /// The reduced fallback list still carries no credential-looking name: it
@@ -6502,67 +6446,54 @@ mod tests {
         vec!["-c".to_string(), script.to_string()]
     }
 
-    #[tokio::test]
-    async fn shell_executes_allowed_command() {
-        let tmp = TempDir::new().expect("tempdir");
-        let result = ShellTool::new(ShellMode::Full)
-            .execute(&test_ws(tmp.path()), json!({"command": "echo hello"}))
-            .await;
-        assert!(
-            result.is_ok(),
-            "echo command execution should succeed: {result:?}"
-        );
-        let result = result.unwrap();
-        assert!(result.trim().contains("hello"));
+    /// One invocation of the shell tool and what its answer must carry.
+    struct ShellInvocationCase {
+        name: &'static str,
+        command: &'static str,
+        contains: &'static [&'static str],
     }
 
-    #[cfg(unix)]
+    /// The shell tool's answer for a command: the call is `Ok`, the output is
+    /// the command's, and a non-zero exit still reaches the model as its own
+    /// status note — one table over the invocations.
     #[tokio::test]
-    async fn shell_nonzero_exit_with_stdout_counts_as_success() {
-        // `test -f` exits 1 when file doesn't exist, with no stdout/stderr.
-        // Combined with `echo`, this produces stdout + non-zero exit without
-        // triggering any command-specific filter profiles.
-        let tmp = TempDir::new().expect("tempdir");
-        let result = ShellTool::new(ShellMode::Full)
-            .execute(
-                &test_ws(tmp.path()),
-                json!({"command": "echo partial; test -f nonexistent_file_xyz"}),
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "shell should return Ok(String) when stdout present: {result:?}"
-        );
-        let result = result.unwrap();
-        assert!(result.contains("partial"));
-        assert!(
-            result.contains("[exit status: 1]"),
-            "model should still see real exit status, got {result:?}",
-        );
-    }
-
-    #[tokio::test]
-    async fn shell_captures_exit_code() {
-        let tmp = TempDir::new().expect("tempdir");
-        let result = ShellTool::new(ShellMode::Full)
-            .execute(
-                &test_ws(tmp.path()),
-                json!({"command": "ls nonexistent_dir_xyz"}),
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "command with nonexistent path should return ok: {result:?}"
-        );
-        let output = result.unwrap();
-        assert!(
-            output.contains("[exit status: 1]"),
-            "output should contain exit status: {output:?}",
-        );
-        assert!(
-            output.contains("nonexistent_dir_xyz"),
-            "output should contain the error: {output:?}"
-        );
+    async fn shell_tool_reports_output_and_status_cases() {
+        let cases: &[ShellInvocationCase] = &[
+            ShellInvocationCase {
+                name: "an allowed command prints its output",
+                command: "echo hello",
+                contains: &["hello"],
+            },
+            // `test -f` exits 1 when the file does not exist, with no
+            // stdout/stderr; combined with `echo` this is stdout plus a non-zero
+            // exit without triggering a command-specific filter profile.
+            #[cfg(unix)]
+            ShellInvocationCase {
+                name: "stdout with a non-zero exit is a success",
+                command: "echo partial; test -f nonexistent_file_xyz",
+                contains: &["partial", "[exit status: 1]"],
+            },
+            ShellInvocationCase {
+                name: "a failing command reports its exit and its error",
+                command: "ls nonexistent_dir_xyz",
+                contains: &["[exit status: 1]", "nonexistent_dir_xyz"],
+            },
+        ];
+        for case in cases {
+            let tmp = TempDir::new().expect("tempdir");
+            let result = ShellTool::new(ShellMode::Full)
+                .execute(&test_ws(tmp.path()), json!({"command": case.command}))
+                .await;
+            assert!(result.is_ok(), "{}: {result:?}", case.name);
+            let output = result.unwrap();
+            for needle in case.contains {
+                assert!(
+                    output.contains(needle),
+                    "{}: {output:?} lacks {needle:?}",
+                    case.name
+                );
+            }
+        }
     }
 
     // ── Background mode (Full roles only) ─────────────────────────────
@@ -6707,210 +6638,6 @@ mod tests {
         assert!(
             err.to_string().contains("not available in this context"),
             "error message: {err}"
-        );
-    }
-
-    #[test]
-    fn full_description_and_schema_cover_background_capability() {
-        // The Full variant gets its own prompt asset and an extended argument
-        // schema describing the background capability.
-        let full = ShellTool::new(ShellMode::Full);
-        let description = full.description();
-        assert!(
-            description.contains("Background mode"),
-            "Full description must describe background mode"
-        );
-        assert!(
-            description.contains("[exit status: N]"),
-            "Full description must document the completion annotation"
-        );
-        // The platform-selected texts this description carries are checked by
-        // `platform_selected_texts_are_this_platforms_own`, which reads this host's
-        // platform; nothing here may depend on it.
-
-        let schema = full.parameters_schema();
-        let props = schema["properties"].as_object().expect("schema properties");
-        assert!(
-            props.contains_key("background"),
-            "Full schema must advertise the background argument"
-        );
-        assert!(
-            props.contains_key("stop"),
-            "Full schema must advertise the stop argument"
-        );
-        assert_eq!(
-            props["background"]["type"], "boolean",
-            "background must be a boolean"
-        );
-        assert_eq!(
-            props["background"]["default"], false,
-            "background must default to false"
-        );
-    }
-
-    /// The read-only variant shares the base description and the grep-engine
-    /// disclosure with Full, but must not advertise the full-only background
-    /// capability (it has no `background` argument).
-    #[test]
-    fn read_only_description_covers_grep_notes_without_background_capability() {
-        let description = ShellTool::new(ShellMode::ReadOnly).description();
-        assert!(
-            description.contains("## Grep notes"),
-            "read-only description must carry the grep-engine disclosure"
-        );
-        assert!(
-            !description.contains("Background mode"),
-            "read-only description must not advertise the full-only background capability"
-        );
-    }
-
-    /// A command that outlives its timeout must be killed: the run returns
-    /// `ShellRunResult::TimedOut` with an elapsed time close to the limit
-    /// (not the full `sleep` duration).
-    ///
-    /// This test is `#[ignore]` by default because it waits out a real 1 s
-    /// command timeout against a live `sleep 10` child. Run it explicitly
-    /// with:
-    ///
-    /// ```sh
-    /// cargo test run_command_with_timeout_kills_long_sleep -- --ignored --nocapture
-    /// ```
-    #[ignore = "waits out real command timeouts against live processes (hardcoded waits); runs only when explicitly invoked"]
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn run_command_with_timeout_kills_long_sleep() {
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg("sleep 10");
-        let result = run_command_with_timeout(
-            &mut cmd,
-            Some(Duration::from_secs(1)),
-            Duration::from_secs(10),
-            mem::default_limit(),
-            RunOwner::Agent,
-            LeftoverPolicy::Command,
-            None,
-        )
-        .await;
-        match result {
-            ShellRunResult::TimedOut { elapsed, .. } => {
-                assert!(
-                    elapsed < Duration::from_secs(3),
-                    "expected ~1s timeout, got {elapsed:?}"
-                );
-            }
-            other => panic!("expected TimedOut, got {other:?}"),
-        }
-    }
-
-    /// When a command times out, stdout written before the kill must be
-    /// preserved in `ShellRunResult::TimedOut`.
-    ///
-    /// This test is `#[ignore]` by default because it waits out a real 2 s
-    /// command timeout against a live `sleep 60` child. Run it explicitly
-    /// with:
-    ///
-    /// ```sh
-    /// cargo test run_command_with_timeout_captures_partial_stdout -- --ignored --nocapture
-    /// ```
-    #[ignore = "waits out real command timeouts against live processes (hardcoded waits); runs only when explicitly invoked"]
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn run_command_with_timeout_captures_partial_stdout() {
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg("echo started; sleep 60");
-        let result = run_command_with_timeout(
-            &mut cmd,
-            Some(Duration::from_secs(2)),
-            Duration::from_secs(10),
-            mem::default_limit(),
-            RunOwner::Agent,
-            LeftoverPolicy::Command,
-            None,
-        )
-        .await;
-        match result {
-            ShellRunResult::TimedOut { stdout, .. } => {
-                let s = String::from_utf8_lossy(&stdout);
-                assert!(
-                    s.contains("started"),
-                    "stdout should contain partial output: {s}"
-                );
-            }
-            other => panic!("expected TimedOut, got {other:?}"),
-        }
-    }
-
-    /// Tests that timeout error messages include partial output (stdout and stderr
-    /// tails) and ANSI stripping works.
-    ///
-    /// The `sleep 30` grandchild is now terminated by the PGID kill, not orphaned.
-    ///
-    /// This test is `#[ignore]` by default because it waits out a real 1 s command timeout against a live `sleep 30` child. Run it
-    /// explicitly with:
-    ///
-    /// ```sh
-    /// cargo test shell_timeout_error_includes_diagnostics -- --ignored --nocapture
-    /// ```
-    #[ignore = "waits out real command timeouts against live processes (hardcoded waits); runs only when explicitly invoked"]
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shell_timeout_error_includes_diagnostics() {
-        let tmp = TempDir::new().expect("tempdir");
-        let mut cmd = build_shell_command("echo before-timeout; sleep 30", tmp.path());
-        let result = run_command_with_timeout(
-            &mut cmd,
-            Some(Duration::from_secs(1)),
-            Duration::from_secs(10),
-            mem::default_limit(),
-            RunOwner::Agent,
-            LeftoverPolicy::Command,
-            None,
-        )
-        .await;
-        let ShellRunResult::TimedOut {
-            stdout,
-            stderr,
-            pid,
-            elapsed,
-        } = result
-        else {
-            panic!("expected timeout");
-        };
-        let msg = format_timeout_error(
-            "echo test",
-            elapsed,
-            Duration::from_secs(1),
-            pid,
-            &stdout,
-            &stderr,
-        );
-        assert!(msg.contains("elapsed:"), "msg: {msg}");
-        assert!(msg.contains("timeout_limit:"), "msg: {msg}");
-        assert!(msg.contains("timeout_secs"), "msg: {msg}");
-        assert!(msg.contains("before-timeout"), "msg: {msg}");
-
-        // Verify ANSI escape sequences are stripped from timeout error messages
-        let ansi_stdout = b"\x1B[31mred error\x1B[0m";
-        let ansi_stderr = b"\x1B[1mBOLD STUFF\x1B[22m";
-        let ansi_msg = format_timeout_error(
-            "test",
-            elapsed,
-            Duration::from_mins(5),
-            Some(42),
-            ansi_stdout,
-            ansi_stderr,
-        );
-        assert!(
-            ansi_msg.contains("red error"),
-            "ANSI text content should survive stripping: {ansi_msg}"
-        );
-        assert!(
-            !ansi_msg.contains("\x1B["),
-            "ANSI escape codes should be stripped from timeout error: {ansi_msg}"
-        );
-        assert!(
-            ansi_msg.contains("BOLD STUFF"),
-            "ANSI text content should survive stripping: {ansi_msg}"
         );
     }
 
@@ -7117,61 +6844,6 @@ mod tests {
             .expect("grandchild PID file must exist — grandchild was launched");
         let pid: i32 = pid_content.trim().parse().expect("valid PID from file");
         wait_for_death(pid).await;
-    }
-
-    /// The leftover note is a note on a completed command, phrased in the
-    /// platform's own terms and the mode's — both platforms and both modes are
-    /// drivable from one host, which is why the platform is a value here. The stop
-    /// recipe is Full mode's only: ReadOnly's guard rejects the commands it names.
-    #[test]
-    fn leftover_note_names_the_scope_and_the_platforms_stop_command() {
-        let full_sentence = leftover_mode_sentence(ShellMode::Full);
-        let read_only_sentence = leftover_mode_sentence(ShellMode::ReadOnly);
-
-        let unix = format_leftover_note(ShellMode::Full, ShellPlatform::Unix, Some(1234));
-        assert!(unix.contains("leftover process group: 1234"), "{unix}");
-        assert!(unix.contains("kill -TERM -1234"), "{unix}");
-        // The note carries the very fragment the tool description renders.
-        assert!(unix.contains(&full_sentence), "{unix}");
-        assert!(!unix.contains(&read_only_sentence), "{unix}");
-        assert!(!unix.contains("drain"), "{unix}");
-        assert!(!unix.contains("timed out"), "{unix}");
-
-        // Windows: the run's root pid has already been reaped when this path is
-        // reached, so the recipe lists the tree by parent rather than addressing
-        // the released pid with `taskkill /PID <pid>`.
-        let windows = format_leftover_note(ShellMode::Full, ShellPlatform::Windows, Some(42));
-        assert!(
-            windows.contains("leftover process tree: started by pid 42, which has already exited"),
-            "{windows}"
-        );
-        assert!(
-            windows.contains(r#"tasklist /FI "PPID eq 42""#),
-            "{windows}"
-        );
-        assert!(
-            windows.contains("taskkill /PID <listed pid> /T /F"),
-            "{windows}"
-        );
-        assert!(!windows.contains("taskkill /PID 42"), "{windows}");
-
-        // ReadOnly prints no stop line: the guard this mode runs rejects
-        // `kill`/`pkill`/`killall` (and `taskkill`), so naming one would name a
-        // command the mode refuses. Its own fragment states the limitation instead.
-        let readonly = format_leftover_note(ShellMode::ReadOnly, ShellPlatform::Unix, Some(7));
-        assert!(readonly.contains(&read_only_sentence), "{readonly}");
-        assert!(!readonly.contains(&full_sentence), "{readonly}");
-        assert!(!readonly.contains("background: true"), "{readonly}");
-        assert!(!readonly.contains("kill"), "{readonly}");
-        assert!(!readonly.contains("taskkill"), "{readonly}");
-        let readonly_windows =
-            format_leftover_note(ShellMode::ReadOnly, ShellPlatform::Windows, Some(42));
-        assert!(!readonly_windows.contains("taskkill"), "{readonly_windows}");
-        assert!(!readonly_windows.contains("tasklist"), "{readonly_windows}");
-
-        let unknown = format_leftover_note(ShellMode::Full, ShellPlatform::Unix, None);
-        assert!(unknown.contains("could not be identified"), "{unknown}");
-        assert!(!unknown.contains("kill -TERM"), "{unknown}");
     }
 
     /// Short-lived backgrounded jobs that finish within the drain bound keep
@@ -7531,84 +7203,6 @@ mod tests {
         check_shell_output(cases);
     }
 
-    #[test]
-    fn truncate_line_width_short_and_long() {
-        // Long lines truncated with continuation marker
-        let long = "a".repeat(500);
-        let result = truncate_line_width(&long, 100);
-        assert!(result.len() < long.len() + 100, "should truncate");
-        assert!(
-            result.contains("more chars on this line"),
-            "should show continuation marker"
-        );
-        let lines: Vec<&str> = result.lines().collect();
-        assert_eq!(lines.len(), 2, "truncated line + continuation marker");
-        assert_eq!(
-            lines[0].len(),
-            100,
-            "first line should be exactly max_chars"
-        );
-        assert!(
-            !lines[0].contains("..."),
-            "first line should not contain truncation marker"
-        );
-
-        // Short lines preserved unchanged
-        let input = "hello\nworld";
-        let result = truncate_line_width(input, 500);
-        assert_eq!(result, input, "short lines should pass through");
-    }
-
-    #[test]
-    fn try_spill_to_file_behavior() {
-        // Small output passes through unchanged
-        let short = "hello".to_string();
-        let result = try_spill_to_file(short, TOOL_OUTPUT_BUDGET_BYTES);
-        assert_eq!(result, "hello", "short output should pass through");
-
-        // Large single-line output spills
-        let large = "x".repeat(TOOL_OUTPUT_BUDGET_BYTES * 2);
-        let result = try_spill_to_file(large, TOOL_OUTPUT_BUDGET_BYTES);
-        assert!(
-            result.contains("[Output saved to"),
-            "should contain spill path"
-        );
-        assert!(
-            result.contains("10000 bytes"),
-            "should mention byte count: {result}"
-        );
-
-        // Multi-line large output shows head+tail preview
-        let lines: Vec<String> = (0..800).map(|i| format!("line_{i:04}")).collect();
-        let multi = lines.join("\n");
-        let multi_len = multi.len();
-        assert!(
-            multi_len > TOOL_OUTPUT_BUDGET_BYTES,
-            "test data {multi_len} must exceed spill threshold"
-        );
-        let result = try_spill_to_file(multi, TOOL_OUTPUT_BUDGET_BYTES);
-        assert!(
-            result.contains("[Output saved to"),
-            "should contain spill path"
-        );
-        assert!(
-            result.contains("[view with: read "),
-            "should contain actionable read hint"
-        );
-        assert!(result.contains("line_0000"), "should show first line");
-        assert!(result.contains("line_0799"), "should show last line");
-        assert!(
-            result.len() < multi_len,
-            "inline preview should be truncated"
-        );
-
-        // Ensure the spill dir exists
-        assert!(
-            std::fs::read_dir(std::env::temp_dir().join(".agent")).is_ok(),
-            "spill dir should exist"
-        );
-    }
-
     /// The `PATH` of the reduced fallback environment covers the tool
     /// directories a developer expects (`~/.cargo/bin`, `~/.npm-global/bin`,
     /// Homebrew on macOS) and honors `$CARGO_HOME`. This is the fallback
@@ -7633,6 +7227,18 @@ mod tests {
             assert!(
                 path.contains(".local/bin"),
                 "PATH should include the per-user programs directory ~/.local/bin, where the product installs itself: {path}"
+            );
+            // The extra tool directories are prepended to the portable baseline,
+            // so a developer tool resolves before the system's own entries.
+            let cargo = path
+                .find(".cargo/bin")
+                .expect("the cargo bin directory is in PATH");
+            let system = path
+                .find("/usr/bin")
+                .expect("the system baseline is in PATH");
+            assert!(
+                cargo < system,
+                "the tool directories must precede the system baseline: {path}"
             );
             {
                 let _guard = set_env_var("CARGO_HOME", Some("/custom/cargo"));
@@ -7676,144 +7282,7 @@ mod tests {
         }
     }
 
-    // ── New feature tests ───────────────────────────────────────────
-
-    #[test]
-    fn collapse_blank_lines_cases() {
-        let cases: &[(&str, &str)] = &[
-            // 3+ consecutive blank lines collapse to 2
-            ("a\n\n\n\nb\n\n\nc", "a\n\n\nb\n\n\nc"),
-            // runs ≤2 left alone, longer runs collapse to 2
-            ("a\n\nb\n\n\nc\n\n\n\nd", "a\n\nb\n\n\nc\n\n\nd"),
-            // no blank lines → pass through unchanged
-            ("a\nb\nc", "a\nb\nc"),
-            // all-blank input collapses completely (no anchor lines)
-            ("\n\n\n\n\n", ""),
-        ];
-        for (input, expected) in cases {
-            let result = collapse_blank_lines(input);
-            assert_eq!(result, *expected, "input: {input:?}");
-        }
-    }
-
     // ── Chained command and canonical command tests ─────────────────
-
-    #[test]
-    fn extract_segments_cases() {
-        let cases: &[(&str, &[&str])] = &[
-            // simple single command
-            ("cargo build", &["cargo build"]),
-            // chained with &&
-            ("cd project && cargo build", &["cd project", "cargo build"]),
-            // pipe (|) splits commands
-            (
-                "npm run build 2>&1 | tee build.log",
-                &["npm run build 2>&1", "tee build.log"],
-            ),
-            // single quotes protect && and | from being treated as separators
-            ("echo 'foo && bar' | cat", &["echo 'foo && bar'", "cat"]),
-            // semicolon splits commands
-            ("cargo build ; cargo test", &["cargo build", "cargo test"]),
-            // single-quoted && preserved as one segment
-            ("echo 'foo && bar'", &["echo 'foo && bar'"]),
-            // double-quoted pipe preserved as one segment
-            ("echo \"pipe | test\"", &["echo \"pipe | test\""]),
-            // ── Newline as command separator ──────────────────────
-            (
-                "touch /tmp/a\necho hi > /tmp/b",
-                &["touch /tmp/a", "echo hi > /tmp/b"],
-            ),
-            // Backslash-newline continuation joins the logical line.
-            ("echo hello \\\nworld", &["echo hello world"]),
-            // Heredoc bodies are removed before segmentation (never commands).
-            ("cat <<EOF\nbody\nEOF", &["cat"]),
-            (
-                "cat <<EOF > /tmp/out\nbody\nEOF",
-                &["cat   > /tmp/out"], // `<<EOF` marker replaced by a space
-            ),
-            // Herestrings have no body — the whole line stays one segment.
-            ("cat <<< hi > /tmp/out", &["cat <<< hi > /tmp/out"]),
-            // `>|` compound redirect is not split at the pipe.
-            ("echo hi >| /tmp/force", &["echo hi >| /tmp/force"]),
-            // ── Command substitutions stay whole ────────────────────
-            // Separators inside `$(...)` are part of the substitution, not
-            // command separators (mis-splitting flips is_chained and skips
-            // standalone-only output transforms).
-            ("echo $(echo hi; touch x)", &["echo $(echo hi; touch x)"]),
-            ("echo $(echo hi) ; touch x", &["echo $(echo hi)", "touch x"]),
-            ("echo `echo hi; touch x`", &["echo `echo hi; touch x`"]),
-            (
-                "cd /tmp && echo $(echo a && echo b)",
-                &["cd /tmp", "echo $(echo a && echo b)"],
-            ),
-            // Nested substitution stays inside the outer one.
-            ("echo $(echo $(ls; pwd))", &["echo $(echo $(ls; pwd))"]),
-            // Nested `$(` adds exactly one paren; a real `;` after it splits.
-            (
-                "echo $(echo $(echo hi)) ; touch x",
-                &["echo $(echo $(echo hi))", "touch x"],
-            ),
-            // Plain parens inside a substitution nest too: the `;` is body.
-            (
-                "echo $( (echo hi) ; echo more) tail",
-                &["echo $( (echo hi) ; echo more) tail"],
-            ),
-            // Arithmetic with parens: `&&` inside `$((...))` is body content.
-            (
-                "echo $(( (a) && (b) )) tail",
-                &["echo $(( (a) && (b) )) tail"],
-            ),
-            // `$((...))` nested inside `$(...)`.
-            (
-                "echo $(echo $((a+1)); echo x)",
-                &["echo $(echo $((a+1)); echo x)"],
-            ),
-            // Substitution with newline inside stays whole.
-            ("echo $(echo hi\necho bye)", &["echo $(echo hi\necho bye)"]),
-            // Heredoc body with a substitution: the body substitution is
-            // emitted as its own segment (it must remain scanned — bash
-            // executes `$()` inside unquoted heredoc bodies).
-            ("cat <<EOF\n$(touch ws)\nEOF", &["cat", "$(touch ws)"]),
-            // Double-quoted substitutions stay whole too: a `;` inside
-            // `"$(...)"` is part of the substitution, not a separator, and
-            // bash executes the body, so segmentation must not fragment it.
-            (
-                "echo \"$(echo hi; touch x)\"",
-                &["echo \"$(echo hi; touch x)\""],
-            ),
-            (
-                "echo \"$(echo hi)\" ; touch x",
-                &["echo \"$(echo hi)\"", "touch x"],
-            ),
-            (
-                "echo \"`echo hi; touch x`\"",
-                &["echo \"`echo hi; touch x`\""],
-            ),
-            // Escape-aware: `\)` is body content, not a substitution closer.
-            (
-                "echo $(echo \\)) ; touch x",
-                &["echo $(echo \\))", "touch x"],
-            ),
-            // Escaped backticks inside a backtick substitution don't close it.
-            (
-                "echo `echo \\`hi\\`` ; touch x",
-                &["echo `echo \\`hi\\``", "touch x"],
-            ),
-            // `\'` inside `$(...)`: the closing quote is not swallowed.
-            (
-                "echo $(echo 'a\\') ; touch x",
-                &["echo $(echo 'a\\')", "touch x"],
-            ),
-        ];
-        for (input, expected) in cases {
-            let result = extract_command_segments(input);
-            assert_eq!(
-                result.iter().map(String::as_str).collect::<Vec<_>>(),
-                *expected,
-                "input: {input:?}"
-            );
-        }
-    }
 
     #[test]
     fn canonical_command_cases() {
@@ -7893,118 +7362,6 @@ mod tests {
         }
     }
 
-    /// A quoted path spelling profiles like its unquoted twin. Profiles are
-    /// selected from the original command string, so this is what gives an
-    /// agent-written `'/usr/local/bin/cargo' build` the cargo output treatment.
-    #[cfg(unix)]
-    #[test]
-    fn quoted_path_spelling_selects_the_same_profile_as_its_unquoted_twin() {
-        let selected = |command: &str| {
-            let segments = extract_command_segments(command);
-            select_profile(&segments, false)
-                .match_command
-                .as_str()
-                .to_owned()
-        };
-        let quoted = selected("'/usr/local/bin/cargo' build");
-        assert_eq!(quoted, selected("/usr/local/bin/cargo build"));
-        // Non-vacuity: an unrelated command must NOT select that same profile.
-        assert_ne!(quoted, selected("'/usr/local/bin/true' build"));
-    }
-
-    #[test]
-    fn first_command_word_consistent_with_canonical() {
-        // Property: first_command_word returns the first word of canonical_command's
-        // result, or empty when canonical_command is empty.
-        let inputs: &[&str] = &[
-            // Path stripping
-            "/usr/local/bin/cargo build",
-            // Git global flags
-            "git -C /repo diff",
-            "git -c user.name=me log",
-            "git -- diff",
-            // Shell prefix: sudo
-            "sudo cargo build",
-            "sudo -E cargo build",
-            "sudo --preserve-env cargo build",
-            "sudo -E git -C /repo diff",
-            // Shell prefix: time
-            "time -v cargo test",
-            // cd (shell builtin)
-            "cd",
-            "cd ..",
-            // Package managers
-            "pnpm install",
-            "yarn add foo",
-            // Cargo flags
-            "cargo test --lib",
-            "cargo --release build",
-            "cargo --release --verbose build",
-            // Environment variable assignments
-            "CC=gcc make",
-            "VAR=val cargo check",
-            "CC=gcc CXX=g++ make -j4",
-            "CC=gcc",
-            "sudo CC=gcc make",
-            // Edge cases
-            "",
-            "   ",
-            "ls",
-            "cat file.txt",
-            "/bin/echo hello",
-        ];
-        for &input in inputs {
-            let canonical = canonical_command(input);
-            let first = first_command_word(input);
-            if canonical.is_empty() {
-                assert!(
-                    first.is_empty(),
-                    "first_command_word({input:?}) should be empty when canonical_command is empty",
-                );
-            } else {
-                let expected_first = canonical.split_whitespace().next().unwrap_or("");
-                assert_eq!(
-                    first, expected_first,
-                    "first_command_word({input:?}) should match first word of canonical_command({input:?}) = {canonical:?}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_all_profiles_have_valid_configs() {
-        let profiles = PROFILES.iter().collect::<Vec<_>>();
-        assert!(
-            !profiles.is_empty(),
-            "should have at least the generic fallback"
-        );
-        for p in &profiles {
-            assert!(
-                !p.match_command.as_str().is_empty(),
-                "match_command should not be empty"
-            );
-            if let (Some(head), Some(tail), Some(max)) = (p.head_lines, p.tail_lines, p.max_lines) {
-                assert!(
-                    head + tail < max,
-                    "head+tail ({head}+{tail}) should be strictly less than max_lines ({max}) — omission marker would overflow"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn profile_df_caps_at_20_lines() {
-        let input = (0..50)
-            .map(|i| format!("filesystem{i}  used  avail capacity mounted_on"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let result = process_shell_output("df -h", &input, "", 0, Duration::ZERO);
-        let lines = result.lines().count();
-        // 20 lines + 1 truncated note line = 21 max
-        assert!(lines <= 21, "df should cap at ~21 lines, got {lines}");
-        assert!(lines >= 19, "df should have around 20 lines, got {lines}");
-    }
-
     // ── check_outside_quotes ──────────────────────────────────────────
     // Pure quote-tracking state machine — escape handling is caller's concern.
 
@@ -8063,170 +7420,7 @@ mod tests {
         }
     }
 
-    // ── track_char_context ───────────────────────────────────────────
-    // Combined escape + quote tracking state machine.
-
-    type ContextStep = (char, bool, bool, bool, bool);
-
-    #[test]
-    fn track_char_context_cases() {
-        // Each case: (char, expected_return, in_single, in_double, escaped)
-        // The `escaped` column shows the flag AFTER processing the character.
-        let cases: &[(&str, &[ContextStep])] = &[
-            (
-                "backslash escapes outside quotes",
-                &[
-                    ('\\', false, false, false, true), // backslash sets escaped
-                    ('a', false, false, false, false), // escaped 'a' consumed, skip
-                    ('a', true, false, false, false),  // normal 'a' outside quotes
-                ],
-            ),
-            (
-                "escaped backslash",
-                &[
-                    ('\\', false, false, false, true),  // first backslash sets escaped
-                    ('\\', false, false, false, false), // second backslash: escaped flag was set, consume it; does NOT start new escape
-                    ('a', true, false, false, false),   // normal 'a' outside quotes
-                ],
-            ),
-            (
-                "escaped quote inside double does not toggle",
-                &[
-                    ('"', false, false, true, false),  // double opens
-                    ('\\', false, false, true, true),  // backslash inside double, sets escaped
-                    ('"', false, false, true, false), // escaped quote consumed, doesn't toggle double
-                    ('"', false, false, false, false), // unescaped quote closes double
-                ],
-            ),
-            (
-                "backslash inside single is literal",
-                &[
-                    ('\'', false, true, false, false),  // single opens
-                    ('\\', false, true, false, false), // backslash inside single: not escape, still inside
-                    ('a', false, true, false, false),  // inside single quotes
-                    ('\'', false, false, false, false), // single closes
-                    ('>', true, false, false, false),  // outside quotes again
-                ],
-            ),
-        ];
-
-        for (name, steps) in cases {
-            let (mut s, mut d, mut e) = (false, false, false);
-            for (i, &(ch, exp_out, exp_s, exp_d, exp_e)) in steps.iter().enumerate() {
-                let result = track_char_context(ch, &mut s, &mut d, &mut e);
-                assert_eq!(
-                    result, exp_out,
-                    "{name} step {i}: track_char_context({ch:?}) returned {result}, expected {exp_out}",
-                );
-                assert_eq!(
-                    s, exp_s,
-                    "{name} step {i}: after {ch:?}, in_single={s}, expected {exp_s}",
-                );
-                assert_eq!(
-                    d, exp_d,
-                    "{name} step {i}: after {ch:?}, in_double={d}, expected {exp_d}",
-                );
-                assert_eq!(
-                    e, exp_e,
-                    "{name} step {i}: after {ch:?}, escaped={e}, expected {exp_e}",
-                );
-            }
-        }
-    }
-
-    // ── apply_line_truncation unit tests ──────────────────────────────
-
-    struct TruncateCase {
-        name: &'static str,
-        head: usize,
-        tail: usize,
-        max: Option<usize>,
-        output: &'static str,
-        pre_is_some: bool,
-        check_contains: &'static [&'static str],
-    }
-
-    fn check_truncate(cases: &[TruncateCase]) {
-        for case in cases {
-            let mut p = Profile::new("test");
-            if case.head > 0 || case.tail > 0 {
-                p = p.head(case.head).tail(case.tail);
-            }
-            if let Some(m) = case.max {
-                p = p.max(m);
-            }
-            let (result, pre) = apply_line_truncation(case.output, &p);
-            assert_eq!(
-                pre.is_some(),
-                case.pre_is_some,
-                "[{}] pre.is_some mismatch. pre: {pre:?}",
-                case.name
-            );
-            assert_contains_not_contains(case.name, &result, case.check_contains, &[]);
-        }
-    }
-
-    #[test]
-    fn truncate_simple_cases() {
-        check_truncate(&[
-            TruncateCase {
-                name: "no config passthrough",
-                head: 0,
-                tail: 0,
-                max: None,
-                output: "line1\nline2\nline3",
-                pre_is_some: false,
-                check_contains: &["line1\nline2\nline3"],
-            },
-            TruncateCase {
-                name: "head+tail small output no sandwich",
-                head: 2,
-                tail: 2,
-                max: None,
-                output: "line1\nline2\nline3\nline4\nline5",
-                pre_is_some: false,
-                check_contains: &["line1\nline2\nline3\nline4\nline5"],
-            },
-            TruncateCase {
-                name: "max only caps at limit",
-                head: 0,
-                tail: 0,
-                max: Some(3),
-                output: "a\nb\nc\nd\ne",
-                pre_is_some: false,
-                check_contains: &["... (2 lines truncated)"],
-            },
-            TruncateCase {
-                name: "max only fits no truncation",
-                head: 0,
-                tail: 0,
-                max: Some(10),
-                output: "a\nb\nc",
-                pre_is_some: false,
-                check_contains: &["a\nb\nc"],
-            },
-            TruncateCase {
-                name: "head+tail fits when under limit",
-                head: 5,
-                tail: 3,
-                max: None,
-                output: "a\nb\nc\nd",
-                pre_is_some: false,
-                check_contains: &["a\nb\nc\nd"],
-            },
-            // head=2, tail=2, max=3 on 5-line output: small output bypasses sandwich,
-            // so max cap is the only active truncation → 3 lines + marker = 4 total.
-            TruncateCase {
-                name: "head+tail+max small output no sandwich",
-                head: 2,
-                tail: 2,
-                max: Some(3),
-                output: "a\nb\nc\nd\ne",
-                pre_is_some: false,
-                check_contains: &["... (2 lines truncated)"],
-            },
-        ]);
-    }
+    // ── apply_line_truncation ─────────────────────────────────────────
 
     #[test]
     fn truncate_head_tail_triggers_sandwich_large_output() {
@@ -8275,45 +7469,6 @@ mod tests {
         );
     }
 
-    // ── format_sandwich tests ──────────────────────────────────────────
-
-    #[test]
-    fn format_sandwich_cases() {
-        let cases: &[(&str, usize, usize, &str)] = &[
-            // (input, head, tail, expected)
-            ("a\nb\nc", 2, 2, "a\nb\nc"),
-            (
-                "a\nb\nc\nd\ne\nf\ng",
-                2,
-                2,
-                "a\nb\n... (3 lines omitted)\nf\ng",
-            ),
-            ("a\nb\nc\nd\ne\nf\ng", 7, 0, "a\nb\nc\nd\ne\nf\ng"),
-            ("a\nb\nc\nd\ne\nf\ng", 0, 7, "a\nb\nc\nd\ne\nf\ng"),
-            // Head-only truncation (e.g., git log profile: head=20, no tail)
-            (
-                "a\nb\nc\nd\ne\nf\ng",
-                3,
-                0,
-                "a\nb\nc\n... (4 lines omitted)",
-            ),
-            // Tail-only truncation (e.g., ping/gh/helm profiles: tail=4..10, no head)
-            (
-                "a\nb\nc\nd\ne\nf\ng",
-                0,
-                3,
-                "... (4 lines omitted)\ne\nf\ng",
-            ),
-        ];
-        for (input, head, tail, expected) in cases {
-            let result = format_sandwich(input, *head, *tail, "omitted");
-            assert_eq!(
-                result, *expected,
-                "format_sandwich({input:?}, {head}, {tail})"
-            );
-        }
-    }
-
     // ── finish_shell_output unit tests ────────────────────────────────
     // Credential scrubbing is now performed upstream at pipeline entry in
     // `apply_profile_pipeline`, so `finish_shell_output` receives pre-scrubbed
@@ -8330,29 +7485,9 @@ mod tests {
         eq: Option<&'static str>,
     }
 
-    fn check_finish(cases: &[FinishCase]) {
-        for case in cases {
-            // For pre-truncation spill path: repeat the string enough times to
-            // exceed TOOL_OUTPUT_BUDGET_BYTES, triggering the spill-to-file branch
-            // in finish_shell_output. The spill content is pre-scrubbed by
-            // apply_profile_pipeline before being passed to finish_shell_output.
-            // This test verifies that the spill hint is properly appended.
-            let pre_owned = case.pre.map(|s| s.repeat(TOOL_OUTPUT_BUDGET_BYTES + 1));
-            let result = finish_shell_output(
-                case.combined.to_string(),
-                case.elapsed,
-                pre_owned.as_deref(),
-            );
-            assert_contains_not_contains(case.name, &result, case.check, case.not_check);
-            if let Some(expected) = case.eq {
-                assert_eq!(result.trim(), expected, "[{}] expected eq", case.name);
-            }
-        }
-    }
-
     #[test]
     fn finish_shell_output_cases() {
-        check_finish(&[
+        let cases: &[FinishCase] = &[
             FinishCase {
                 name: "pre-scrubbed input passes through",
                 combined: "API_KEY=abcd*[REDACTED]",
@@ -8398,384 +7533,24 @@ mod tests {
                 not_check: &[],
                 eq: Some("API_KEY=abcd*[REDACTED]"),
             },
-        ]);
-    }
-
-    /// The fragments of every shared prompt skeleton must be embedded, and must
-    /// carry no placeholder of their own: `substitute` does not rescan a
-    /// replacement value. Each skeleton must keep exactly the keys its renderer
-    /// supplies — a stray one would render literally into every agent's
-    /// description. The renderers pick the fragment through `SHELL_PLATFORM`, or
-    /// (the command-line notes and the leftover notes) through the mode, so a typo
-    /// in a key would otherwise panic on that platform's host only. The leftover
-    /// skeleton is sectioned instead: its second section is the per-call note's own
-    /// lead, rendered with no substitution at all, so it must carry no key.
-    #[test]
-    fn platform_prompt_assets_are_embedded() {
-        for (skeleton, keys, fragments) in [
-            (
-                "tool/shell_readonly_banner.md",
-                [
-                    "{{temp_root}}",
-                    "{{platform_checks}}",
-                    "{{producing_families}}",
-                ]
-                .as_slice(),
-                [
-                    "tool/shell_readonly_banner_unix.md",
-                    "tool/shell_readonly_banner_windows.md",
-                ]
-                .as_slice(),
-            ),
-            (
-                "tool/shell_grep_notes.md",
-                ["{{platform_notes}}"].as_slice(),
-                [
-                    "tool/shell_grep_notes_unix.md",
-                    "tool/shell_grep_notes_windows.md",
-                ]
-                .as_slice(),
-            ),
-            (
-                "tool/shell_full.md",
-                ["{{stop_semantics}}", "{{trailing_separator}}"].as_slice(),
-                [
-                    "tool/shell_full_stop_unix.md",
-                    "tool/shell_full_stop_windows.md",
-                    "tool/shell_full_trailing_unix.md",
-                    "tool/shell_full_trailing_windows.md",
-                ]
-                .as_slice(),
-            ),
-            (
-                "tool/shell_command_lines.md",
-                [
-                    "{{escaped_target}}",
-                    "{{remedy}}",
-                    "{{cap}}",
-                    "{{overhead}}",
-                    "{{limit}}",
-                ]
-                .as_slice(),
-                [
-                    "tool/shell_command_lines_escaped_full.md",
-                    "tool/shell_command_lines_escaped_read_only.md",
-                    "tool/shell_command_lines_read_only_aside.md",
-                    "tool/shell_command_lines_remedy_full.md",
-                    "tool/shell_command_lines_remedy_read_only.md",
-                ]
-                .as_slice(),
-            ),
-            (
-                "tool/shell_leftover.md",
-                ["{{mode_sentence}}"].as_slice(),
-                [
-                    "tool/shell_leftover_full.md",
-                    "tool/shell_leftover_read_only.md",
-                ]
-                .as_slice(),
-            ),
-        ] {
-            let shared = crate::prompt::load_prompt(skeleton);
-            let mut rest = shared.clone();
-            for key in keys {
-                assert!(shared.contains(key), "{skeleton} lost {key}");
-                rest = rest.replace(key, "");
-            }
-            assert!(!rest.contains("{{"), "{skeleton} carries an unrendered key");
-            for asset in fragments {
-                let text = crate::prompt::load_prompt(asset);
-                assert!(!text.contains("{{"), "{asset} carries a placeholder");
-            }
-        }
-        // The leftover skeleton is split into sections: the first is what the tool
-        // description renders (its one key supplied by the renderer), the second the
-        // per-call note's lead, which takes no key at all — only section 0 is
-        // substituted, so an unrendered key there would reach the agent literally.
-        let leftover = crate::prompt::load_prompt_sections("tool/shell_leftover.md");
-        assert_eq!(leftover.len(), 2, "tool/shell_leftover.md lost a section");
-        assert!(leftover[0].contains("{{mode_sentence}}"), "{leftover:?}");
-        assert!(
-            !leftover[1].contains("{{"),
-            "the note lead carries an unrendered key: {}",
-            leftover[1]
-        );
-    }
-
-    /// The banner names the producing families as the CLI registry derives them,
-    /// so it cannot go stale the way a hand-written list did: a family whose
-    /// operations make files is named, and refused, without an edit here.
-    #[test]
-    fn the_readonly_banner_names_the_producing_families_from_the_registry() {
-        let families = crate::cli::producing_families();
-        assert!(
-            families.contains("`rasterize`"),
-            "the banner's own case: {families}"
-        );
-        assert!(
-            render_readonly_banner().contains(&families),
-            "the banner names the producing families: {families}"
-        );
-    }
-
-    /// The Windows section of the shell description's own notes, in `mode`: the
-    /// renderer whose assets `platform_prompt_assets_are_embedded` above checks.
-    fn command_line_notes(mode: ShellMode) -> String {
-        render_command_line_notes(ShellPlatform::Windows, mode)
-            .expect("the platform whose interpreter ends a command at a break has notes")
-    }
-
-    /// Whether the rendering leaves a paragraph no sentence fills: a placeholder a
-    /// mode's fragment does not fill leaves its line breaks behind, and the rendering
-    /// has to be right in itself rather than after a later trim.
-    fn has_blank_paragraph(text: &str) -> bool {
-        text.split("\n\n").any(|para| para.trim().is_empty())
-    }
-
-    /// This platform's own section is offered on the platform it is true of and
-    /// nowhere else, and it states the rules the shell now keeps there: the tool set
-    /// that is not present, `;` that separates nothing, `#` that comments nothing,
-    /// the settings the interpreter is started with (auto-run scripts included), and
-    /// which encoding a program's output is read back in. The renderer takes no mode,
-    /// so the same section is the one both modes receive.
-    #[test]
-    fn the_guidance_states_this_platforms_own_rules() {
-        assert!(render_platform_notes(ShellPlatform::Unix).is_none());
-        let guidance = render_platform_notes(ShellPlatform::Windows)
-            .expect("the platform with rules of its own has a section");
-        for sentence in [
-            "no POSIX tool set",
-            "`;` is not a command separator",
-            "`#` is not a comment",
-            "auto-run scripts",
-            "console encoding",
-        ] {
-            assert!(guidance.contains(sentence), "{sentence}: {guidance}");
-        }
-        assert!(!guidance.contains("{{"), "{guidance}");
-    }
-
-    /// This platform's own rules reach the agent in the description of both modes,
-    /// and the other platform's rules reach neither: the section is not
-    /// mode-specific, so a mode that dropped it would leave rules its own runs
-    /// depend on unstated.
-    #[test]
-    fn the_platform_notes_reach_both_modes() {
-        let this = render_platform_notes(SHELL_PLATFORM);
-        let other = render_platform_notes(match SHELL_PLATFORM {
-            ShellPlatform::Unix => ShellPlatform::Windows,
-            ShellPlatform::Windows => ShellPlatform::Unix,
-        });
-        for mode in [ShellMode::Full, ShellMode::ReadOnly] {
-            let description = ShellTool::new(mode).description();
-            assert!(!description.contains("{{"), "{description}");
-            if let Some(notes) = this.as_deref() {
-                assert!(
-                    description.contains(notes),
-                    "each mode's description must carry this platform's own rules"
-                );
-            }
-            if let Some(other) = other.as_deref() {
-                assert!(
-                    !description.contains(other),
-                    "no mode's description may carry the other platform's rules"
-                );
-            }
-        }
-    }
-
-    /// The guidance the agent is handed — in both modes, on the platform whose
-    /// interpreter reads one line — states the limit this reading refuses under, in
-    /// numbers the constants decide.
-    #[test]
-    fn the_guidance_states_the_same_command_line_limit() {
-        for mode in [ShellMode::Full, ShellMode::ReadOnly] {
-            let guidance = command_line_notes(mode);
-            // The three numbers of the limit's sentence are the constants': the
-            // platform's own line, what its path, its pinned settings and its `/C`
-            // switch take, and what that leaves for the text.
-            for number in [
-                windows_line::COMMAND_LINE_CAP,
-                windows_line::TEXT_UNIT_LIMIT,
-                windows_line::COMMAND_LINE_CAP - windows_line::TEXT_UNIT_LIMIT,
-            ] {
-                assert!(
-                    guidance.contains(&number.to_string()),
-                    "{number}: {guidance}"
-                );
-            }
-            // No `{{…}}` placeholder is left: every one the skeleton writes is
-            // substituted, so a missing fragment would reach the agent as its own name.
-            assert!(!guidance.contains("{{"), "{guidance}");
-        }
-    }
-
-    /// The section is rendered from the mode's own fragments and no other's, each of
-    /// them once: the caret's escape is described by the reader that mode consults,
-    /// only the read-only mode's own checks need the aside, and a fragment the skeleton
-    /// wrote twice would be substituted twice (see [`super::render_command_line_notes`]),
-    /// so the agent would read the same sentence twice. The fragments themselves are
-    /// asserted, rather than a word like "read-only" that an unrelated sentence could
-    /// later carry.
-    #[test]
-    fn the_guidance_names_each_modes_own_fragments() {
-        let full = command_line_notes(ShellMode::Full);
-        let read_only = command_line_notes(ShellMode::ReadOnly);
-        let (full_escaped, read_only_escaped, aside) = (
-            crate::prompt::load_prompt("tool/shell_command_lines_escaped_full.md")
-                .trim()
-                .to_owned(),
-            crate::prompt::load_prompt("tool/shell_command_lines_escaped_read_only.md")
-                .trim()
-                .to_owned(),
-            crate::prompt::load_prompt("tool/shell_command_lines_read_only_aside.md")
-                .trim()
-                .to_owned(),
-        );
-        assert!(!full.contains(&read_only_escaped));
-        assert!(!full.contains(&aside));
-        assert!(!read_only.contains(&full_escaped));
-        // Once each, and the aside as a paragraph of its own: the read-only mode adds it
-        // after a blank line, so it is never run on from the sentence before.
-        for (guidance, fragment) in [
-            (&full, full_escaped.as_str()),
-            (&full, windows_line::remedy(ShellMode::Full).as_str()),
-            (&read_only, read_only_escaped.as_str()),
-            (
-                &read_only,
-                windows_line::remedy(ShellMode::ReadOnly).as_str(),
-            ),
-            (&read_only, aside.as_str()),
-        ] {
-            assert_eq!(guidance.matches(fragment).count(), 1, "{fragment}");
-        }
-        assert!(
-            read_only.lines().any(|line| line == aside),
-            "the aside is a paragraph of its own: {read_only}"
-        );
-        // The mode that has no aside leaves no paragraph behind for it, and neither
-        // rendering leaves a blank paragraph anywhere else: both are right as they stand,
-        // with nothing for the description to trim away when it joins the sections.
-        assert!(!has_blank_paragraph(&full), "{full:?}");
-        assert!(!has_blank_paragraph(&read_only), "{read_only:?}");
-        // The platform whose interpreter already separates at a break is handed no
-        // such section at all.
-        assert!(render_command_line_notes(ShellPlatform::Unix, ShellMode::Full).is_none());
-    }
-
-    /// The leftover-process section reaches the agent in both modes, each mode's own
-    /// sentence and no other's: a mode handed the other's fragment would promise a
-    /// mechanism its runs do not have (or deny the one they do), and the section is
-    /// not platform-selected, so a mode that dropped it would leave the note's own
-    /// meaning unstated. A fragment that exists but is never rendered — or a sentence
-    /// the skeleton wrote twice, which `substitute` would replace twice — fails here
-    /// rather than reaching the agent, and the rendering is asserted to be the very
-    /// text both modes' descriptions carry.
-    #[test]
-    fn the_leftover_notes_name_each_modes_own_mechanism() {
-        let full = render_leftover_notes(ShellMode::Full);
-        let read_only = render_leftover_notes(ShellMode::ReadOnly);
-        let full_sentence = crate::prompt::load_prompt("tool/shell_leftover_full.md")
-            .trim()
-            .to_owned();
-        let read_only_sentence = crate::prompt::load_prompt("tool/shell_leftover_read_only.md")
-            .trim()
-            .to_owned();
-        assert_eq!(full.matches(&full_sentence).count(), 1, "{full}");
-        assert_eq!(
-            read_only.matches(&read_only_sentence).count(),
-            1,
-            "{read_only}"
-        );
-        assert!(!full.contains(&read_only_sentence), "{full}");
-        assert!(!read_only.contains(&full_sentence), "{read_only}");
-        // What the section states in both modes: a FINISHED call whose own output and
-        // exit status are the result, its leftover killed — never left running. The
-        // wording is the asset's, so only the words that carry the rule are asserted.
-        for rendered in [&full, &read_only] {
-            assert!(!rendered.contains("{{"), "{rendered}");
-            for word in ["FINISHED", "killed"] {
-                assert!(rendered.contains(word), "{word}: {rendered}");
-            }
-            assert!(!rendered.contains("RUNNING"), "{rendered}");
-            assert!(!rendered.contains("left running"), "{rendered}");
-        }
-        // The mechanism each mode may name: Full mode points at the supported way to
-        // keep a process running; ReadOnly mode has none to point at and says what to
-        // do instead.
-        for sentence in ["background: true", "`stop`"] {
-            assert!(full.contains(sentence), "{sentence}: {full}");
-        }
-        assert!(!read_only.contains("background: true"), "{read_only}");
-        assert!(
-            read_only.contains("inside the command's lifetime"),
-            "{read_only}"
-        );
-        // Both descriptions carry the section — a fragment that exists but is never
-        // rendered fails here.
-        for (mode, notes) in [
-            (ShellMode::Full, full.as_str()),
-            (ShellMode::ReadOnly, read_only.as_str()),
-        ] {
-            let description = ShellTool::new(mode).description();
-            assert!(
-                description.contains(notes.trim()),
-                "each mode's description must carry its leftover notes"
+        ];
+        for case in cases {
+            // For pre-truncation spill path: repeat the string enough times to
+            // exceed TOOL_OUTPUT_BUDGET_BYTES, triggering the spill-to-file branch
+            // in finish_shell_output. The spill content is pre-scrubbed by
+            // apply_profile_pipeline before being passed to finish_shell_output.
+            // This test verifies that the spill hint is properly appended.
+            let pre_owned = case.pre.map(|s| s.repeat(TOOL_OUTPUT_BUDGET_BYTES + 1));
+            let result = finish_shell_output(
+                case.combined.to_string(),
+                case.elapsed,
+                pre_owned.as_deref(),
             );
+            assert_contains_not_contains(case.name, &result, case.check, case.not_check);
+            if let Some(expected) = case.eq {
+                assert_eq!(result.trim(), expected, "[{}] expected eq", case.name);
+            }
         }
-    }
-
-    /// This platform's asset named `tool/shell_{stem}_{platform}.md`, and the other
-    /// platform's — the whole of what "platform-selected" means for a text the
-    /// description carries.
-    fn platform_text(stem: &str) -> (String, String) {
-        let read = |platform: &str| {
-            crate::prompt::load_prompt(&format!("tool/shell_{stem}_{platform}.md"))
-                .trim()
-                .to_owned()
-        };
-        match SHELL_PLATFORM {
-            ShellPlatform::Unix => (read("unix"), read("windows")),
-            ShellPlatform::Windows => (read("windows"), read("unix")),
-        }
-    }
-
-    /// Every platform-selected text the description carries is this platform's own
-    /// and the other platform's is absent: a placeholder left behind would reach the
-    /// agent as its own name, and another platform's sentence would promise it a
-    /// mechanism this one does not have. The stop text is additionally the one text
-    /// the description's stop bullet and the `stop` argument's schema entry both
-    /// carry, so the two cannot promise different mechanisms either (see `tree`).
-    #[test]
-    fn platform_selected_texts_are_this_platforms_own() {
-        let full = ShellTool::new(ShellMode::Full);
-        let description = full.description();
-        assert!(!description.contains("{{"), "{description}");
-        for stem in ["full_stop", "full_trailing", "grep_notes"] {
-            let (this, other) = platform_text(stem);
-            assert!(
-                description.contains(&this),
-                "the description must carry this platform's {stem} text"
-            );
-            assert!(
-                !description.contains(&other),
-                "the description must not carry the other platform's {stem} text"
-            );
-        }
-
-        let (this, other) = platform_text("full_stop");
-        let schema = full.parameters_schema();
-        let stop = schema["properties"]["stop"]["description"]
-            .as_str()
-            .expect("the stop argument carries a description");
-        assert!(
-            stop.contains(&this),
-            "the stop schema must carry this platform's stop text"
-        );
-        assert!(
-            !stop.contains(&other),
-            "the stop schema must not promise the other platform's stop text"
-        );
     }
 
     /// The Windows-only refusal decision, driven directly: the serve decision's
@@ -8926,7 +7701,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     mod program_command_tests {
         use super::*;
-        use std::ffi::OsStr;
         use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
         use tempfile::TempDir;
@@ -8934,152 +7708,164 @@ mod tests {
         /// An executable program named `name` under `dir`: a copy of a real Mach-O
         /// binary, the only kind of file [`program_command`] names by its path — so
         /// the fixture is one the kernel starts directly, and its permissions can be
-        /// changed by the tests that need that.
+        /// narrowed where a case needs that.
         fn program(dir: &Path, name: &str) -> PathBuf {
             let path = dir.join(name);
             std::fs::copy("/bin/echo", &path).expect("copy a real program");
             path
         }
 
-        /// An executable script named `name` under `dir`, with a valid interpreter
-        /// line: exactly the kind of file the naming rule leaves to the forking
-        /// start.
-        fn script(dir: &Path, name: &str) -> PathBuf {
-            let path = dir.join(name);
-            std::fs::write(&path, "#!/bin/sh\nprintf '%s' \"$0\"\n").expect("write fixture");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("make the fixture executable");
-            path
-        }
-
-        /// `prog`'s search list as the pairs a spawn would be handed.
+        /// `value` as the single-`PATH` search list a spawn would be handed.
         fn search_path(value: &str) -> Vec<(OsString, OsString)> {
             vec![(OsString::from("PATH"), OsString::from(value))]
         }
 
+        /// The bare word is resolved by the search list's own rules — the first
+        /// entry naming a program this user may start, an empty entry as the
+        /// commands directory, the default list where the environment carries none
+        /// — and every file the kernel does not start by itself keeps the bare
+        /// name. A name that already carries a separator is the caller's own
+        /// program, not one to look up.
         #[test]
-        fn a_bare_name_becomes_the_path_its_own_search_list_finds() {
-            let dir = TempDir::new().expect("tempdir");
-            let found = program(dir.path(), "prog");
-            let env = search_path(&dir.path().to_string_lossy());
-
-            let cmd = program_command("prog", &env, Some(dir.path()));
-
-            assert_eq!(cmd.get_program(), found.as_os_str());
-        }
-
-        /// Every file the kernel does not start by itself keeps the bare name: an
-        /// empty executable (which `execvp` re-runs under `/bin/sh`), a script (which
-        /// it reaches through its interpreter under rules the naming rule does not
-        /// model), and a name that already carries a separator (the caller's own
-        /// program, not one to look up).
-        #[test]
-        fn a_name_is_left_alone_where_a_resolved_path_would_change_what_runs() {
-            let dir = TempDir::new().expect("tempdir");
-            let env = search_path(&dir.path().to_string_lossy());
-            let unresolvable = dir.path().join("prog");
-            std::fs::write(&unresolvable, "").expect("write an empty fixture");
-            std::fs::set_permissions(&unresolvable, std::fs::Permissions::from_mode(0o755))
-                .expect("make the fixture executable");
-
-            assert_eq!(
-                program_command("prog", &env, Some(dir.path())).get_program(),
-                OsStr::new("prog"),
-                "an executable the kernel cannot start must keep the bare name"
-            );
-
-            std::fs::remove_file(&unresolvable).expect("clear the fixture");
-            script(dir.path(), "prog");
-            assert_eq!(
-                program_command("prog", &env, Some(dir.path())).get_program(),
-                OsStr::new("prog"),
-                "a script must keep the bare name"
-            );
-
-            // The same directory holds a program a bare `prog` *would* have found,
-            // so the untouched name is what a separator buys, not a missing fixture.
-            std::fs::remove_file(dir.path().join("prog")).expect("clear the fixture");
-            let found = program(dir.path(), "prog");
-            assert_eq!(
-                program_command(&found.to_string_lossy(), &env, Some(dir.path())).get_program(),
-                found.as_os_str()
-            );
-        }
-
-        #[test]
-        fn an_empty_search_entry_resolves_against_the_commands_directory() {
-            let dir = TempDir::new().expect("tempdir");
-            let found = program(dir.path(), "prog");
-
-            let cmd = program_command("prog", &search_path(""), Some(dir.path()));
-
-            assert_eq!(cmd.get_program(), found.as_os_str());
-        }
-
-        #[test]
-        fn an_environment_without_a_path_falls_back_to_the_default_search_path() {
-            let cmd = program_command("true", &[], None);
-
-            assert_eq!(cmd.get_program(), OsStr::new("/usr/bin/true"));
-        }
-
-        #[test]
-        fn a_directory_and_a_non_executable_file_are_skipped_for_the_next_entry() {
+        #[expect(clippy::too_many_lines)] // one straight-line case per resolution rule, each with its own fixture
+        fn a_bare_name_is_the_program_its_own_search_list_names() {
             let root = TempDir::new().expect("tempdir");
-            let as_dir = root.path().join("as-dir");
-            std::fs::create_dir_all(as_dir.join("prog")).expect("directory named like the program");
+            let prog = program(root.path(), "prog");
+            let search = root.path().to_string_lossy().into_owned();
+            let cmd = program_command("prog", &search_path(&search), Some(root.path()));
+            assert_eq!(
+                cmd.get_program(),
+                prog.as_os_str(),
+                "the search list finds the program"
+            );
+
+            // An empty entry stands for the commands directory, which the caller
+            // passes as the child's own working directory.
+            let root = TempDir::new().expect("tempdir");
+            let prog = program(root.path(), "prog");
+            let cmd = program_command("prog", &search_path(""), Some(root.path()));
+            assert_eq!(
+                cmd.get_program(),
+                prog.as_os_str(),
+                "an empty entry resolves against the commands directory"
+            );
+
+            let root = TempDir::new().expect("tempdir");
+            let cmd = program_command("true", &[], Some(root.path()));
+            assert_eq!(
+                cmd.get_program(),
+                Path::new("/usr/bin/true").as_os_str(),
+                "an environment with no PATH gets the default search path"
+            );
+
+            // A directory named like the program and a file without its execute
+            // bits are passed over; the program under the last entry is the one
+            // named.
+            let root = TempDir::new().expect("tempdir");
+            std::fs::create_dir_all(root.path().join("as-dir").join("prog"))
+                .expect("directory named like the program");
             let no_exec = root.path().join("no-exec");
             std::fs::create_dir(&no_exec).expect("tempdir");
             std::fs::write(no_exec.join("prog"), "#!/bin/sh\n").expect("non-executable fixture");
-            let good = root.path().join("good");
-            std::fs::create_dir(&good).expect("tempdir");
-            let found = program(&good, "prog");
-            let search = std::env::join_paths([&as_dir, &no_exec, &good])
-                .expect("join the search list")
-                .to_string_lossy()
-                .into_owned();
+            std::fs::create_dir(root.path().join("good")).expect("tempdir");
+            let good = program(&root.path().join("good"), "prog");
+            let search = std::env::join_paths([
+                root.path().join("as-dir"),
+                root.path().join("no-exec"),
+                root.path().join("good"),
+            ])
+            .expect("join the search list");
+            let cmd = program_command(
+                "prog",
+                &search_path(&search.to_string_lossy()),
+                Some(root.path()),
+            );
+            assert_eq!(
+                cmd.get_program(),
+                good.as_os_str(),
+                "a directory and a non-executable file are skipped"
+            );
 
-            let cmd = program_command("prog", &search_path(&search), Some(root.path()));
-
-            assert_eq!(cmd.get_program(), found.as_os_str());
-        }
-
-        /// `execvp` tests whether *this* user may execute the file, not whether the
-        /// mode's execute bits are set, so a file that is executable for someone
-        /// else is passed over and the search goes on. (Root may execute anything,
-        /// so the check has nothing to say there.)
-        #[test]
-        fn a_file_its_owner_may_not_execute_is_not_the_program() {
-            if unsafe { libc::geteuid() } == 0 {
-                return;
-            }
+            // `execvp` asks whether *this* user may execute the file, not whether
+            // the mode's execute bits are set: someone else's executable is passed
+            // over and the search goes on, while root may start it and stops at the
+            // first entry.
             let root = TempDir::new().expect("tempdir");
             let not_ours = root.path().join("not-ours");
             std::fs::create_dir(&not_ours).expect("tempdir");
             let foreign = program(&not_ours, "prog");
             std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o001))
                 .expect("executable for someone else only");
-            let good = root.path().join("good");
-            std::fs::create_dir(&good).expect("tempdir");
-            let found = program(&good, "prog");
-            let search = std::env::join_paths([&not_ours, &good])
-                .expect("join the search list")
-                .to_string_lossy()
-                .into_owned();
+            let good_dir = root.path().join("good");
+            std::fs::create_dir(&good_dir).expect("tempdir");
+            let good = program(&good_dir, "prog");
+            let search = std::env::join_paths([not_ours.as_path(), good_dir.as_path()])
+                .expect("join the search list");
+            let cmd = program_command(
+                "prog",
+                &search_path(&search.to_string_lossy()),
+                Some(root.path()),
+            );
+            let expected = if unsafe { libc::geteuid() } == 0 {
+                foreign
+            } else {
+                good
+            };
+            assert_eq!(
+                cmd.get_program(),
+                expected.as_os_str(),
+                "a file only someone else may execute is not the program"
+            );
 
+            let root = TempDir::new().expect("tempdir");
+            let search = root.path().to_string_lossy().into_owned();
             let cmd = program_command("prog", &search_path(&search), Some(root.path()));
+            assert_eq!(
+                cmd.get_program(),
+                Path::new("prog").as_os_str(),
+                "nothing resolving leaves the bare name"
+            );
 
-            assert_eq!(cmd.get_program(), found.as_os_str());
-        }
+            // An executable the kernel cannot start: `execvp` re-runs it under
+            // `/bin/sh`, so it is not a program this path may name.
+            let root = TempDir::new().expect("tempdir");
+            let empty = root.path().join("prog");
+            std::fs::write(&empty, "").expect("write an empty fixture");
+            std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o755))
+                .expect("make the fixture executable");
+            let search = root.path().to_string_lossy().into_owned();
+            let cmd = program_command("prog", &search_path(&search), Some(root.path()));
+            assert_eq!(
+                cmd.get_program(),
+                Path::new("prog").as_os_str(),
+                "an executable the kernel cannot start keeps the bare name"
+            );
 
-        #[test]
-        fn nothing_resolving_leaves_the_bare_name() {
-            let dir = TempDir::new().expect("tempdir");
-            let env = search_path(&dir.path().to_string_lossy());
+            // A script with a valid interpreter line is exactly what the naming rule
+            // leaves to the forking start.
+            let root = TempDir::new().expect("tempdir");
+            let script = root.path().join("prog");
+            std::fs::write(&script, "#!/bin/sh\nprintf '%s' \"$0\"\n").expect("write fixture");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("make the fixture executable");
+            let search = root.path().to_string_lossy().into_owned();
+            let cmd = program_command("prog", &search_path(&search), Some(root.path()));
+            assert_eq!(
+                cmd.get_program(),
+                Path::new("prog").as_os_str(),
+                "a script keeps the bare name"
+            );
 
-            let cmd = program_command("prog", &env, Some(dir.path()));
-
-            assert_eq!(cmd.get_program(), OsStr::new("prog"));
+            let root = TempDir::new().expect("tempdir");
+            let prog = program(root.path(), "prog");
+            let search = root.path().to_string_lossy().into_owned();
+            let asked = prog.to_string_lossy().into_owned();
+            let cmd = program_command(&asked, &search_path(&search), Some(root.path()));
+            assert_eq!(
+                cmd.get_program(),
+                prog.as_os_str(),
+                "a name carrying its own separator is the caller's program"
+            );
         }
 
         /// The actual regression guard, and the one thing `Command`'s own getters

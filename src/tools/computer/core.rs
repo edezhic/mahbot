@@ -3869,25 +3869,62 @@ mod tests {
         obs
     }
 
-    #[test]
-    fn normalized_to_surface_maps_and_validates() {
-        let geo = surface(100.0, 200.0, 800.0, 600.0);
-        let (sx, sy) = normalized_to_surface(500.0, 250.0, &geo).unwrap();
-        assert!((sx - 500.0).abs() < 1e-9, "x = {sx}");
-        assert!((sy - 350.0).abs() < 1e-9, "y = {sy}");
-        // Out of bounds (finite but negative / over max) and NaN.
-        assert!(normalized_to_surface(-1.0, 0.0, &geo).is_err());
-        assert!(normalized_to_surface(0.0, 1001.0, &geo).is_err());
-        assert!(normalized_to_surface(f64::NAN, 0.0, &geo).is_err());
+    /// A point on a surface, given in normalized coordinates, and the pixel it
+    /// must name — or `None` when the point is not one the surface can express.
+    struct PointCase {
+        name: &'static str,
+        geometry: SurfaceGeometry,
+        point: (f64, f64),
+        pixels: Option<(f64, f64)>,
     }
 
     #[test]
-    fn normalized_to_surface_handles_negative_origins() {
-        // A virtual-desktop bounding rect spanning a display with a negative origin.
-        let geo = surface(0.0, -100.0, 3840.0, 1180.0);
-        let (px, py) = normalized_to_surface(500.0, 500.0, &geo).unwrap();
-        assert!((px - 1920.0).abs() < 1e-9, "x = {px}");
-        assert!((py - 490.0).abs() < 1e-9, "y = {py}");
+    fn normalized_point_cases() {
+        let cases = [
+            PointCase {
+                name: "an_offset_surface",
+                geometry: surface(100.0, 200.0, 800.0, 600.0),
+                point: (500.0, 250.0),
+                pixels: Some((500.0, 350.0)),
+            },
+            PointCase {
+                name: "a_negative_origin_surface",
+                // A virtual-desktop bounding rect spanning a display with a
+                // negative origin.
+                geometry: surface(0.0, -100.0, 3840.0, 1180.0),
+                point: (500.0, 500.0),
+                pixels: Some((1920.0, 490.0)),
+            },
+            // Out of bounds (finite but negative / over max) and NaN.
+            PointCase {
+                name: "below_the_range",
+                geometry: surface(100.0, 200.0, 800.0, 600.0),
+                point: (-1.0, 0.0),
+                pixels: None,
+            },
+            PointCase {
+                name: "above_the_range",
+                geometry: surface(100.0, 200.0, 800.0, 600.0),
+                point: (0.0, 1001.0),
+                pixels: None,
+            },
+            PointCase {
+                name: "not_a_number",
+                geometry: surface(100.0, 200.0, 800.0, 600.0),
+                point: (f64::NAN, 0.0),
+                pixels: None,
+            },
+        ];
+        for case in cases {
+            let result = normalized_to_surface(case.point.0, case.point.1, &case.geometry);
+            let Some((x, y)) = case.pixels else {
+                assert!(result.is_err(), "{}: the point must be refused", case.name);
+                continue;
+            };
+            let (px, py) = result.unwrap_or_else(|e| panic!("{}: {e}", case.name));
+            assert!((px - x).abs() < 1e-9, "{}: x = {px}", case.name);
+            assert!((py - y).abs() < 1e-9, "{}: y = {py}", case.name);
+        }
     }
 
     #[test]
@@ -3945,46 +3982,166 @@ mod tests {
         );
     }
 
+    /// Where a rect comes from: a region cut out of an image, or a window on a
+    /// captured screen.
+    enum RectSource {
+        Region {
+            region: Region,
+            image: (u32, u32),
+        },
+        Window {
+            window: SurfaceGeometry,
+            screen: SurfaceGeometry,
+        },
+    }
+
+    struct RectCase {
+        name: &'static str,
+        source: RectSource,
+        /// The `(x, y, width, height)` the rect must name, or the words of the
+        /// refusal (empty when only the refusal itself is the claim).
+        rect: Result<(u32, u32, u32, u32), &'static str>,
+    }
+
+    #[expect(clippy::too_many_lines)] // one rect shape per source and refusal
     #[test]
-    fn region_to_pixels_maps_orders_and_clamps() {
-        // Normalized 200..=800 on a 1000px image → 200..=800 px.
-        let region = Region {
-            x0: 200.0,
-            y0: 100.0,
-            x1: 800.0,
-            y1: 500.0,
-        };
-        assert_eq!(
-            region_to_pixels(&region, 1000, 1000).unwrap(),
-            (200, 100, 600, 400)
-        );
-        // Reversed corners are normalized in order → same rect.
-        let rev = Region {
-            x0: 800.0,
-            y0: 500.0,
-            x1: 200.0,
-            y1: 100.0,
-        };
-        assert_eq!(
-            region_to_pixels(&rev, 1000, 1000).unwrap(),
-            (200, 100, 600, 400)
-        );
-        // Out-of-range normalized coords are rejected.
-        let bad = Region {
-            x0: 1100.0,
-            y0: 0.0,
-            x1: 200.0,
-            y1: 100.0,
-        };
-        assert!(region_to_pixels(&bad, 1000, 1000).is_err());
-        // A region enclosing no area is refused, never turned into one pixel.
-        let flat = Region {
-            x0: 100.0,
-            y0: 100.0,
-            x1: 900.0,
-            y1: 100.0,
-        };
-        assert!(region_to_pixels(&flat, 1000, 1000).is_err());
+    fn rect_cases() {
+        let cases = [
+            // Normalized 200..=800 on a 1000px image → 200..=800 px.
+            RectCase {
+                name: "a_region_of_an_image",
+                source: RectSource::Region {
+                    region: Region {
+                        x0: 200.0,
+                        y0: 100.0,
+                        x1: 800.0,
+                        y1: 500.0,
+                    },
+                    image: (1000, 1000),
+                },
+                rect: Ok((200, 100, 600, 400)),
+            },
+            // Reversed corners are normalized in order → the same rect.
+            RectCase {
+                name: "reversed_corners_name_the_same_region",
+                source: RectSource::Region {
+                    region: Region {
+                        x0: 800.0,
+                        y0: 500.0,
+                        x1: 200.0,
+                        y1: 100.0,
+                    },
+                    image: (1000, 1000),
+                },
+                rect: Ok((200, 100, 600, 400)),
+            },
+            // Out-of-range normalized coords are rejected.
+            RectCase {
+                name: "a_region_outside_the_normalized_range",
+                source: RectSource::Region {
+                    region: Region {
+                        x0: 1100.0,
+                        y0: 0.0,
+                        x1: 200.0,
+                        y1: 100.0,
+                    },
+                    image: (1000, 1000),
+                },
+                rect: Err(""),
+            },
+            // A region enclosing no area is refused, never turned into one pixel.
+            RectCase {
+                name: "a_region_enclosing_no_area",
+                source: RectSource::Region {
+                    region: Region {
+                        x0: 100.0,
+                        y0: 100.0,
+                        x1: 900.0,
+                        y1: 100.0,
+                    },
+                    image: (1000, 1000),
+                },
+                rect: Err(""),
+            },
+            // A region beyond the image is clamped to the image bounds (>=1px).
+            RectCase {
+                name: "a_region_beyond_the_image_is_clamped",
+                source: RectSource::Region {
+                    region: Region {
+                        x0: 500.0,
+                        y0: 500.0,
+                        x1: 1000.0,
+                        y1: 1000.0,
+                    },
+                    image: (200, 200),
+                },
+                rect: Ok((100, 100, 100, 100)),
+            },
+            // Negative-origin offset into buffer space.
+            RectCase {
+                name: "a_window_on_a_negative_origin_screen",
+                source: RectSource::Window {
+                    window: surface(-1920.0, 100.0, 800.0, 600.0),
+                    screen: surface(-1920.0, 0.0, 3840.0, 1080.0),
+                },
+                rect: Ok((0, 100, 800, 600)),
+            },
+            // Partially off-screen shrinks dims to the visible intersection.
+            RectCase {
+                name: "a_window_partly_off_screen",
+                source: RectSource::Window {
+                    window: surface(1500.0, 900.0, 800.0, 400.0),
+                    screen: surface(-1920.0, 0.0, 3840.0, 1080.0),
+                },
+                rect: Ok((3420, 900, 420, 180)),
+            },
+            // Fully off-screen errors instead of cropping a misleading 1x1.
+            RectCase {
+                name: "a_window_off_the_screen",
+                source: RectSource::Window {
+                    window: surface(5000.0, 0.0, 100.0, 100.0),
+                    screen: surface(-1920.0, 0.0, 3840.0, 1080.0),
+                },
+                rect: Err("outside the captured screen"),
+            },
+            RectCase {
+                name: "a_window_with_no_area",
+                source: RectSource::Window {
+                    window: surface(0.0, 0.0, 0.0, 0.0),
+                    screen: surface(-1920.0, 0.0, 3840.0, 1080.0),
+                },
+                rect: Err(""),
+            },
+        ];
+
+        for case in &cases {
+            let result = match case.source {
+                RectSource::Region { region, image } => region_to_pixels(&region, image.0, image.1),
+                RectSource::Window { window, screen: on } => window_capture_rect(&window, &on),
+            };
+            match case.rect {
+                Ok(expected) => assert_eq!(
+                    result.unwrap_or_else(|e| panic!("{}: {e}", case.name)),
+                    expected,
+                    "{}: the rect",
+                    case.name
+                ),
+                Err(words) => {
+                    let err = format!(
+                        "{:?}",
+                        result
+                            .err()
+                            .unwrap_or_else(|| panic!("{}: the rect must be refused", case.name))
+                    );
+                    assert!(
+                        err.contains(words),
+                        "{}: the refusal must say {words:?}: {err}",
+                        case.name
+                    );
+                }
+            }
+        }
+
         // A region object carries only its corners: an unknown key is a mistake, not
         // a value to ignore.
         assert!(
@@ -4002,16 +4159,6 @@ mod tests {
         // The array form is four numbers: a fifth names nothing and is refused too.
         assert!(serde_json::from_value::<Region>(serde_json::json!([0, 0, 1, 1, 2])).is_err());
         assert!(serde_json::from_value::<Region>(serde_json::json!([0, 0, 1, 1])).is_ok());
-        // A region beyond the image is clamped to the image bounds (>=1px).
-        let big = Region {
-            x0: 500.0,
-            y0: 500.0,
-            x1: 1000.0,
-            y1: 1000.0,
-        };
-        let (x, y, w, h) = region_to_pixels(&big, 200, 200).unwrap();
-        assert!(x + w <= 200 && y + h <= 200);
-        assert!(w >= 1 && h >= 1);
     }
 
     #[test]
@@ -4059,6 +4206,8 @@ mod tests {
         assert!(err.to_string().contains("16"), "{err:?}");
     }
 
+    /// A `file://` portal URI decodes to the path it names, with its escaped bytes
+    /// restored — and to nothing at all when it does not name a local file.
     #[test]
     fn portal_uri_decodes_to_path() {
         assert_eq!(
@@ -4083,160 +4232,159 @@ mod tests {
         assert!(portal_uri_to_path("file:///tmp/a%zz.png").is_err());
     }
 
-    #[test]
-    fn window_rect_intersects_screen() {
-        let screen = surface(-1920.0, 0.0, 3840.0, 1080.0);
-        // Negative-origin offset into buffer space.
-        let win = surface(-1920.0, 100.0, 800.0, 600.0);
-        assert_eq!(
-            window_capture_rect(&win, &screen).unwrap(),
-            (0, 100, 800, 600)
-        );
-        // Partially off-screen shrinks dims to the visible intersection.
-        let partial = surface(1500.0, 900.0, 800.0, 400.0);
-        assert_eq!(
-            window_capture_rect(&partial, &screen).unwrap(),
-            (3420, 900, 420, 180)
-        );
-        // Fully off-screen errors instead of cropping a misleading 1x1.
-        let off = surface(5000.0, 0.0, 100.0, 100.0);
-        let err = window_capture_rect(&off, &screen).unwrap_err();
-        assert!(
-            err.to_string().contains("outside the captured screen"),
-            "{err:?}"
-        );
-        assert!(window_capture_rect(&surface(0.0, 0.0, 0.0, 0.0), &screen).is_err());
+    /// A tree and what its rendering must show: the lines it prints, in order,
+    /// what the header above them states, and the counts behind the header.
+    struct RenderCase {
+        name: &'static str,
+        observation: Observation,
+        /// The prefix each of the first lines must start with.
+        lines: &'static [&'static str],
+        /// Substrings the whole rendering must carry.
+        contains: &'static [&'static str],
+        /// Statements the header (above the first element line) must carry.
+        header: Vec<String>,
+        /// Substrings the rendering must not carry.
+        absent: Vec<String>,
+        /// The `(nodes, interactive)` counts, when the case is about them.
+        counts: Option<(usize, usize)>,
     }
 
+    #[expect(clippy::too_many_lines)]
     #[test]
-    fn render_tree_assigns_pre_order_refs_and_flags() {
-        let obs = sample_observation();
-        let counts = counts(&obs.root);
-        let text = render_tree(&obs, counts);
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(
-            lines[0].starts_with(
-                "[Surface: app=\"TestApp\" window=\"Sample\" 800x600 @ (0, 0) — 4 nodes, 2 interactive]"
-            ),
-            "got {}",
-            lines[0]
-        );
+    fn render_tree_cases() {
         // e1 = root window (AX stripped to Window), e2 = OK button (has action),
         // e3 = group, e4 = Cancel button.
-        assert!(
-            lines[1].starts_with("[e1] Window \"Sample\""),
-            "got {}",
-            lines[1]
-        );
-        assert!(
-            lines[2].starts_with("  [e2] Button \"OK\""),
-            "got {}",
-            lines[2]
-        );
-        assert!(lines[2].contains("actions=[press]"), "got {}", lines[2]);
-        assert!(lines[3].starts_with("  [e3] Group"), "got {}", lines[3]);
-        assert!(
-            lines[4].starts_with("    [e4] Button \"Cancel\""),
-            "got {}",
-            lines[4]
-        );
-        // The counts are the two buttons (actions); root/group are non-interactive, and
-        // fewer interactive elements than the thin-surface threshold is what makes the
-        // full observation say so.
-        assert_eq!(counts.interactive, 2);
-        assert_eq!(counts.nodes, 4);
-        assert!(counts.interactive < AX_THIN_INTERACTIVE_ELEMENTS);
-    }
+        let pre_order = RenderCase {
+            name: "pre_order_refs_and_flags",
+            observation: sample_observation(),
+            lines: &[
+                "[Surface: app=\"TestApp\" window=\"Sample\" 800x600 @ (0, 0) — 4 nodes, 2 interactive]",
+                "[e1] Window \"Sample\"",
+                "  [e2] Button \"OK\"",
+                "  [e3] Group",
+                "    [e4] Button \"Cancel\"",
+            ],
+            contains: &["actions=[press]"],
+            header: Vec::new(),
+            absent: Vec::new(),
+            // The counts are the two buttons (actions); root/group are
+            // non-interactive, and fewer interactive elements than the thin-surface
+            // threshold is what makes the full observation say so.
+            counts: Some((4, 2)),
+        };
 
-    #[test]
-    fn render_tree_states_every_ceiling_it_hit() {
         let long = "x".repeat(200);
-        let root = UiNode {
-            value: Some(long.clone()),
-            ..node("AXTextField", Some("field"))
-        };
-        let obs = Observation {
-            app_name: "A".to_string(),
-            window_title: None,
-            surface: surface(0.0, 0.0, 10.0, 10.0),
-            root,
-            truncation: Truncation {
-                nodes: Some(MAX_TREE_NODES),
-                depth: Some(Cut {
-                    count: 2,
-                    limit: 25,
-                }),
-                values: Some(Cut {
-                    count: 1,
-                    limit: MAX_VALUE_CHARS,
-                }),
-                names: Some(Cut {
-                    count: 3,
-                    limit: MAX_NAME_CHARS,
-                }),
-                children: Some(Cut {
-                    count: 4,
-                    limit: MAX_CHILDREN,
-                }),
-                children_cut: Some(Cut {
-                    count: 1,
-                    limit: MAX_CHILDREN,
-                }),
+        let truncated = RenderCase {
+            name: "every_ceiling_is_stated_in_the_header",
+            observation: Observation {
+                app_name: "A".to_string(),
+                window_title: None,
+                surface: surface(0.0, 0.0, 10.0, 10.0),
+                root: UiNode {
+                    value: Some(long.clone()),
+                    ..node("AXTextField", Some("field"))
+                },
+                truncation: Truncation {
+                    nodes: Some(MAX_TREE_NODES),
+                    depth: Some(Cut {
+                        count: 2,
+                        limit: 25,
+                    }),
+                    values: Some(Cut {
+                        count: 1,
+                        limit: MAX_VALUE_CHARS,
+                    }),
+                    names: Some(Cut {
+                        count: 3,
+                        limit: MAX_NAME_CHARS,
+                    }),
+                    children: Some(Cut {
+                        count: 4,
+                        limit: MAX_CHILDREN,
+                    }),
+                    children_cut: Some(Cut {
+                        count: 1,
+                        limit: MAX_CHILDREN,
+                    }),
+                },
             },
+            lines: &[],
+            contains: &["value=\""],
+            // Every cut is stated in the header, above the first element line: a tree
+            // near a ceiling reaches the agent as a preview of its head, so a statement
+            // after the tree would never be read.
+            header: vec![
+                format!("the {MAX_TREE_NODES}-node ceiling"),
+                "2 nodes at the 25-deep ceiling".to_string(),
+                format!("1 value cut at {RENDER_VALUE_CHARS} chars"),
+                // The read's own value cap is a separate ceiling from the display cap.
+                format!("1 value cut at {MAX_VALUE_CHARS} chars"),
+                format!("3 names cut at {MAX_NAME_CHARS} chars"),
+                format!("4 nodes claim more than {MAX_CHILDREN} children"),
+                format!(
+                    "1 node listed more than {MAX_CHILDREN} children — only the first {MAX_CHILDREN} \
+                     were read"
+                ),
+            ],
+            // A long value must be truncated.
+            absent: vec![long],
+            counts: None,
         };
-        let text = render_tree(&obs, counts(&obs.root));
-        assert!(text.contains("value=\""), "value should render");
-        assert!(!text.contains(&long), "long value must be truncated");
-        // Every cut is stated in the header, above the first element line: a tree
-        // near a ceiling reaches the agent as a preview of its head, so a statement
-        // after the tree would never be read.
-        let header_end = text
-            .lines()
-            .position(|line| line.starts_with("[e"))
-            .expect("the tree renders under the header");
-        let header = text.lines().take(header_end).collect::<Vec<_>>().join("\n");
-        assert!(
-            header.contains(&format!("the {MAX_TREE_NODES}-node ceiling")),
-            "{header}"
-        );
-        assert!(
-            header.contains("2 nodes at the 25-deep ceiling"),
-            "{header}"
-        );
-        assert!(
-            header.contains(&format!("1 value cut at {RENDER_VALUE_CHARS} chars")),
-            "{header}"
-        );
-        // The read's own value cap is a separate ceiling from the display cap.
-        assert!(
-            header.contains(&format!("1 value cut at {MAX_VALUE_CHARS} chars")),
-            "{header}"
-        );
-        assert!(
-            header.contains(&format!("3 names cut at {MAX_NAME_CHARS} chars")),
-            "{header}"
-        );
-        assert!(
-            header.contains(&format!("4 nodes claim more than {MAX_CHILDREN} children")),
-            "{header}"
-        );
-        assert!(
-            header.contains(&format!(
-                "1 node listed more than {MAX_CHILDREN} children — only the first {MAX_CHILDREN} \
-                 were read"
-            )),
-            "{header}"
-        );
-    }
 
-    #[test]
-    fn a_single_node_at_a_ceiling_reads_as_one_node() {
-        let mut truncation = Truncation::default();
-        truncation.cut_depth(25);
-        assert_eq!(
-            truncation.statements(0),
-            ["[Tree truncated: 1 node at the 25-deep ceiling — its children were not read]"]
-        );
+        for case in [pre_order, truncated] {
+            let text = render_tree(&case.observation, counts(&case.observation.root));
+            let lines: Vec<&str> = text.lines().collect();
+            for (index, prefix) in case.lines.iter().enumerate() {
+                assert!(
+                    lines[index].starts_with(prefix),
+                    "{}: line {index} should start with {prefix:?}: {}",
+                    case.name,
+                    lines[index]
+                );
+            }
+            for expected in case.contains {
+                assert!(
+                    text.contains(expected),
+                    "{}: the rendering does not carry {expected:?}: {text}",
+                    case.name
+                );
+            }
+            for unexpected in &case.absent {
+                assert!(
+                    !text.contains(unexpected),
+                    "{}: the rendering carries {unexpected:?}: {text}",
+                    case.name
+                );
+            }
+            if !case.header.is_empty() {
+                let header_end = lines
+                    .iter()
+                    .position(|line| line.starts_with("[e"))
+                    .expect("the tree renders under the header");
+                let header = lines[..header_end].join("\n");
+                for statement in &case.header {
+                    assert!(
+                        header.contains(statement.as_str()),
+                        "{}: the header does not state {statement:?}: {header}",
+                        case.name
+                    );
+                }
+            }
+            if let Some((nodes, interactive)) = case.counts {
+                let measured = counts(&case.observation.root);
+                assert_eq!(measured.nodes, nodes, "{}: nodes", case.name);
+                assert_eq!(
+                    measured.interactive, interactive,
+                    "{}: interactive elements",
+                    case.name
+                );
+                assert!(
+                    measured.interactive < AX_THIN_INTERACTIVE_ELEMENTS,
+                    "{}: fewer interactive elements than the thin-surface threshold",
+                    case.name
+                );
+            }
+        }
     }
 
     /// An observation recorded as a surface's look, for the views below.
@@ -4258,63 +4406,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_narrow_look_by_kind_lists_matches_and_names_the_kinds_present() {
-        let obs = sample_observation();
-        let look = look_of(&obs, window_target("k"));
-
-        let buttons = Narrow {
-            kind: Some("button".to_string()),
-            ..Narrow::default()
-        };
-        let answer = render_narrow(&look, &buttons, true).expect("a kind always resolves");
-        assert!(
-            answer.contains("elements of kind \"button\" — 2 of 4 nodes"),
-            "{answer}"
-        );
-        assert!(answer.contains("[e2] Button \"OK\""), "{answer}");
-        assert!(answer.contains("[e4] Button \"Cancel\""), "{answer}");
-        assert!(answer.contains("— at path 1"), "{answer}");
-        assert!(answer.contains("— at path 2.1"), "{answer}");
-        assert!(
-            answer.contains("it covers part of the surface only"),
-            "{answer}"
-        );
-
-        // Narrowing composes: a kind inside a ref's subtree is only that subtree's.
-        let inside = Narrow {
-            at: Some(Locator {
-                path: vec![1],
-                role: "AXGroup".to_string(),
-                name: None,
-                frame: None,
-            }),
-            kind: Some("button".to_string()),
-            ..Narrow::default()
-        };
-        let answer = render_narrow(&look, &inside, true).expect("the ref is in this look");
-        assert!(answer.contains("— 1 of 2 nodes"), "{answer}");
-        assert!(answer.contains("Button \"Cancel\""), "{answer}");
-        assert!(
-            !answer.contains("Button \"OK\""),
-            "only the subtree's matches are listed: {answer}"
-        );
-
-        // A mistyped kind is a mistake to correct, not an empty surface.
-        let mistyped = Narrow {
-            kind: Some("buton".to_string()),
-            ..Narrow::default()
-        };
-        let answer = render_narrow(&look, &mistyped, true).expect("a kind always resolves");
-        assert!(answer.contains("no element of kind \"buton\""), "{answer}");
-        assert!(answer.contains("kinds present: Button (2)"), "{answer}");
+    /// A narrowed look and what it must answer: the matches it lists, what it must
+    /// not print, or the refusal a ref that no longer names its element gives.
+    struct NarrowCase {
+        name: &'static str,
+        narrow: Narrow,
+        /// Whether the turn still holds the refs the look was taken with.
+        refs: bool,
+        present: &'static [&'static str],
+        absent: &'static [&'static str],
+        /// The refusal's own prefix — empty when the look resolves.
+        refusal: &'static str,
     }
 
-    #[test]
-    fn a_narrow_look_of_a_subtree_prints_no_refs_once_the_turn_ended() {
-        let obs = sample_observation();
-        let look = look_of(&obs, window_target("k"));
-        let subtree = Narrow {
+    fn subtree_narrow() -> Narrow {
+        Narrow {
             at: Some(Locator {
                 path: vec![1],
                 role: "AXGroup".to_string(),
@@ -4323,33 +4429,139 @@ mod tests {
             }),
             depth: Some(2),
             kind: None,
-        };
-        let answer = render_narrow(&look, &subtree, true).expect("the ref is in this look");
-        assert!(answer.contains("[e3] Group"), "{answer}");
-        assert!(
-            answer.contains("  [e4] Button \"Cancel\" actions=[press]"),
-            "the subtree keeps its shape, printed as a full look prints it: {answer}"
-        );
-        assert!(answer.contains("2 levels beneath 2"), "{answer}");
+        }
+    }
 
-        // A later turn keeps the look but loses the refs: nothing is printed that would
-        // not resolve, and the answer says acting needs a fresh observation.
-        let answer = render_narrow(&look, &subtree, false).expect("the ref is in this look");
-        assert!(!answer.contains("[e3]"), "{answer}");
-        assert!(answer.contains("[No refs:"), "{answer}");
-
-        // A ref that no longer names that element is a mistake, not an empty look.
-        let stale = Narrow {
-            at: Some(Locator {
-                path: vec![1],
-                role: "AXButton".to_string(),
-                name: Some("Gone".to_string()),
-                frame: None,
-            }),
-            ..Narrow::default()
-        };
-        let err = render_narrow(&look, &stale, true).expect_err("the ref no longer matches");
-        assert!(err.to_string().starts_with(ERR_STALE_ELEMENT), "{err}");
+    #[expect(clippy::too_many_lines)] // one cohesive table over the narrowed looks
+    #[test]
+    fn narrow_look_cases() {
+        let obs = sample_observation();
+        let look = look_of(&obs, window_target("k"));
+        let cases = vec![
+            NarrowCase {
+                name: "by_kind_lists_matches_and_names_the_kinds_present",
+                narrow: Narrow {
+                    kind: Some("button".to_string()),
+                    ..Narrow::default()
+                },
+                refs: true,
+                present: &[
+                    "elements of kind \"button\" — 2 of 4 nodes",
+                    "[e2] Button \"OK\"",
+                    "[e4] Button \"Cancel\"",
+                    "— at path 1",
+                    "— at path 2.1",
+                    "it covers part of the surface only",
+                ],
+                absent: &[],
+                refusal: "",
+            },
+            NarrowCase {
+                // Narrowing composes: a kind inside a ref's subtree is only that
+                // subtree's.
+                name: "a_kind_inside_a_subtree_is_only_that_subtrees",
+                narrow: Narrow {
+                    at: Some(Locator {
+                        path: vec![1],
+                        role: "AXGroup".to_string(),
+                        name: None,
+                        frame: None,
+                    }),
+                    kind: Some("button".to_string()),
+                    ..Narrow::default()
+                },
+                refs: true,
+                present: &["— 1 of 2 nodes", "Button \"Cancel\""],
+                absent: &["Button \"OK\""],
+                refusal: "",
+            },
+            NarrowCase {
+                // A mistyped kind is a mistake to correct, not an empty surface.
+                name: "a_mistyped_kind_names_the_kinds_present",
+                narrow: Narrow {
+                    kind: Some("buton".to_string()),
+                    ..Narrow::default()
+                },
+                refs: true,
+                present: &["no element of kind \"buton\"", "kinds present: Button (2)"],
+                absent: &[],
+                refusal: "",
+            },
+            NarrowCase {
+                name: "a_subtree_keeps_its_shape",
+                narrow: subtree_narrow(),
+                refs: true,
+                present: &[
+                    "[e3] Group",
+                    // The subtree keeps its shape, printed as a full look prints it.
+                    "  [e4] Button \"Cancel\" actions=[press]",
+                    "2 levels beneath 2",
+                ],
+                absent: &[],
+                refusal: "",
+            },
+            NarrowCase {
+                // A later turn keeps the look but loses the refs: nothing is printed
+                // that would not resolve, and the answer says acting needs a fresh
+                // observation.
+                name: "a_subtree_prints_no_refs_once_the_turn_ended",
+                narrow: subtree_narrow(),
+                refs: false,
+                present: &["[No refs:"],
+                absent: &["[e3]"],
+                refusal: "",
+            },
+            NarrowCase {
+                // A ref that no longer names that element is a mistake, not an empty
+                // look.
+                name: "a_ref_that_no_longer_names_the_element_is_refused",
+                narrow: Narrow {
+                    at: Some(Locator {
+                        path: vec![1],
+                        role: "AXButton".to_string(),
+                        name: Some("Gone".to_string()),
+                        frame: None,
+                    }),
+                    ..Narrow::default()
+                },
+                refs: true,
+                present: &[],
+                absent: &[],
+                refusal: ERR_STALE_ELEMENT,
+            },
+        ];
+        for case in cases {
+            let result = render_narrow(&look, &case.narrow, case.refs);
+            if !case.refusal.is_empty() {
+                let err = format!(
+                    "{}",
+                    result
+                        .err()
+                        .unwrap_or_else(|| panic!("{}: the look must be refused", case.name))
+                );
+                assert!(
+                    err.starts_with(case.refusal),
+                    "{}: the refusal: {err}",
+                    case.name
+                );
+                continue;
+            }
+            let answer = result.unwrap_or_else(|e| panic!("{}: {e}", case.name));
+            for expected in case.present {
+                assert!(
+                    answer.contains(expected),
+                    "{}: the answer does not say {expected:?}: {answer}",
+                    case.name
+                );
+            }
+            for unexpected in case.absent {
+                assert!(
+                    !answer.contains(unexpected),
+                    "{}: the answer prints {unexpected:?}: {answer}",
+                    case.name
+                );
+            }
+        }
     }
 
     #[test]
@@ -4397,91 +4609,109 @@ mod tests {
         forget_look(&window_target("fresh2"));
     }
 
+    /// A tree after the change, and what the change answer must say about it.
+    struct ChangeCase {
+        name: &'static str,
+        after: Observation,
+        present: &'static [&'static str],
+        absent: &'static [&'static str],
+    }
+
     #[test]
     #[serial_test::serial(computer_looks)]
-    fn a_change_answer_pairs_by_kind_and_name_in_order() {
+    fn change_answer_cases() {
         let before = framed_observation();
-        let mut after = framed_observation();
-        // The OK button moved and its value changed; the Cancel button was renamed, which
-        // reads as one element gone and another appeared; a new field appeared.
-        after.root.children[0].frame = Some((70.0, 10.0, 80.0, 24.0));
-        after.root.children[0].value = Some("typed".to_string());
-        after.root.children[1].children[0].name = Some("Cancelled".to_string());
-        after.root.children.push(leaf("AXTextField", "Search"));
-
-        let answer = render_changes(
-            &look_of(&before, window_target("k")),
-            &after,
-            counts(&after.root),
-        );
-        assert!(
-            answer.contains("2 appeared, 1 disappeared, 1 moved, 1 changed value"),
-            "{answer}"
-        );
-        assert!(
-            answer.contains("Button \"OK\" from (10, 10) to (70, 10)"),
-            "{answer}"
-        );
-        assert!(answer.contains("Button \"Cancel\""), "{answer}");
-        assert!(answer.contains("Button \"Cancelled\""), "{answer}");
-        assert!(answer.contains("TextField \"Search\""), "{answer}");
-        assert!(answer.contains("changed value:"), "{answer}");
-
-        // A control that lost its press action and one that took the focus are reported
-        // too: both are what the observation prints of the element.
-        let mut restated = framed_observation();
-        restated.root.children[0].actions.clear();
-        restated.root.children[1].children[0].focused = true;
-        let answer = render_changes(
-            &look_of(&before, window_target("k")),
-            &restated,
-            counts(&restated.root),
-        );
-        assert!(
-            answer.contains("1 changed actions, 1 changed focus"),
-            "{answer}"
-        );
-        assert!(
-            answer.contains("Button \"OK\" — actions [press] → []"),
-            "{answer}"
-        );
-        assert!(
-            answer.contains("Button \"Cancel\" is focused now"),
-            "{answer}"
-        );
-
         // Nothing changed on an identical tree, and the answer says so.
+        assert!(
+            render_changes(
+                &look_of(&before, window_target("k")),
+                &before,
+                counts(&before.root)
+            )
+            .contains("nothing changed on this surface since the observation taken")
+        );
         let same = render_changes(
             &look_of(&before, window_target("k")),
             &before,
             counts(&before.root),
         );
         assert!(
-            same.contains("nothing changed on this surface since the observation taken"),
-            "{same}"
-        );
-        assert!(
             !same.contains("[e"),
             "a change answer prints no refs: {same}"
         );
-    }
+        // The OK button moved and its value changed; the Cancel button was renamed,
+        // which reads as one element gone and another appeared; a new field appeared.
+        let mut moved = framed_observation();
+        moved.root.children[0].frame = Some((70.0, 10.0, 80.0, 24.0));
+        moved.root.children[0].value = Some("typed".to_string());
+        moved.root.children[1].children[0].name = Some("Cancelled".to_string());
+        moved.root.children.push(leaf("AXTextField", "Search"));
 
-    #[test]
-    fn an_element_without_a_position_is_never_reported_as_moved() {
-        let before = framed_observation();
-        let mut after = sample_observation();
-        assert!(after.root.children[1].children[0].frame.is_none());
-        after.root.children[1].children[0].value = Some("other".to_string());
-        let answer = render_changes(
-            &look_of(&before, window_target("k")),
-            &after,
-            counts(&after.root),
-        );
-        assert!(!answer.contains("moved:"), "{answer}");
-        assert!(answer.contains("changed value:"), "{answer}");
-        // A side with no value says so, instead of a pair of quotes the observation never
-        // printed.
-        assert!(answer.contains("no value → \"other\""), "{answer}");
+        // A control that lost its press action and one that took the focus are
+        // reported too: both are what the observation prints of the element.
+        let mut restated = framed_observation();
+        restated.root.children[0].actions.clear();
+        restated.root.children[1].children[0].focused = true;
+
+        // A control whose position the read did not report — the answer never calls
+        // it moved, and a side with no value says so instead of a pair of quotes the
+        // observation never printed.
+        let mut unplaced = sample_observation();
+        assert!(unplaced.root.children[1].children[0].frame.is_none());
+        unplaced.root.children[1].children[0].value = Some("other".to_string());
+
+        let cases = vec![
+            ChangeCase {
+                name: "moves_renames_and_new_elements_are_paired",
+                after: moved,
+                present: &[
+                    "2 appeared, 1 disappeared, 1 moved, 1 changed value",
+                    "Button \"OK\" from (10, 10) to (70, 10)",
+                    "Button \"Cancel\"",
+                    "Button \"Cancelled\"",
+                    "TextField \"Search\"",
+                    "changed value:",
+                ],
+                absent: &[],
+            },
+            ChangeCase {
+                name: "actions_and_focus_are_restated",
+                after: restated,
+                present: &[
+                    "1 changed actions, 1 changed focus",
+                    "Button \"OK\" — actions [press] → []",
+                    "Button \"Cancel\" is focused now",
+                ],
+                absent: &[],
+            },
+            ChangeCase {
+                name: "an_unplaced_element_is_never_reported_as_moved",
+                after: unplaced,
+                present: &["changed value:", "no value → \"other\""],
+                absent: &["moved:"],
+            },
+        ];
+        for case in cases {
+            let answer = render_changes(
+                &look_of(&before, window_target("k")),
+                &case.after,
+                counts(&case.after.root),
+            );
+            for expected in case.present {
+                assert!(
+                    answer.contains(expected),
+                    "{}: the answer does not say {expected:?}: {answer}",
+                    case.name
+                );
+            }
+            for unexpected in case.absent {
+                assert!(
+                    !answer.contains(unexpected),
+                    "{}: the answer prints {unexpected:?}: {answer}",
+                    case.name
+                );
+            }
+        }
     }
 
     #[test]
@@ -4699,17 +4929,6 @@ mod tests {
     }
 
     #[test]
-    fn capture_size_refuses_what_a_capture_cannot_express() {
-        assert_eq!(
-            capture_size("a window still", 800, 600).unwrap(),
-            (800, 600)
-        );
-        assert!(capture_size("a window still", 0, 600).is_err());
-        let err = capture_size("a display frame", usize::MAX, 1).unwrap_err();
-        assert!(err.to_string().starts_with(ERR_DEGRADED), "{err}");
-    }
-
-    #[test]
     fn capture_budget_refuses_a_surface_it_cannot_hold() {
         let budget = CaptureBudget::default();
         // A wildly misreported display: the area a u32 rect can name is far past the
@@ -4797,26 +5016,6 @@ mod tests {
         assert_eq!(adopted.rgba.len(), 4 * 4 * 4);
         drop(adopted);
         assert_eq!(budget.remaining(), CAPTURE_BUDGET_PIXELS);
-    }
-
-    #[test]
-    fn impact_text_states_the_middle_outcome_without_advice_to_retry() {
-        assert_eq!(impact_text("clicked".to_string(), Impact::Done), "clicked");
-        assert_eq!(
-            impact_text(
-                "clicked".to_string(),
-                Impact::DoneWith("ctrl may still be held down".to_string()),
-            ),
-            "clicked — ctrl may still be held down"
-        );
-        let text = impact_text(
-            "clicked element e3".to_string(),
-            Impact::Unconfirmed("the call was abandoned".to_string()),
-        );
-        assert!(text.starts_with("applied but unconfirmed"), "{text}");
-        assert!(text.contains("may already have taken effect"), "{text}");
-        assert!(text.contains("act twice"), "{text}");
-        assert!(!text.contains("retry"), "{text}");
     }
 
     #[test]
@@ -4999,82 +5198,96 @@ mod tests {
         assert_eq!(scaled, surface(20.0, 40.0, 200.0, 100.0));
     }
 
-    #[test]
-    fn resolve_locator_path_hits_unique_and_not_found() {
-        let obs = sample_observation();
-        let root = &obs.root;
-        // Path [0] reaches the OK button → Path match (role + name agree).
-        let hit = resolve_locator(
-            root,
-            &Locator {
-                path: vec![0],
-                role: "button".to_string(),
-                name: Some("OK".to_string()),
-                frame: None,
-            },
-        );
-        assert!(matches!(hit, LocatorMatch::Path(_)));
-        // Path out of range → falls through to the search (button "OK" is unique).
-        let fallback = resolve_locator(
-            root,
-            &Locator {
-                path: vec![99],
-                role: "button".to_string(),
-                name: Some("OK".to_string()),
-                frame: None,
-            },
-        );
-        assert!(matches!(fallback, LocatorMatch::Unique(_)));
-        // Path node exists but role+name mismatch → search again.
-        let mismatch = resolve_locator(
-            root,
-            &Locator {
-                path: vec![1],
-                role: "button".to_string(),
-                name: Some("OK".to_string()),
-                frame: None,
-            },
-        );
-        assert!(matches!(mismatch, LocatorMatch::Unique(_)));
-        // No node matches → NotFound.
-        let none = resolve_locator(
-            root,
-            &Locator {
-                path: Vec::new(),
-                role: "AXSlider".to_string(),
-                name: None,
-                frame: None,
-            },
-        );
-        assert!(matches!(none, LocatorMatch::NotFound));
+    /// A locator and the decision it must reach against the sample surface.
+    struct LocatorCase {
+        name: &'static str,
+        locator: Locator,
+        /// `"path"`, `"unique"`, `"ambiguous"` or `"not-found"`.
+        decision: &'static str,
     }
 
     #[test]
-    fn resolve_locator_ambiguous_when_many_match() {
+    fn locator_cases() {
         let obs = sample_observation();
         let root = &obs.root;
-        // Two buttons match the role with no name constraint → ambiguous.
-        let all_buttons = resolve_locator(
-            root,
-            &Locator {
-                path: Vec::new(),
-                role: "AXButton".to_string(),
-                name: None,
-                frame: None,
+        let cases = [
+            LocatorCase {
+                // Path [0] reaches the OK button → Path match (role + name agree).
+                name: "a_path_that_names_the_element",
+                locator: Locator {
+                    path: vec![0],
+                    role: "button".to_string(),
+                    name: Some("OK".to_string()),
+                    frame: None,
+                },
+                decision: "path",
             },
-        );
-        assert!(matches!(all_buttons, LocatorMatch::Ambiguous));
-        // A path that pins one of them wins over the ambiguity.
-        let pinned = resolve_locator(
-            root,
-            &Locator {
-                path: vec![0],
-                role: "AXButton".to_string(),
-                name: None,
-                frame: None,
+            LocatorCase {
+                // Path out of range → falls through to the search (button "OK" is
+                // unique).
+                name: "a_path_out_of_range_falls_through_to_the_search",
+                locator: Locator {
+                    path: vec![99],
+                    role: "button".to_string(),
+                    name: Some("OK".to_string()),
+                    frame: None,
+                },
+                decision: "unique",
             },
-        );
-        assert!(matches!(pinned, LocatorMatch::Path(_)));
+            LocatorCase {
+                // The path's node exists but its role and name disagree → search again.
+                name: "a_path_whose_element_moved_on_is_searched_again",
+                locator: Locator {
+                    path: vec![1],
+                    role: "button".to_string(),
+                    name: Some("OK".to_string()),
+                    frame: None,
+                },
+                decision: "unique",
+            },
+            LocatorCase {
+                // No node matches → NotFound.
+                name: "nothing_matches",
+                locator: Locator {
+                    path: Vec::new(),
+                    role: "AXSlider".to_string(),
+                    name: None,
+                    frame: None,
+                },
+                decision: "not-found",
+            },
+            LocatorCase {
+                // Two buttons match the role with no name constraint → ambiguous.
+                name: "several_elements_match",
+                locator: Locator {
+                    path: Vec::new(),
+                    role: "AXButton".to_string(),
+                    name: None,
+                    frame: None,
+                },
+                decision: "ambiguous",
+            },
+            LocatorCase {
+                // A path that pins one of them wins over the ambiguity.
+                name: "a_pinning_path_wins_over_the_ambiguity",
+                locator: Locator {
+                    path: vec![0],
+                    role: "AXButton".to_string(),
+                    name: None,
+                    frame: None,
+                },
+                decision: "path",
+            },
+        ];
+        for case in cases {
+            let decision = match resolve_locator(root, &case.locator) {
+                LocatorMatch::Path(_) => "path",
+                LocatorMatch::Unique(_) => "unique",
+                LocatorMatch::Ambiguous => "ambiguous",
+                LocatorMatch::NotFound => "not-found",
+            };
+            assert_eq!(decision, case.decision, "{}: the decision", case.name);
+        }
     }
 
     #[test]
@@ -5110,70 +5323,131 @@ mod tests {
         assert!(format!("{err}").contains("too many key names"), "got {err}");
     }
 
+    /// The middle outcome is stated as delivered-but-unconfirmed, never as a failure
+    /// to repeat; a note added to an outcome never upgrades a delivered one.
     #[test]
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn a_share_cannot_outlive_its_call_or_lengthen_a_short_one() {
-        let call = Budget::new(
-            Duration::from_secs(10),
-            "window listing",
-            "the running applications",
+    fn impact_text_states_the_middle_outcome_without_advice_to_retry() {
+        assert_eq!(impact_text("clicked".to_string(), Impact::Done), "clicked");
+        assert_eq!(
+            impact_text(
+                "clicked".to_string(),
+                Impact::DoneWith("ctrl may still be held down".to_string()),
+            ),
+            "clicked — ctrl may still be held down",
+            "a delivered note is appended"
         );
-        // A share asking for more than the call has ends with the call.
-        let long = call.slice(Duration::from_secs(60), "the windows of Numbers");
-        assert_eq!(long.end, call.end);
-        assert!(long.limit <= call.limit);
-        // A share asking for less keeps its own, shorter end.
-        let short = call.slice(Duration::ZERO, "the windows of Numbers");
-        assert_eq!(short.limit, Duration::ZERO);
-        assert!(short.expired());
-        assert!(!call.expired());
+        let text = impact_text(
+            "clicked element e3".to_string(),
+            Impact::Unconfirmed("the call was abandoned".to_string()),
+        );
+        assert!(text.starts_with("applied but unconfirmed"), "{text}");
+        assert!(text.contains("may already have taken effect"), "{text}");
+        assert!(text.contains("act twice"), "{text}");
+        assert!(!text.contains("retry"), "{text}");
+
+        // A note records one more fact without changing what the outcome says: a
+        // delivered call stays delivered (DoneWith, never Unconfirmed), and an
+        // unconfirmed one stays unconfirmed.
+        let delivered = impact_note(Impact::Done, "the probe failed".to_string());
+        assert!(
+            matches!(&delivered, Impact::DoneWith(note) if note == "the probe failed"),
+            "impact_note never upgrades a delivered outcome"
+        );
+        let delivered_with = impact_note(
+            Impact::DoneWith("ctrl may still be held".to_string()),
+            "the probe failed".to_string(),
+        );
+        assert!(
+            matches!(&delivered_with, Impact::DoneWith(note) if note == "ctrl may still be held; the probe failed"),
+            "a delivered note accumulates as a delivered note"
+        );
+        let unconfirmed = impact_note(
+            Impact::Unconfirmed("abandoned".to_string()),
+            "the probe failed".to_string(),
+        );
+        assert!(
+            matches!(&unconfirmed, Impact::Unconfirmed(note) if note == "abandoned; the probe failed"),
+            "an unconfirmed outcome stays unconfirmed"
+        );
+    }
+
+    /// One application's share of a call: what it may cost, and what running out of
+    /// it says — a skipped item, never an abandoned call.
+    struct ShareCase {
+        name: &'static str,
+        /// The call's own budget, in seconds.
+        call: u64,
+        /// The share it hands to one application, in seconds.
+        share: u64,
     }
 
     #[test]
-    fn a_spent_call_says_it_was_abandoned_and_names_the_target() {
-        let call = Budget::new(Duration::ZERO, "window listing", "the windows of Numbers");
-        let text = format!("{:#}", call.check().expect_err("the clock is spent"));
-        assert!(text.starts_with("degraded: "), "{text}");
-        assert!(
-            text.contains("the windows of Numbers stopped answering accessibility requests"),
-            "{text}"
-        );
-        assert!(
-            text.contains("the window listing was abandoned after 0s"),
-            "{text}"
-        );
-    }
-
-    #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn a_spent_share_says_the_item_was_skipped_not_the_call_abandoned() {
-        let call = Budget::new(
-            Duration::from_secs(20),
-            "window listing",
-            "the running applications",
-        );
-        let share = call.slice(Duration::ZERO, "the windows of Numbers");
-        let note = share.note();
-        assert!(
-            note.contains("the windows of Numbers stopped answering accessibility requests"),
-            "{note}"
-        );
-        assert!(
-            note.contains("it was skipped, so the window listing went on without it"),
-            "{note}"
-        );
-        // A share never speaks for the call: the model must not be told to retry a call
-        // that returned results, nor read the skipped application as the call failing.
-        assert!(!note.contains("abandoned"), "{note}");
-        assert!(!note.contains("retry"), "{note}");
-        // The listing renders an expired share as "skipped" and anything else as itself.
-        assert_eq!(
-            unread_reason(&anyhow!("window refused"), &share),
-            SKIPPED_NOTE
-        );
-        assert_eq!(
-            unread_reason(&anyhow!("window refused"), &call),
-            "window refused"
-        );
+    fn share_budget_cases() {
+        for case in [
+            ShareCase {
+                name: "a_share_asking_for_more_than_the_call_has",
+                call: 10,
+                share: 60,
+            },
+            ShareCase {
+                name: "a_spent_share",
+                call: 20,
+                share: 0,
+            },
+        ] {
+            let call = Budget::new(
+                Duration::from_secs(case.call),
+                "window listing",
+                "the running applications",
+            );
+            let share = call.slice(Duration::from_secs(case.share), "the windows of Numbers");
+            // A share asking for more than the call has ends with the call; one asking
+            // for less keeps its own, shorter end.
+            if case.share > case.call {
+                assert_eq!(share.end, call.end, "{}: the shared end", case.name);
+            }
+            assert!(share.end <= call.end, "{}: the call's end", case.name);
+            assert!(share.limit <= call.limit, "{}: the call's limit", case.name);
+
+            if case.share == 0 {
+                assert_eq!(
+                    share.limit,
+                    Duration::ZERO,
+                    "{}: the spent share",
+                    case.name
+                );
+                assert!(share.expired(), "{}: the share is spent", case.name);
+                assert!(!call.expired(), "{}: the call is not", case.name);
+            }
+
+            let note = share.note();
+            assert!(
+                note.contains("the windows of Numbers stopped answering accessibility requests"),
+                "{}: {note}",
+                case.name
+            );
+            // A share never speaks for the call: the model must not be told to retry a
+            // call that returned results, nor read the skipped application as the call
+            // failing.
+            assert!(!note.contains("abandoned"), "{}: {note}", case.name);
+            assert!(!note.contains("retry"), "{}: {note}", case.name);
+
+            // The listing renders an expired share as "skipped" and anything else as
+            // itself.
+            let refused = anyhow!("window refused");
+            let reason = unread_reason(&refused, &share);
+            if case.share == 0 {
+                assert_eq!(reason, SKIPPED_NOTE, "{}: a spent share", case.name);
+            } else {
+                assert_eq!(reason, "window refused", "{}: an unspent share", case.name);
+            }
+            assert_eq!(
+                unread_reason(&refused, &call),
+                "window refused",
+                "{}: the call itself",
+                case.name
+            );
+        }
     }
 }

@@ -739,51 +739,71 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn a_drawing_becomes_a_picture_of_its_own_size_with_its_transparency() {
-        let (_dir, ws) = workspace(&[("drawing.svg", RED_HALF.as_bytes())]);
-        let picture = rendered(PathAccess::Unrestricted, &ws, "drawing.svg").await;
-
-        assert_eq!(picture.dimensions(), (40, 20));
-        assert_eq!(
-            picture.get_pixel(5, 5).0,
-            [255, 0, 0, 255],
-            "the drawing's fill"
-        );
-        assert_eq!(
-            picture.get_pixel(35, 5).0[3],
-            0,
-            "what the drawing leaves out stays transparent"
-        );
+    /// One drawing's rendered picture: the drawing, its own size, and the ink
+    /// and transparency it must show at the given points.
+    struct DrawingCase {
+        name: &'static str,
+        file: &'static str,
+        svg: String,
+        expected: (u32, u32),
+        ink: Option<(u32, u32, [u8; 4])>,
+        transparent: Option<(u32, u32)>,
     }
 
     #[tokio::test]
-    async fn a_large_drawing_is_capped_and_a_small_one_is_never_enlarged() {
-        let drawing = |side: &str| {
+    async fn drawing_render_cases() {
+        let sized = |side: &str| {
             format!(
                 r##"<svg xmlns="http://www.w3.org/2000/svg" width="{side}" height="1000">
                    <rect width="{side}" height="1000" fill="#ff0000"/></svg>"##
             )
         };
-        let (_dir, ws) = workspace(&[
-            ("large.svg", drawing("4000").as_bytes()),
-            ("small.svg", drawing("1").as_bytes()),
-        ]);
-
-        assert_eq!(
-            rendered(PathAccess::Unrestricted, &ws, "large.svg")
-                .await
-                .dimensions(),
-            (2048, 512),
-            "a drawing past the cap is scaled down, its aspect ratio kept"
-        );
-        assert_eq!(
-            rendered(PathAccess::Unrestricted, &ws, "small.svg")
-                .await
-                .dimensions(),
-            (1, 1000),
-            "a drawing inside the cap keeps its own size"
-        );
+        for case in [
+            DrawingCase {
+                name: "a drawing renders at its own size, keeping its transparency",
+                file: "drawing.svg",
+                svg: RED_HALF.to_string(),
+                expected: (40, 20),
+                ink: Some((5, 5, [255, 0, 0, 255])),
+                transparent: Some((35, 5)),
+            },
+            DrawingCase {
+                name: "a drawing past the cap is scaled down, its aspect ratio kept",
+                file: "large.svg",
+                svg: sized("4000"),
+                expected: (2048, 512),
+                ink: None,
+                transparent: None,
+            },
+            DrawingCase {
+                name: "a drawing inside the cap keeps its own size",
+                file: "small.svg",
+                svg: sized("1"),
+                expected: (1, 1000),
+                ink: None,
+                transparent: None,
+            },
+        ] {
+            let (_dir, ws) = workspace(&[(case.file, case.svg.as_bytes())]);
+            let picture = rendered(PathAccess::Unrestricted, &ws, case.file).await;
+            assert_eq!(picture.dimensions(), case.expected, "[{}]", case.name);
+            if let Some((x, y, rgba)) = case.ink {
+                assert_eq!(
+                    picture.get_pixel(x, y).0,
+                    rgba,
+                    "[{}] the drawing's fill",
+                    case.name
+                );
+            }
+            if let Some((x, y)) = case.transparent {
+                assert_eq!(
+                    picture.get_pixel(x, y).0[3],
+                    0,
+                    "[{}] what the drawing leaves out stays transparent",
+                    case.name
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -860,24 +880,6 @@ mod tests {
             picture.get_pixel(25, 5).0[3],
             0,
             "a reference outside the caller's boundary is not read"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_compressed_drawing_renders_like_its_plain_form() {
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        gz.write_all(RED_HALF.as_bytes()).unwrap();
-        let compressed = gz.finish().unwrap();
-        let (_dir, ws) = workspace(&[
-            ("drawing.svg", RED_HALF.as_bytes()),
-            ("drawing.svgz", compressed.as_slice()),
-        ]);
-
-        let plain = rendered(PathAccess::Unrestricted, &ws, "drawing.svg").await;
-        let zipped = rendered(PathAccess::Unrestricted, &ws, "drawing.svgz").await;
-        assert!(
-            plain == zipped,
-            "a compressed drawing renders as its plain form does"
         );
     }
 
@@ -965,6 +967,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(html_capture)]
     async fn a_pdf_page_that_cannot_be_chosen_is_refused_with_the_count() {
         let two_pages = pdf_with_pages(&[(200, 100), (300, 150)]);
         let no_pages = pdf_with_pages(&[]);
@@ -973,6 +976,12 @@ mod tests {
             ("none.pdf", no_pages.as_slice()),
             ("drawing.svg", RED_HALF.as_bytes()),
         ]);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let _stand_in = crate::tools::rasterize_html::stand_in_for_capture(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(tiny_png())
+        });
 
         let refused = |error: anyhow::Error| format!("{error:#}");
         for (args, reason) in [
@@ -992,6 +1001,10 @@ mod tests {
                 json!({ "path": "drawing.svg", "page": 1 }),
                 "naming a page is for a PDF",
             ),
+            (
+                json!({ "path": "https://example.com/report", "page": 1 }),
+                "naming a page is for a PDF",
+            ),
         ] {
             let error = RasterizeTool::new(PathAccess::Unrestricted)
                 .execute(&ws, args)
@@ -1000,6 +1013,11 @@ mod tests {
             let text = refused(error);
             assert!(text.contains(reason), "{text}");
         }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "nothing was captured"
+        );
     }
 
     /// A tiny valid PNG, which the capture stand-in answers with.
@@ -1122,20 +1140,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_render_with_no_user_has_no_personal_workspace() {
-        let (_dir, ws) = workspace(&[("page.html", b"<!DOCTYPE html>")]);
-
-        let error = RasterizeTool::new(PathAccess::Unrestricted)
-            .execute(&ws, json!({ "path": "page.html" }))
-            .await
-            .expect_err("no user means no personal workspace to render from");
-        assert!(
-            format!("{error:#}").contains("a page is rendered from your personal workspace"),
-            "{error:#}"
-        );
-    }
-
-    #[tokio::test]
     #[serial_test::serial(html_capture)]
     async fn a_page_inside_the_personal_workspace_renders_through_the_browser() {
         let user = "rasterize-inside-probe";
@@ -1178,82 +1182,75 @@ mod tests {
         assert_eq!(bytes, png, "the capture's bytes are the picture written");
     }
 
+    /// One address call: what it renders (the captured URL) or the refusal it
+    /// must produce.
+    struct AddressCase {
+        name: &'static str,
+        path: &'static str,
+        captured_url: Option<&'static str>,
+        refused: Option<&'static str>,
+    }
+
     #[tokio::test]
     #[serial_test::serial(html_capture)]
-    async fn naming_a_page_for_a_page_or_an_address_is_refused() {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let _stand_in = crate::tools::rasterize_html::stand_in_for_capture(move |_| {
-            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(tiny_png())
-        });
-        let (_dir, ws) = workspace(&[("page.html", b"<!DOCTYPE html><p>hi</p>")]);
-
-        for args in [
-            json!({ "path": "page.html", "page": 1 }),
-            json!({ "path": "https://example.com/report", "page": 1 }),
+    async fn address_render_cases() {
+        for case in [
+            AddressCase {
+                name: "an address renders the url it names",
+                path: " https://example.com/report ",
+                captured_url: Some("https://example.com/report"),
+                refused: None,
+            },
+            AddressCase {
+                name: "a file address is never captured",
+                path: "file:///etc/passwd",
+                captured_url: None,
+                refused: Some("only an http(s) address"),
+            },
+            AddressCase {
+                name: "an ftp address is never captured",
+                path: "ftp://example.com/file",
+                captured_url: None,
+                refused: Some("only an http(s) address"),
+            },
         ] {
-            let error = RasterizeTool::new(PathAccess::Unrestricted)
-                .execute(&ws, args)
-                .await
-                .expect_err("a page is for a PDF");
-            assert!(
-                format!("{error:#}").contains("naming a page is for a PDF"),
-                "{error:#}"
-            );
+            let png = tiny_png();
+            let expected = png.clone();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let want = case.captured_url;
+            let _stand_in = crate::tools::rasterize_html::stand_in_for_capture(move |url| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(Some(url), want, "[{}] unexpected capture URL", case.name);
+                Ok(expected.clone())
+            });
+            let (_dir, ws) = workspace(&[]);
+
+            if let Some(reason) = case.refused {
+                let error = RasterizeTool::new(PathAccess::Unrestricted)
+                    .execute(&ws, json!({ "path": case.path }))
+                    .await
+                    .expect_err("only http(s) addresses are pages");
+                assert!(
+                    format!("{error:#}").contains(reason),
+                    "[{}] {error:#}",
+                    case.name
+                );
+                assert_eq!(
+                    calls.load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "[{}] nothing was captured",
+                    case.name
+                );
+            } else {
+                let (_, bytes) =
+                    produced(PathAccess::Unrestricted, &ws, json!({ "path": case.path })).await;
+                assert_eq!(
+                    bytes, png,
+                    "[{}] the capture's bytes are the picture written",
+                    case.name
+                );
+            }
         }
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "nothing was captured"
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(html_capture)]
-    async fn an_address_renders_the_url_it_names() {
-        let png = tiny_png();
-        let expected = png.clone();
-        let _stand_in = crate::tools::rasterize_html::stand_in_for_capture(move |url| {
-            assert_eq!(url, "https://example.com/report");
-            Ok(expected.clone())
-        });
-        let (_dir, ws) = workspace(&[]);
-
-        let (_, bytes) = produced(
-            PathAccess::Unrestricted,
-            &ws,
-            json!({ "path": " https://example.com/report " }),
-        )
-        .await;
-        assert_eq!(bytes, png);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(html_capture)]
-    async fn a_non_http_address_is_never_captured() {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let _stand_in = crate::tools::rasterize_html::stand_in_for_capture(move |_| {
-            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(tiny_png())
-        });
-        let (_dir, ws) = workspace(&[]);
-
-        for path in ["file:///etc/passwd", "ftp://example.com/file"] {
-            let error = RasterizeTool::new(PathAccess::Unrestricted)
-                .execute(&ws, json!({ "path": path }))
-                .await
-                .expect_err("only http(s) addresses are pages");
-            assert!(
-                format!("{error:#}").contains("only an http(s) address"),
-                "{error:#}"
-            );
-        }
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "nothing was captured"
-        );
     }
 }

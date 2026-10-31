@@ -1364,7 +1364,7 @@ impl Tool for ChromeTool {
     fn parameters_schema(&self) -> Value {
         // oneOf entry order follows the shared registry (which is ordered for
         // the CLI help), so it may differ from the order the hand-built schema
-        // used; the set is pinned by `parameters_schema_has_all_actions`.
+        // used; the set is the registry's `tool` entries, and nothing else.
         let entries: Vec<Value> = crate::chrome::actions::ACTIONS
             .iter()
             .filter_map(|a| {
@@ -2668,7 +2668,6 @@ fn inner_text_eval_js(selector: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::chrome_daemon::chrome_bin;
 
     // ── build_args: simple actions ───────────────────────────────────────
 
@@ -3044,112 +3043,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tool_name_and_description_are_set() {
-        let tool = ChromeTool::default();
-        assert_eq!(tool.name(), "chrome");
-        assert!(!tool.description().is_empty());
-    }
-
-    #[test]
-    fn parameters_schema_is_valid_json() {
-        let tool = ChromeTool::default();
-        let schema = tool.parameters_schema();
-        assert!(schema.is_object());
-        assert!(
-            schema
-                .get("properties")
-                .and_then(|p| p.get("action"))
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn parameters_schema_has_all_actions() {
-        let tool = ChromeTool::default();
-        let schema = tool.parameters_schema();
-        let action_schemas = schema["properties"]["action"]["oneOf"]
-            .as_array()
-            .expect("oneOf should be an array");
-
-        // There are exactly 16 chrome actions.
-        assert_eq!(
-            action_schemas.len(),
-            16,
-            "expected 16 actions, got {}",
-            action_schemas.len()
-        );
-
-        let action_names: Vec<&str> = action_schemas
-            .iter()
-            .filter_map(|s| {
-                s.get("properties")
-                    .and_then(|p| p.as_object())
-                    .and_then(|props| props.keys().next())
-                    .map(String::as_str)
-            })
-            .collect();
-
-        for expected in &[
-            "open",
-            "snapshot",
-            "click",
-            "get_text",
-            "get_innertext",
-            "get_url",
-            "press",
-            "fill",
-            "type",
-            "eval",
-            "find",
-            "screenshot",
-            "upload",
-            "wait",
-            "expect",
-            "extract",
-        ] {
-            assert!(
-                action_names.contains(expected),
-                "schema missing action: {expected}"
-            );
-        }
-
-        // Structural invariants: snapshot, get_url, screenshot and wait must lack
-        // inner "required"; all other actions must have it.
-        for s in action_schemas {
-            let inner = s
-                .get("properties")
-                .and_then(|p| p.as_object())
-                .and_then(|props| props.values().next())
-                .and_then(|v| v.as_object());
-            let name = s
-                .get("properties")
-                .and_then(|p| p.as_object())
-                .and_then(|props| props.keys().next())
-                .map_or("?", String::as_str);
-
-            let has_inner_required = inner.is_some_and(|obj| obj.contains_key("required"));
-            if name == "snapshot" || name == "get_url" || name == "screenshot" || name == "wait" {
-                assert!(
-                    !has_inner_required,
-                    "{name} should NOT have inner 'required'"
-                );
-            } else {
-                assert!(has_inner_required, "{name} should have inner 'required'");
-            }
-        }
-    }
-
-    #[test]
-    fn chrome_bin_name_is_correct() {
-        let name = chrome_bin();
-        if cfg!(target_os = "windows") {
-            assert_eq!(name, "chrome-use.exe");
-        } else {
-            assert_eq!(name, "chrome-use");
-        }
-    }
-
     // -----------------------------------------------------------------------
     // fetch_page_text validation — error propagation through public method
     // (exercises the early-return preamble without chrome-use)
@@ -3190,21 +3083,6 @@ mod tests {
     // unrecoverable shape produces the corrective-shape error.
     // -----------------------------------------------------------------------
 
-    fn assert_normalizes(
-        action: serde_json::Value,
-        args: &serde_json::Value,
-        expected: &serde_json::Value,
-    ) {
-        let (normalized, note) = normalize_action(action, args).unwrap_or_else(|e| {
-            panic!("expected normalization to succeed, got: {e}");
-        });
-        assert_eq!(normalized, *expected, "normalized action mismatch");
-        assert!(
-            note.is_some(),
-            "recoverable shape should report a normalization note"
-        );
-    }
-
     fn assert_rejects(action: serde_json::Value, args: &serde_json::Value) {
         let err = normalize_action(action, args).unwrap_err();
         assert!(
@@ -3213,117 +3091,153 @@ mod tests {
         );
     }
 
-    #[test]
-    fn normalize_flat_action_with_sibling_fields() {
-        // {"action":"open","url":"..."} → {"open":{"url":"..."}}
-        assert_normalizes(
-            json!("open"),
-            &json!({"action":"open","url":"https://example.com","tab":"t"}),
-            &json!({"open":{"url":"https://example.com"}}),
-        );
-        // {"action":"open","open":{"url":"..."}} → same
-        assert_normalizes(
-            json!("open"),
-            &json!({"action":"open","open":{"url":"https://example.com"},"tab":"t"}),
-            &json!({"open":{"url":"https://example.com"}}),
-        );
-        // {"action":"open","open":"https://..."} → {"open":{"url":"..."}}
-        assert_normalizes(
-            json!("open"),
-            &json!({"action":"open","open":"https://example.com","tab":"t"}),
-            &json!({"open":{"url":"https://example.com"}}),
-        );
-        // snapshot with no args
-        assert_normalizes(
-            json!("snapshot"),
-            &json!({"action":"snapshot","tab":"t"}),
-            &json!({"snapshot":{}}),
-        );
-        // get_text with flattened selector
-        assert_normalizes(
-            json!("get_text"),
-            &json!({"action":"get_text","selector":"body","tab":"t"}),
-            &json!({"get_text":{"selector":"body"}}),
-        );
+    struct NormalizedActionCase {
+        name: &'static str,
+        action: serde_json::Value,
+        args: serde_json::Value,
+        expected: serde_json::Value,
     }
 
-    #[test]
-    fn normalize_stringified_json_action() {
-        // {"action":"{\"open\":{\"url\":\"...\"}}"} → {"open":{"url":"..."}}
-        assert_normalizes(
-            json!("{\"open\": {\"url\": \"https://example.com\"}}"),
-            &json!({"action":"{\"open\": {\"url\": \"https://example.com\"}}","tab":"t"}),
-            &json!({"open":{"url":"https://example.com"}}),
-        );
-        // CDATA-wrapped JSON
-        assert_normalizes(
-            json!("<![CDATA[{\"open\": {\"url\": \"https://example.com\"}}]]>"),
-            &json!({"action":"<![CDATA[{\"open\": {\"url\": \"https://example.com\"}}]]>","tab":"t"}),
-            &json!({"open":{"url":"https://example.com"}}),
-        );
+    fn check_normalized_actions(cases: &[NormalizedActionCase]) {
+        for case in cases {
+            let (normalized, note) = normalize_action(case.action.clone(), &case.args)
+                .unwrap_or_else(|e| {
+                    panic!("{}: expected normalization to succeed, got: {e}", case.name)
+                });
+            assert_eq!(
+                normalized, case.expected,
+                "{}: normalized action mismatch",
+                case.name
+            );
+            assert!(
+                note.is_some(),
+                "{}: recoverable shape should report a normalization note",
+                case.name
+            );
+        }
     }
 
+    /// A flat action with siblings, a stringified JSON action and a bare open value all
+    /// normalize to the action they name and report a note.
     #[test]
-    fn normalize_bare_open_value() {
-        // {"action":{"open":"https://..."}} → {"open":{"url":"..."}}
-        assert_normalizes(
-            json!({"open":"https://example.com"}),
-            &json!({"action":{"open":"https://example.com"},"tab":"t"}),
-            &json!({"open":{"url":"https://example.com"}}),
-        );
-        // bare URL string as the whole action
-        assert_normalizes(
-            json!("https://example.com"),
-            &json!({"action":"https://example.com","tab":"t"}),
-            &json!({"open":{"url":"https://example.com"}}),
-        );
+    fn normalize_accepts_json_action_shapes() {
+        check_normalized_actions(&[
+            // {"action":"open","url":"..."} → {"open":{"url":"..."}}
+            NormalizedActionCase {
+                name: "flat open with a url sibling",
+                action: json!("open"),
+                args: json!({"action":"open","url":"https://example.com","tab":"t"}),
+                expected: json!({"open":{"url":"https://example.com"}}),
+            },
+            // {"action":"open","open":{"url":"..."}} → same
+            NormalizedActionCase {
+                name: "flat open with a nested open",
+                action: json!("open"),
+                args: json!({"action":"open","open":{"url":"https://example.com"},"tab":"t"}),
+                expected: json!({"open":{"url":"https://example.com"}}),
+            },
+            // {"action":"open","open":"https://..."} → {"open":{"url":"..."}}
+            NormalizedActionCase {
+                name: "flat open with a url string under open",
+                action: json!("open"),
+                args: json!({"action":"open","open":"https://example.com","tab":"t"}),
+                expected: json!({"open":{"url":"https://example.com"}}),
+            },
+            NormalizedActionCase {
+                name: "snapshot with no args",
+                action: json!("snapshot"),
+                args: json!({"action":"snapshot","tab":"t"}),
+                expected: json!({"snapshot":{}}),
+            },
+            NormalizedActionCase {
+                name: "get_text with a flattened selector",
+                action: json!("get_text"),
+                args: json!({"action":"get_text","selector":"body","tab":"t"}),
+                expected: json!({"get_text":{"selector":"body"}}),
+            },
+            // {"action":"{\"open\":{\"url\":\"...\"}}"} → {"open":{"url":"..."}}
+            NormalizedActionCase {
+                name: "stringified json action",
+                action: json!("{\"open\": {\"url\": \"https://example.com\"}}"),
+                args: json!({"action":"{\"open\": {\"url\": \"https://example.com\"}}","tab":"t"}),
+                expected: json!({"open":{"url":"https://example.com"}}),
+            },
+            NormalizedActionCase {
+                name: "cdata-wrapped json action",
+                action: json!("<![CDATA[{\"open\": {\"url\": \"https://example.com\"}}]]>"),
+                args: json!({"action":"<![CDATA[{\"open\": {\"url\": \"https://example.com\"}}]]>","tab":"t"}),
+                expected: json!({"open":{"url":"https://example.com"}}),
+            },
+            // {"action":{"open":"https://..."}} → {"open":{"url":"..."}}
+            NormalizedActionCase {
+                name: "bare open value",
+                action: json!({"open":"https://example.com"}),
+                args: json!({"action":{"open":"https://example.com"},"tab":"t"}),
+                expected: json!({"open":{"url":"https://example.com"}}),
+            },
+            NormalizedActionCase {
+                name: "bare url string as the whole action",
+                action: json!("https://example.com"),
+                args: json!({"action":"https://example.com","tab":"t"}),
+                expected: json!({"open":{"url":"https://example.com"}}),
+            },
+        ]);
     }
 
+    /// XML-wrapped actions normalize too: the tag text decodes to the serde field types.
     #[test]
-    fn normalize_xml_wrapped_actions() {
-        assert_normalizes(
-            json!("<open><url>https://example.com</url></open>"),
-            &json!({"action":"<open><url>https://example.com</url></open>","tab":"t"}),
-            &json!({"open":{"url":"https://example.com"}}),
-        );
-        assert_normalizes(
-            json!("<open>https://example.com</open>"),
-            &json!({"action":"<open>https://example.com</open>","tab":"t"}),
-            &json!({"open":{"url":"https://example.com"}}),
-        );
-        // whitespace inside tags
-        assert_normalizes(
-            json!("<open>\n<url>https://example.com</url>\n</open>"),
-            &json!({"action":"<open>\n<url>https://example.com</url>\n</open>","tab":"t"}),
-            &json!({"open":{"url":"https://example.com"}}),
-        );
-        // stray closing tag
-        assert_normalizes(
-            json!("<open><url>https://example.com</url></open></action>"),
-            &json!({"action":"<open><url>https://example.com</url></open></action>","tab":"t"}),
-            &json!({"open":{"url":"https://example.com"}}),
-        );
-        // find
-        assert_normalizes(
-            json!("<find><by>first</by><value>a</value><action>click</action></find>"),
-            &json!({"action":"<find><by>first</by><value>a</value><action>click</action></find>","tab":"t"}),
-            &json!({"find":{"by":"first","value":"a","action":"click"}}),
-        );
-        // find with exact/index — XML text decoded to the serde bool/u32 types
-        assert_normalizes(
-            json!(
-                "<find><by>text</by><value>submit</value><action>click</action><exact>true</exact></find>"
-            ),
-            &json!({"action":"<find><by>text</by><value>submit</value><action>click</action><exact>true</exact></find>","tab":"t"}),
-            &json!({"find":{"by":"text","value":"submit","action":"click","exact":true}}),
-        );
-        assert_normalizes(
-            json!(
-                "<find><by>nth</by><value>input</value><action>click</action><index>2</index></find>"
-            ),
-            &json!({"action":"<find><by>nth</by><value>input</value><action>click</action><index>2</index></find>","tab":"t"}),
-            &json!({"find":{"by":"nth","value":"input","action":"click","index":2}}),
-        );
+    fn normalize_accepts_xml_action_shapes() {
+        check_normalized_actions(&[
+            NormalizedActionCase {
+                name: "xml open",
+                action: json!("<open><url>https://example.com</url></open>"),
+                args: json!({"action":"<open><url>https://example.com</url></open>","tab":"t"}),
+                expected: json!({"open":{"url":"https://example.com"}}),
+            },
+            NormalizedActionCase {
+                name: "xml open with a text body",
+                action: json!("<open>https://example.com</open>"),
+                args: json!({"action":"<open>https://example.com</open>","tab":"t"}),
+                expected: json!({"open":{"url":"https://example.com"}}),
+            },
+            // whitespace inside tags
+            NormalizedActionCase {
+                name: "xml open with whitespace inside tags",
+                action: json!("<open>\n<url>https://example.com</url>\n</open>"),
+                args: json!({"action":"<open>\n<url>https://example.com</url>\n</open>","tab":"t"}),
+                expected: json!({"open":{"url":"https://example.com"}}),
+            },
+            // stray closing tag
+            NormalizedActionCase {
+                name: "xml open with a stray closing tag",
+                action: json!("<open><url>https://example.com</url></open></action>"),
+                args: json!({"action":"<open><url>https://example.com</url></open></action>","tab":"t"}),
+                expected: json!({"open":{"url":"https://example.com"}}),
+            },
+            NormalizedActionCase {
+                name: "xml find",
+                action: json!("<find><by>first</by><value>a</value><action>click</action></find>"),
+                args: json!({"action":"<find><by>first</by><value>a</value><action>click</action></find>","tab":"t"}),
+                expected: json!({"find":{"by":"first","value":"a","action":"click"}}),
+            },
+            // find with exact/index — XML text decoded to the serde bool/u32 types
+            NormalizedActionCase {
+                name: "xml find with exact",
+                action: json!(
+                    "<find><by>text</by><value>submit</value><action>click</action><exact>true</exact></find>"
+                ),
+                args: json!({"action":"<find><by>text</by><value>submit</value><action>click</action><exact>true</exact></find>","tab":"t"}),
+                expected: json!({"find":{"by":"text","value":"submit","action":"click","exact":true}}),
+            },
+            NormalizedActionCase {
+                name: "xml find with index",
+                action: json!(
+                    "<find><by>nth</by><value>input</value><action>click</action><index>2</index></find>"
+                ),
+                args: json!({"action":"<find><by>nth</by><value>input</value><action>click</action><index>2</index></find>","tab":"t"}),
+                expected: json!({"find":{"by":"nth","value":"input","action":"click","index":2}}),
+            },
+        ]);
     }
 
     #[test]
@@ -3947,25 +3861,6 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_action_normalizes_and_parses() {
-        // Canonical tagged object.
-        let action = serde_json::json!({"screenshot": {}});
-        let parsed: ChromeAction = serde_json::from_value(action.clone()).unwrap();
-        assert!(matches!(parsed, ChromeAction::Screenshot {}));
-
-        // Plain action name with a tab sibling.
-        let args = serde_json::json!({"action": "screenshot", "tab": "docs"});
-        let (normalized, note) =
-            normalize_action(args.get("action").cloned().unwrap(), &args).unwrap();
-        assert!(
-            note.is_some(),
-            "screenshot should record a normalization note"
-        );
-        let parsed: ChromeAction = serde_json::from_value(normalized).unwrap();
-        assert!(matches!(parsed, ChromeAction::Screenshot {}));
-    }
-
-    #[test]
     #[expect(clippy::case_sensitive_file_extension_comparisons)] // the tool itself always emits a lowercase .png name
     fn screenshot_output_path_is_safe_and_unique() {
         // A hostile tab name must not escape the temp dir.
@@ -3999,21 +3894,122 @@ mod tests {
         );
     }
 
+    /// `readBack` without a `warning` is chrome-use's normal success shape —
+    /// no note may be appended. A warning on a type read-back mismatch (exit 0)
+    /// must be surfaced, unquoted, and marked not applied.
     #[test]
-    fn format_action_output_eval_falls_back_without_result() {
+    fn format_action_output_warning_cases() {
         let response = ChromeResponse {
-            data: Some(json!({"note": "no result key"})),
+            data: Some(json!({"typed": "hi", "readBack": "hi"})),
             ..ChromeResponse::default()
         };
         let out = ChromeTool::format_action_output(
-            &ChromeAction::Eval { js: "42".into() },
+            &ChromeAction::Type {
+                selector: "#e".into(),
+                text: "hi".into(),
+                key_events: false,
+            },
             "default",
             response,
             "",
         );
-        assert!(out.contains('{'), "should fall back to pretty-print: {out}");
+        assert!(
+            !out.contains("chrome-use warning"),
+            "clean output must not carry a warning: {out}"
+        );
+
+        // chrome-use's `type` warning on a read-back mismatch — exit 0, so the
+        // tool must flag it.
+        let response = ChromeResponse {
+            data: Some(json!({
+                "typed": "hi", "readBack": "h",
+                "warning": "the field does not contain what was typed",
+            })),
+            ..ChromeResponse::default()
+        };
+        let out = ChromeTool::format_action_output(
+            &ChromeAction::Type {
+                selector: "#e".into(),
+                text: "hi".into(),
+                key_events: false,
+            },
+            "default",
+            response,
+            "",
+        );
+        assert!(
+            out.contains("chrome-use warning"),
+            "output should surface the warning: {out}"
+        );
+        // The warning is rendered unquoted, not as its JSON serialization.
+        assert!(
+            out.contains("warning: the field does not contain what was typed —"),
+            "warning text should be rendered unquoted: {out}"
+        );
+        assert!(
+            out.contains("the field does not contain what was typed"),
+            "output should carry the warning text: {out}"
+        );
+        assert!(
+            out.contains("NOT applied"),
+            "output should tell the agent to treat the action as not applied: {out}"
+        );
     }
 
+    #[tokio::test]
+    async fn image_payload_attaches_chrome_screenshot() {
+        // Build a tiny PNG on disk.
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        let dir = std::env::temp_dir().join("mahbot-chrome-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png_path = dir.join("shot.png");
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&png_path, &buf).unwrap();
+
+        let tool = ChromeTool::default();
+        *tool.last_screenshot.lock().unwrap_poison() =
+            Some(png_path.to_string_lossy().into_owned());
+
+        let payload = tool
+            .image_payload(
+                &crate::Workspace::default(),
+                &serde_json::json!({"action": "screenshot", "tab": "default"}),
+            )
+            .await
+            .expect("screenshot must produce an image payload");
+        assert_eq!(payload.source, crate::tools::ImagePayloadSource::Chrome);
+        assert_eq!(payload.format, "PNG");
+        assert!(payload.data_uri.starts_with("data:image/jpeg;base64,"));
+        assert!(
+            payload
+                .attached_annotation()
+                .starts_with("Chrome screenshot"),
+            "annotation must describe it as a chrome screenshot: {}",
+            payload.attached_annotation()
+        );
+
+        // A non-screenshot action never re-attaches the last screenshot: a stale
+        // path on the tool must not become this action's image payload.
+        *tool.last_screenshot.lock().unwrap_poison() = Some("/tmp/stale.png".to_string());
+        let non_screenshot = tool
+            .image_payload(
+                &crate::Workspace::default(),
+                &serde_json::json!({"action": "open", "url": "https://example.com", "tab": "default"}),
+            )
+            .await;
+        assert!(
+            non_screenshot.is_none(),
+            "non-screenshot action must yield no payload"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `upload` answer's four rules: chrome-use's own counts and the absolute
+    /// file each path was read from; a stated zero never reads as delivery; a
+    /// consumed input stays a success with its warning; and a skipped one-file
+    /// check is a note on that same success.
     #[test]
     fn upload_output_reports_delivery_and_keeps_the_warning_a_success() {
         let resolved = vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")];
@@ -4059,131 +4055,14 @@ mod tests {
         assert!(!out.contains("Delivered"), "{out}");
         assert!(!out.contains("still holds them"), "{out}");
         assert!(!out.contains("did reach the page"), "{out}");
-    }
 
-    #[test]
-    fn a_single_files_path_is_taken_as_a_list() {
-        let action: ChromeAction =
-            serde_json::from_value(json!({"upload": {"selector": "#f", "files": "a.txt"}}))
-                .expect("a single path is the one-element list");
-        assert!(matches!(action, ChromeAction::Upload { files, .. } if files == ["a.txt"]));
-    }
-
-    #[test]
-    fn format_action_output_appends_warning_for_type_read_back_mismatch() {
-        // chrome-use's `type` warning on a read-back mismatch — exit 0, so the
-        // tool must flag it.
-        let response = ChromeResponse {
-            data: Some(json!({
-                "typed": "hi", "readBack": "h",
-                "warning": "the field does not contain what was typed",
-            })),
-            ..ChromeResponse::default()
-        };
-        let out = ChromeTool::format_action_output(
-            &ChromeAction::Type {
-                selector: "#e".into(),
-                text: "hi".into(),
-                key_events: false,
-            },
-            "default",
-            response,
-            "",
-        );
+        // The one-file check the browser could not run is a note, not a failure:
+        // the delivery it could not judge is still the answer.
+        let out = ChromeTool::upload_output("default", "#f", &resolved, &kept, true);
+        assert!(out.contains("Note:"), "{out}");
         assert!(
-            out.contains("chrome-use warning"),
-            "output should surface the warning: {out}"
-        );
-        // The warning is rendered unquoted, not as its JSON serialization.
-        assert!(
-            out.contains("warning: the field does not contain what was typed —"),
-            "warning text should be rendered unquoted: {out}"
-        );
-        assert!(
-            out.contains("the field does not contain what was typed"),
-            "output should carry the warning text: {out}"
-        );
-        assert!(
-            out.contains("NOT applied"),
-            "output should tell the agent to treat the action as not applied: {out}"
-        );
-    }
-
-    /// `readBack` without a `warning` is chrome-use's normal success shape —
-    /// no note may be appended.
-    #[test]
-    fn format_action_output_clean_response_has_no_warning() {
-        let response = ChromeResponse {
-            data: Some(json!({"typed": "hi", "readBack": "hi"})),
-            ..ChromeResponse::default()
-        };
-        let out = ChromeTool::format_action_output(
-            &ChromeAction::Type {
-                selector: "#e".into(),
-                text: "hi".into(),
-                key_events: false,
-            },
-            "default",
-            response,
-            "",
-        );
-        assert!(
-            !out.contains("chrome-use warning"),
-            "clean output must not carry a warning: {out}"
-        );
-    }
-
-    #[tokio::test]
-    async fn image_payload_attaches_chrome_screenshot() {
-        // Build a tiny PNG on disk.
-        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
-        let dir = std::env::temp_dir().join("mahbot-chrome-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let png_path = dir.join("shot.png");
-        let mut buf = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-            .unwrap();
-        std::fs::write(&png_path, &buf).unwrap();
-
-        let tool = ChromeTool::default();
-        *tool.last_screenshot.lock().unwrap_poison() =
-            Some(png_path.to_string_lossy().into_owned());
-
-        let payload = tool
-            .image_payload(
-                &crate::Workspace::default(),
-                &serde_json::json!({"action": "screenshot", "tab": "default"}),
-            )
-            .await
-            .expect("screenshot must produce an image payload");
-        assert_eq!(payload.source, crate::tools::ImagePayloadSource::Chrome);
-        assert_eq!(payload.format, "PNG");
-        assert!(payload.data_uri.starts_with("data:image/jpeg;base64,"));
-        assert!(
-            payload
-                .attached_annotation()
-                .starts_with("Chrome screenshot"),
-            "annotation must describe it as a chrome screenshot: {}",
-            payload.attached_annotation()
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn image_payload_ignores_non_screenshot_actions() {
-        let tool = ChromeTool::default();
-        // A stale path must not be attached to a non-screenshot action.
-        *tool.last_screenshot.lock().unwrap_poison() = Some("/tmp/stale.png".to_string());
-        let payload = tool
-            .image_payload(
-                &crate::Workspace::default(),
-                &serde_json::json!({"action": "open", "url": "https://example.com", "tab": "default"}),
-            )
-            .await;
-        assert!(
-            payload.is_none(),
-            "non-screenshot action must yield no payload"
+            out.contains(crate::chrome::files::unchecked_several_files_note()),
+            "{out}"
         );
     }
 

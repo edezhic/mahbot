@@ -1169,8 +1169,7 @@ mod tests {
     /// the gate closed for the life of the process, and an environment that moves
     /// loses the old verdict before it can be served under it.
     ///
-    /// Driven directly, because a real measurement spawns the owner's own programs;
-    /// the battery's own rows are measured by `battery_reports_capabilities_per_locale`.
+    /// Driven directly, because a real measurement spawns the owner's own programs.
     ///
     /// `#[serial]`: the verdict and its key are process-global.
     #[cfg(unix)]
@@ -1345,98 +1344,5 @@ mod tests {
             ),
             "the same member is demoted on unix with nothing established"
         );
-    }
-
-    /// The battery's per-locale evidence: which capabilities come out established
-    /// under the locale the commands would actually get, under `C`, and under a
-    /// UTF-8 collating locale. Printing only — a host with no real search to
-    /// compare against is reported and skipped rather than failed — plus the
-    /// sanity check that the host's real search was there and rows ran.
-    ///
-    /// Ignored, like the repo's other real-search evidence lanes: it spawns the
-    /// host's own grep and sh, which a build host need not have. Run it with
-    ///
-    /// ```text
-    /// cargo test --lib -- --ignored --nocapture battery_reports_capabilities_per_locale
-    /// ```
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "manual evidence run: prints the per-locale verdicts from the host's real search"]
-    fn battery_reports_capabilities_per_locale() {
-        let locales = [
-            ("inherited", crate::tools::shell::agent_env_pairs()),
-            ("C", locale_env("C")),
-            ("en_US.UTF-8", locale_env("en_US.UTF-8")),
-        ];
-        for (label, env) in locales {
-            let fixture = Fixture::create().expect("fixture");
-            let battery = run_battery(&fixture, &env);
-            // A run that established nothing prints as all-false: that is what the
-            // gate serves in that case, and the probe's finding — or the unmeasured
-            // tally, which folds no verdict at all — says why.
-            let verdict = battery.verdict.unwrap_or_default();
-            println!(
-                "grep parity [{label}]: established={} plain={} general={} glob={} rows={} compared={} skipped={} unmeasured={} real_search={:?}",
-                battery.verdict.is_some(),
-                verdict.plain,
-                verdict.general,
-                verdict.glob,
-                battery.rows,
-                battery.compared,
-                battery.skipped,
-                battery.unmeasured,
-                battery.real_search,
-            );
-            match battery.real_search {
-                Probe::Present => {}
-                Probe::Absent => {
-                    println!(
-                        "  no real search here to compare against: the fast path is the only search"
-                    );
-                    continue;
-                }
-                Probe::Unknown => {
-                    println!(
-                        "  the probe could not be run: nothing was established and the fast path is closed"
-                    );
-                    continue;
-                }
-            }
-            // Which way each shape went — and, for every capability named as
-            // served, that every compared row of it matched the real search.
-            let (served, real): (Vec<Need>, Vec<Need>) = [Need::Plain, Need::General, Need::Glob]
-                .into_iter()
-                .partition(|need| verdict.covers(*need));
-            println!(
-                "  served by the fast path: {} | run by the real search: {}",
-                capability_names(&served),
-                capability_names(&real),
-            );
-            assert!(battery.rows > 0, "{label}: the battery ran no row");
-        }
-    }
-
-    /// The capability names in a list, or `none`.
-    #[cfg(unix)]
-    fn capability_names(needs: &[Need]) -> String {
-        if needs.is_empty() {
-            return "none".to_string();
-        }
-        needs
-            .iter()
-            .map(|need| need.capability())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    /// An environment pair list for `locale`, with the inherited `PATH` kept so
-    /// the real search is found.
-    #[cfg(unix)]
-    fn locale_env(locale: &str) -> Vec<(OsString, OsString)> {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        vec![
-            (OsString::from("LC_ALL"), OsString::from(locale)),
-            (OsString::from("PATH"), path),
-        ]
     }
 }

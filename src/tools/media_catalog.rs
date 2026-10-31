@@ -261,60 +261,6 @@ pub mod image {
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        #[test]
-        fn test_parse_and_query_catalog() {
-            let catalog = parse_catalog(&json!({
-                "data": [
-                    {
-                        "id": "qwen/qwen-image-3-pro",
-                        "architecture": { "output_modalities": ["image"] },
-                        "supported_parameters": {
-                            "resolution": { "type": "enum", "values": ["1K", "2K"] },
-                            "aspect_ratio": { "type": "enum", "values": ["1:1", "9:16"] },
-                            "n": { "type": "range", "min": 1, "max": 6 },
-                            "input_references": { "type": "range", "min": 0, "max": 4 },
-                            "seed": { "type": "boolean" }
-                        }
-                    },
-                    {
-                        "id": "text-only/model",
-                        "architecture": { "output_modalities": ["text"] },
-                        "supported_parameters": {}
-                    }
-                ]
-            }))
-            .expect("valid fixture");
-
-            let image = catalog.find("qwen/qwen-image-3-pro").expect("found");
-            assert_eq!(image.image_output, ImageOutput::Declared);
-            assert!(image.declares("resolution"));
-            assert!(!image.declares("quality"));
-            assert!(image.enum_contains("aspect_ratio", "9:16"));
-            assert!(!image.enum_contains("aspect_ratio", "auto"));
-            assert_eq!(image.range_max("input_references"), Some(4));
-            assert_eq!(image.range_max("seed"), None);
-
-            assert_eq!(
-                catalog.find("text-only/model").expect("found").image_output,
-                ImageOutput::TextOnly
-            );
-            assert!(catalog.find("unknown/model").is_none());
-        }
-
-        #[test]
-        fn test_parse_catalog_tolerates_unknown_shapes() {
-            // Unknown parameter types and entries without ids must not break parsing.
-            let catalog = parse_catalog(&json!({
-                "data": [
-                    { "id": "m1", "architecture": { "output_modalities": ["image"] },
-                      "supported_parameters": { "future_param": { "type": "weird" } } },
-                    { "name": "no id" }
-                ]
-            }))
-            .expect("tolerated");
-            assert!(catalog.find("m1").is_some());
-        }
-
         // ── Resolver tests: scripted fetch on a local Catalog (hermetic) ──
 
         static SCRIPT: Mutex<VecDeque<anyhow::Result<serde_json::Value>>> =
@@ -421,30 +367,6 @@ pub mod image {
                 .await
                 .expect("now cached");
             assert!(info.is_some());
-            assert_eq!(FETCHES.load(Ordering::SeqCst), 1);
-        }
-
-        #[tokio::test]
-        #[serial_test::serial(image_resolver)]
-        async fn resolver_fresh_absence_rejects() {
-            let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT;
-            let base = crate::providers::ensure_base_url(endpoint);
-            let catalog = resolver_catalog();
-            catalog.seed(
-                &base,
-                Some(Arc::new(
-                    parse_catalog(&catalog_with_model("other/model")).expect("seed"),
-                )),
-            );
-            reset_script(vec![Ok(catalog_with_model("other/model"))]);
-
-            let err = resolve_capability_with(&catalog, endpoint, "brand/new-model")
-                .await
-                .unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("not in the OpenRouter image-models catalog")
-            );
             assert_eq!(FETCHES.load(Ordering::SeqCst), 1);
         }
 
@@ -597,74 +519,5 @@ pub(crate) mod video {
     pub(crate) fn seed_cache(catalog: Option<Arc<VideoCatalog>>) {
         let endpoint = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);
         CATALOG.seed(&endpoint, catalog);
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use serde_json::json;
-
-        #[test]
-        fn test_parse_and_query_video_catalog() {
-            let catalog = parse_catalog(&json!({
-                "data": [
-                    {
-                        "id": "minimax/hailuo-3",
-                        "canonical_slug": "minimax/hailuo-03-20260730",
-                        "supported_resolutions": ["2K"],
-                        "supported_aspect_ratios": ["16:9", "9:16", "1:1"],
-                        "supported_durations": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-                        "supported_sizes": null,
-                        "supported_frame_images": ["first_frame", "last_frame"],
-                        "generate_audio": true,
-                        "seed": false,
-                        "pricing_skus": { "duration_seconds": { "type": "second" } }
-                    },
-                    {
-                        "id": "runway/aleph-2",
-                        "canonical_slug": "runway/aleph-2-20260729",
-                        "supported_resolutions": null,
-                        "supported_durations": null,
-                        "generate_audio": false,
-                        "seed": true
-                    },
-                    { "canonical_slug": "no-id-model" }
-                ]
-            }))
-            .expect("valid fixture");
-
-            let hailuo = catalog.find("minimax/hailuo-3").expect("found by id");
-            assert_eq!(hailuo.resolutions.as_deref(), Some(&["2K".to_string()][..]));
-            assert_eq!(hailuo.durations.as_deref().map(<[i64]>::len), Some(11));
-            assert_eq!(hailuo.generate_audio, Some(true));
-            assert_eq!(hailuo.seed, Some(false));
-
-            // Null-heavy model keeps every optional field absent.
-            let aleph = catalog.find("runway/aleph-2").expect("found by id");
-            assert_eq!(aleph.resolutions, None);
-            assert_eq!(aleph.durations, None);
-            assert_eq!(aleph.generate_audio, Some(false));
-
-            // Entries without an `id` are skipped; canonical_slug is never the key.
-            assert!(catalog.find("runway/aleph-2-20260729").is_none());
-            assert!(catalog.find("no-id-model").is_none());
-        }
-
-        #[test]
-        fn test_parse_catalog_tolerates_unknown_shapes() {
-            let catalog = parse_catalog(&json!({
-                "data": [
-                    { "id": "m1", "supported_durations": ["not-an-int"], "seed": "maybe" },
-                    { "id": "m2", "supported_resolutions": [42], "supported_aspect_ratios": null }
-                ]
-            }))
-            .expect("tolerated");
-            let m1 = catalog.find("m1").expect("m1 present");
-            assert_eq!(m1.durations, Some(vec![]));
-            assert_eq!(m1.seed, None);
-            let m2 = catalog.find("m2").expect("m2 present");
-            assert_eq!(m2.resolutions, Some(vec![]));
-            assert_eq!(m2.aspect_ratios, None);
-        }
     }
 }

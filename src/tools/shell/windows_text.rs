@@ -168,6 +168,15 @@ mod tests {
         bytes.iter().map(|b| char::from(*b)).collect()
     }
 
+    /// A case for [`decode_lines`]: the capture it reads, the code-page stand-in
+    /// its fallback supplies, and the whole text the reading must produce.
+    struct DecodeCase {
+        name: &'static str,
+        input: &'static [u8],
+        fallback: fn(&[u8]) -> String,
+        expected: &'static str,
+    }
+
     /// A line that is valid UTF-8 is kept byte for byte, whatever its neighbours
     /// are: the guarantee a native toolchain's output rests on, and the one a
     /// single line in another encoding must not take away from them.
@@ -176,15 +185,51 @@ mod tests {
         // The middle line is genuinely not UTF-8 (`\x80`/`\x81` are
         // continuation bytes with no lead); the lines around it are.
         let mixed = b"ok: h\xc3\xa9llo\nnot utf-8: \x80\x81\nok: done\n";
-        assert_eq!(
-            decode_lines(mixed, bytewise),
-            "ok: héllo\nnot utf-8: \u{80}\u{81}\nok: done\n"
-        );
-        // The same input with the other reading on the line that is not UTF-8.
-        assert_eq!(
-            decode_lines(mixed, |_| "<other>".to_string()),
-            "ok: héllo\n<other>\nok: done\n"
-        );
+        let cases: &[DecodeCase] = &[
+            DecodeCase {
+                name: "the lines around the one that is not UTF-8 are kept",
+                input: mixed,
+                fallback: bytewise,
+                expected: "ok: héllo\nnot utf-8: \u{80}\u{81}\nok: done\n",
+            },
+            // The same input with the other reading on the line that is not UTF-8.
+            DecodeCase {
+                name: "only the unreadable line takes the fallback's reading",
+                input: mixed,
+                fallback: |_| "<other>".to_string(),
+                expected: "ok: héllo\n<other>\nok: done\n",
+            },
+        ];
+        for case in cases {
+            let decoded = decode_lines(case.input, case.fallback);
+            assert_eq!(decoded, case.expected, "[{}]", case.name);
+        }
+    }
+
+    /// The reading leaves the input's own line breaks where they were: the break
+    /// between two lines is the reader's and not the fallback's to change, a `\r`
+    /// before it belongs to the line the fallback is handed (Windows programs write
+    /// `\r\n`), and a capture that ends without a break keeps none.
+    #[test]
+    fn the_inputs_own_line_breaks_are_left_where_they_were() {
+        let cases: &[DecodeCase] = &[
+            DecodeCase {
+                name: "the break belongs to the reader, the \\r to the line",
+                input: b"\xff\r\nplain",
+                fallback: bytewise,
+                expected: "\u{ff}\r\nplain",
+            },
+            DecodeCase {
+                name: "an empty capture stays empty",
+                input: b"",
+                fallback: bytewise,
+                expected: "",
+            },
+        ];
+        for case in cases {
+            let decoded = decode_lines(case.input, case.fallback);
+            assert_eq!(decoded, case.expected, "[{}]", case.name);
+        }
     }
 
     /// Only the line that is not UTF-8 reaches the fallback — a whole-buffer read
@@ -198,15 +243,5 @@ mod tests {
         });
         assert_eq!(text, "a\n\u{ff}\nb\n");
         assert_eq!(lines, vec![b"\xff".to_vec()]);
-    }
-
-    /// The reading leaves the input's own line breaks where they were: the break
-    /// between two lines is the reader's and not the fallback's to change, a `\r`
-    /// before it belongs to the line the fallback is handed (Windows programs
-    /// write `\r\n`), and a capture that ends without a break keeps none.
-    #[test]
-    fn the_line_breaks_of_the_input_are_kept() {
-        assert_eq!(decode_lines(b"\xff\r\nplain", bytewise), "\u{ff}\r\nplain");
-        assert_eq!(decode_lines(b"", bytewise), "");
     }
 }

@@ -339,39 +339,153 @@ mod tests {
         stored
     }
 
+    /// What a `place` value means: no place at all, or a refusal.
+    enum PlaceExpect {
+        NoPlace,
+        /// Substrings the refusal must carry.
+        Refused(&'static [&'static str]),
+    }
+
+    /// One `place` value, for both delegation kinds.
+    struct PlaceValueCase {
+        name: &'static str,
+        args: serde_json::Value,
+        expected: PlaceExpect,
+    }
+
     #[tokio::test]
-    async fn absent_null_and_blank_places_mean_no_place() {
+    async fn place_value_cases() {
         init_management_test_stores().await;
-        for kind in [DelegationKind::Analyze, DelegationKind::Worker] {
-            for args in [
-                json!({}),
-                json!({"place": null}),
-                json!({"place": ""}),
-                json!({"place": "   "}),
-            ] {
-                let ws = resolve(kind, &args).await.expect("no place resolves");
-                assert!(ws.is_none(), "{kind:?} / {args} must be no place");
+        for case in [
+            // Nothing names a place: the round runs in the caller's own one.
+            PlaceValueCase {
+                name: "an absent place",
+                args: json!({}),
+                expected: PlaceExpect::NoPlace,
+            },
+            PlaceValueCase {
+                name: "a null place",
+                args: json!({"place": null}),
+                expected: PlaceExpect::NoPlace,
+            },
+            PlaceValueCase {
+                name: "an empty place",
+                args: json!({"place": ""}),
+                expected: PlaceExpect::NoPlace,
+            },
+            PlaceValueCase {
+                name: "a blank place",
+                args: json!({"place": "   "}),
+                expected: PlaceExpect::NoPlace,
+            },
+            // The root is refused by name, never resolved to a place no round can
+            // run in.
+            PlaceValueCase {
+                name: "the filesystem root",
+                args: json!({"place": "/"}),
+                expected: PlaceExpect::Refused(&["usage: ", "filesystem root"]),
+            },
+        ] {
+            for kind in [DelegationKind::Analyze, DelegationKind::Worker] {
+                let refusal = resolve(kind, &case.args)
+                    .await
+                    .err()
+                    .map(|err| err.to_string());
+                match (&case.expected, refusal) {
+                    (PlaceExpect::NoPlace, None) => {}
+                    (PlaceExpect::NoPlace, Some(err)) => {
+                        panic!("[{}] {:?} must be no place: {err}", case.name, kind);
+                    }
+                    (PlaceExpect::Refused(needles), Some(err)) => {
+                        for needle in *needles {
+                            assert!(
+                                err.contains(needle),
+                                "[{}] {:?} must say {needle:?}: {err}",
+                                case.name,
+                                kind
+                            );
+                        }
+                    }
+                    (PlaceExpect::Refused(_), None) => {
+                        panic!("[{}] {:?} must be refused", case.name, kind);
+                    }
+                }
             }
         }
     }
 
+    /// How a directory is named: the managed row when the directory has one, a
+    /// `dir-…` derivation otherwise — through both entry points, a delegation
+    /// `place` and the resume's own directory lookup.
+    enum DirEntry {
+        Place(DelegationKind),
+        Resume,
+    }
+
+    struct DirNameCase {
+        name: &'static str,
+        entry: DirEntry,
+        /// The managed workspace the directory is registered as, if any.
+        managed: Option<&'static str>,
+    }
+
     #[tokio::test]
-    async fn plain_directory_resolves_to_a_synthetic_workspace() {
+    async fn directory_name_cases() {
         init_management_test_stores().await;
+        for case in [
+            DirNameCase {
+                name: "an analyst's plain directory",
+                entry: DirEntry::Place(DelegationKind::Analyze),
+                managed: None,
+            },
+            DirNameCase {
+                name: "a worker's plain directory",
+                entry: DirEntry::Place(DelegationKind::Worker),
+                managed: None,
+            },
+            DirNameCase {
+                name: "a plain directory a resume points at",
+                entry: DirEntry::Resume,
+                managed: None,
+            },
+            DirNameCase {
+                name: "a managed directory a resume points at",
+                entry: DirEntry::Resume,
+                managed: Some("ws_delegation_resume"),
+            },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let canonical = canon(dir.path());
+            let target = canonical.to_str().unwrap();
+            if let Some(name) = case.managed {
+                create_test_workspace(target, name).await;
+            }
+
+            let ws = match case.entry {
+                DirEntry::Place(kind) => resolve(kind, &json!({ "place": target }))
+                    .await
+                    .expect("a plain directory resolves")
+                    .expect("a target is present"),
+                DirEntry::Resume => workspace_at_dir(target)
+                    .await
+                    .expect("a directory can be resumed into"),
+            };
+            match case.managed {
+                Some(name) => assert_eq!(ws.name, name, "[{}]", case.name),
+                None => assert!(
+                    ws.name.starts_with("dir-"),
+                    "[{}] got {}",
+                    case.name,
+                    ws.name
+                ),
+            }
+            assert_eq!(ws.path, target, "[{}] the directory itself", case.name);
+        }
+
+        // The same directory always derives the same name.
         let dir = tempfile::tempdir().unwrap();
         let canonical = canon(dir.path());
         let target = canonical.to_str().unwrap();
-
-        for kind in [DelegationKind::Analyze, DelegationKind::Worker] {
-            let ws = resolve(kind, &json!({ "place": target }))
-                .await
-                .expect("plain directory resolves")
-                .expect("a target is present");
-            assert_eq!(ws.path, target, "{kind:?}");
-            assert!(ws.name.starts_with("dir-"), "got {}", ws.name);
-            assert!(ws.name.contains('-'), "got {}", ws.name);
-        }
-
         let first = resolve(DelegationKind::Analyze, &json!({ "place": target }))
             .await
             .unwrap()
@@ -381,6 +495,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.name, second.name, "the derivation is deterministic");
+
+        // A directory that is gone cannot be resumed into.
+        let missing = workspace_at_dir("/definitely/not/here/delegation")
+            .await
+            .expect_err("a vanished target directory cannot resume");
+        assert!(
+            missing.to_string().contains("no longer available"),
+            "{missing}"
+        );
     }
 
     #[tokio::test]
@@ -553,19 +676,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filesystem_root_is_refused_for_both_kinds() {
-        init_management_test_stores().await;
-        for kind in [DelegationKind::Analyze, DelegationKind::Worker] {
-            let err = resolve(kind, &json!({ "place": "/" }))
-                .await
-                .expect_err("the filesystem root is refused")
-                .to_string();
-            assert!(err.starts_with("usage:"), "{err}");
-            assert!(err.contains("filesystem root"), "{err}");
-        }
-    }
-
-    #[tokio::test]
     async fn worker_refuses_the_data_directory_but_allows_personal_workspaces() {
         init_management_test_stores().await;
         let probe = test_root().join("data-probe-dir");
@@ -605,33 +715,5 @@ mod tests {
         .expect("a personal workspace directory is allowed")
         .expect("a target is present");
         assert!(ws.name.starts_with("dir-"), "got {}", ws.name);
-    }
-
-    #[tokio::test]
-    async fn workspace_at_dir_matches_managed_or_derives() {
-        init_management_test_stores().await;
-
-        let managed_dir = tempfile::tempdir().unwrap();
-        let managed_canonical = canon(managed_dir.path());
-        let managed_path = managed_canonical.to_str().unwrap();
-        create_test_workspace(managed_path, "ws_delegation_resume").await;
-        let ws = workspace_at_dir(managed_path).await.unwrap();
-        assert_eq!(ws.name, "ws_delegation_resume");
-        assert_eq!(ws.path, managed_path);
-
-        let plain_dir = tempfile::tempdir().unwrap();
-        let plain_canonical = canon(plain_dir.path());
-        let ws = workspace_at_dir(plain_canonical.to_str().unwrap())
-            .await
-            .unwrap();
-        assert!(ws.name.starts_with("dir-"), "got {}", ws.name);
-
-        let missing = workspace_at_dir("/definitely/not/here/delegation")
-            .await
-            .expect_err("a vanished target directory cannot resume");
-        assert!(
-            missing.to_string().contains("no longer available"),
-            "{missing}"
-        );
     }
 }

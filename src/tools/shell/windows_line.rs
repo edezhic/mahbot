@@ -1646,640 +1646,1099 @@ mod tests {
         }
     }
 
-    /// Assert the reading of `command` is `expected`, text and all.
-    fn reads(command: &str, expected: &str) {
-        assert_eq!(read(command).as_deref(), Ok(expected), "{command:?}");
+    /// One full-mode reading: the text is read to `expected`, byte for byte.
+    struct ReadingCase {
+        name: &'static str,
+        text: &'static str,
+        expected: &'static str,
     }
 
-    #[test]
-    fn unix_and_single_line_texts_are_handed_back_untouched() {
-        for text in [
-            "dir /b",
-            "for %f in (*.txt) do (del %f)",
-            "if exist x (echo y)",
-        ] {
-            assert!(
-                matches!(
-                    executable(text, ShellPlatform::Unix, ShellMode::Full),
-                    Ok(Cow::Borrowed(borrowed)) if borrowed == text
-                ),
-                "{text:?}"
-            );
-            assert!(
-                matches!(
-                    executable(text, ShellPlatform::Windows, ShellMode::Full),
-                    Ok(Cow::Borrowed(borrowed)) if borrowed == text
-                ),
-                "{text:?}"
-            );
-        }
+    /// One full-mode refusal: the text is refused, its cause naming `needle`.
+    struct RefusalCase {
+        name: &'static str,
+        text: &'static str,
+        needle: &'static str,
     }
 
-    #[test]
-    fn a_bare_break_becomes_the_unconditional_separator() {
-        // That a failing first line does not stop the rest, and that the status
-        // reported is the last line's, are properties of `&` itself.
-        reads(
-            "dir C:\\ws\ndel C:\\ws\\x.txt",
-            "dir C:\\ws&del C:\\ws\\x.txt",
-        );
-        // An even `\` run is a literal backslash before a separator.
-        reads("dir C:\\ws\\\\\ndel x", "dir C:\\ws\\\\&del x");
+    /// What the read-only guard's own reader makes of a text.
+    #[derive(Clone, Copy)]
+    enum ReadOnlyExpect {
+        /// Refused, the cause naming the needle.
+        Refused(&'static str),
+        /// Read as [`before_first_break`] reads the same text.
+        Projection,
+        /// Read as this text.
+        Reads(&'static str),
     }
 
+    struct ReadOnlyCase {
+        name: &'static str,
+        text: &'static str,
+        /// Whether the full mode reads the same text (both readers were consulted
+        /// by the original guard-divergence rows).
+        reads_in_full: bool,
+        expected: ReadOnlyExpect,
+    }
+
+    /// The full mode's reading of every shape the rules in the module header
+    /// cover, as one table: one row per spelling, each case named.
     #[test]
-    fn blank_lines_and_a_trailing_break_change_nothing() {
-        reads("a\n\nb", "a&b");
-        reads("a\n", "a");
-        reads("\na", "a");
-        reads("a\n\n", "a");
-        // A line holding only a space or a tab is blank to this platform too: the
-        // separator belongs to the break before it, not after it, and the spaces
-        // themselves stay as written.
-        reads("a\n \t\nb", "a& \tb");
-        // A character Unicode calls whitespace is an ordinary one to `cmd.exe`:
-        // the line has text on it, so its break is a separator like any other and
-        // the line is not glued into the one after it.
-        reads("a\n\u{A0}\nb", "a&\u{A0}&b");
-        reads("a\n\u{3000}\nb", "a&\u{3000}&b");
-        // A text whose breaks all stand at its end is the single line it was written
-        // as: this platform's reader never reaches past the first break, so none of
-        // the reading's rules — every one about what the line *after* a break is read
-        // as — is reached, and a trailing break can never turn such a text into a
-        // refusal. A shape only this platform accepts, a shape whose `"` span is left
-        // open, a statement's own text, and the guard's own `\`-before-a-break
-        // divergence all run in the mode they run in without the break.
-        for (text, one_line) in [
-            ("echo a (", "echo a (\n"),
-            ("echo \"a", "echo \"a\n"),
-            ("if exist x", "if exist x\n"),
-            ("dir C:\\ws\\", "dir C:\\ws\\\n"),
-            ("dir C:\\ws\\", "dir C:\\ws\\\n\n"),
-            ("rem note", "rem note\n"),
-        ] {
-            reads(one_line, text);
+    #[expect(clippy::too_many_lines)] // one cohesive table over the reading's shapes
+    fn reading_cases() {
+        let cases: &[ReadingCase] = &[
+            // A bare break is the unconditional separator: a failing first line
+            // does not stop the rest, and the status reported is the last line's.
+            ReadingCase {
+                name: "a bare break is the unconditional separator",
+                text: "dir C:\\ws\ndel C:\\ws\\x.txt",
+                expected: "dir C:\\ws&del C:\\ws\\x.txt",
+            },
+            ReadingCase {
+                name: "an even backslash run stays literal before the separator",
+                text: "dir C:\\ws\\\\\ndel x",
+                expected: "dir C:\\ws\\\\&del x",
+            },
+            // Blank lines and a trailing break change nothing.
+            ReadingCase {
+                name: "a blank line drops its break",
+                text: "a\n\nb",
+                expected: "a&b",
+            },
+            ReadingCase {
+                name: "a trailing break is dropped",
+                text: "a\n",
+                expected: "a",
+            },
+            ReadingCase {
+                name: "a leading break is dropped",
+                text: "\na",
+                expected: "a",
+            },
+            ReadingCase {
+                name: "a text of trailing breaks is one line",
+                text: "a\n\n",
+                expected: "a",
+            },
+            ReadingCase {
+                name: "a whitespace-only line is blank",
+                text: "a\n \t\nb",
+                expected: "a& \tb",
+            },
+            ReadingCase {
+                name: "a non-breaking space is ordinary line text",
+                text: "a\n\u{A0}\nb",
+                expected: "a&\u{A0}&b",
+            },
+            ReadingCase {
+                name: "an ideographic space is ordinary line text",
+                text: "a\n\u{3000}\nb",
+                expected: "a&\u{3000}&b",
+            },
+            // A text whose breaks all stand at its end is the single line it was
+            // written as, in either mode.
+            ReadingCase {
+                name: "a trailing break leaves an unclosed paren shape",
+                text: "echo a (\n",
+                expected: "echo a (",
+            },
+            ReadingCase {
+                name: "a trailing break leaves an open quote shape",
+                text: "echo \"a\n",
+                expected: "echo \"a",
+            },
+            ReadingCase {
+                name: "a trailing break leaves a statement's own text",
+                text: "if exist x\n",
+                expected: "if exist x",
+            },
+            ReadingCase {
+                name: "a trailing break leaves the guard's backslash shape",
+                text: "dir C:\\ws\\\n",
+                expected: "dir C:\\ws\\",
+            },
+            ReadingCase {
+                name: "two trailing breaks leave the guard's backslash shape",
+                text: "dir C:\\ws\\\n\n",
+                expected: "dir C:\\ws\\",
+            },
+            ReadingCase {
+                name: "a trailing break leaves a comment line",
+                text: "rem note\n",
+                expected: "rem note",
+            },
+            // Nothing after the break is true of a break wherever it stands, so a
+            // longer text is read as the same line with and without its trailing
+            // break.
+            ReadingCase {
+                name: "a trailing break leaves a comment after a separator",
+                text: "dir\nrem note\n",
+                expected: "dir&rem note",
+            },
+            ReadingCase {
+                name: "a trailing break leaves a guard backslash before a separator",
+                text: "echo a\ndir C:\\ws\\\n",
+                expected: "echo a&dir C:\\ws\\",
+            },
+            ReadingCase {
+                name: "a trailing break leaves two plain lines",
+                text: "dir\ndir C:\\ws\\\n",
+                expected: "dir&dir C:\\ws\\",
+            },
+            // A break the platform's reader continues across is kept byte for
+            // byte, carriage returns included; a lone `\r` is no break.
+            ReadingCase {
+                name: "a caret continuation keeps the carriage-run break",
+                text: "echo a ^\r\r\nb",
+                expected: "echo a ^\r\r\nb",
+            },
+            ReadingCase {
+                name: "a bracketed group keeps the carriage-run break",
+                text: "(\r\r\ndir\r\r\n)",
+                expected: "(\r\r\ndir\r\r\n)",
+            },
+            ReadingCase {
+                name: "a lone carriage return is no break",
+                text: "dir\rdel x",
+                expected: "dir\rdel x",
+            },
+            ReadingCase {
+                name: "a lone carriage return inside a word is no break",
+                text: "echo a\rb",
+                expected: "echo a\rb",
+            },
+            // The platform's own continuations stay as written.
+            ReadingCase {
+                name: "an odd caret run continues the command",
+                text: "echo a ^\nb",
+                expected: "echo a ^\nb",
+            },
+            ReadingCase {
+                name: "an odd caret continues a copy",
+                text: "copy a.txt ^\nb.txt",
+                expected: "copy a.txt ^\nb.txt",
+            },
+            ReadingCase {
+                name: "an even caret run is a literal caret before the break",
+                text: "echo a ^^\nb",
+                expected: "echo a ^^&b",
+            },
+            ReadingCase {
+                name: "an escaped caret at the text's end is not pending",
+                text: "dir\necho b^^",
+                expected: "dir&echo b^^",
+            },
+            ReadingCase {
+                name: "a multiline for block keeps its breaks",
+                text: "for %f in (*.txt) do (\ndel x\n)",
+                expected: "for %f in (*.txt) do (\ndel x\n)",
+            },
+            ReadingCase {
+                name: "a multiline for block keeps a blank line",
+                text: "for %f in (*.txt) do (\n\ndel x\n)",
+                expected: "for %f in (*.txt) do (\n\ndel x\n)",
+            },
+            ReadingCase {
+                name: "an if block over a file keeps its breaks",
+                text: "if exist C:\\ws\\x.txt (\ndel C:\\ws\\x.txt\n)",
+                expected: "if exist C:\\ws\\x.txt (\ndel C:\\ws\\x.txt\n)",
+            },
+            ReadingCase {
+                name: "an if block with an else keeps its breaks",
+                text: "if exist x (echo a\n) else (\necho b\n)",
+                expected: "if exist x (echo a\n) else (\necho b\n)",
+            },
+            ReadingCase {
+                name: "an @if block keeps its breaks",
+                text: "@if not defined DEBUG (\necho release\n)",
+                expected: "@if not defined DEBUG (\necho release\n)",
+            },
+            ReadingCase {
+                name: "an if == block keeps its breaks",
+                text: "if %a%==1 (\necho one\n)",
+                expected: "if %a%==1 (\necho one\n)",
+            },
+            ReadingCase {
+                name: "an if comparison with two strings keeps its breaks",
+                text: "if \"%a%\" == \"1\" (\necho one\n)",
+                expected: "if \"%a%\" == \"1\" (\necho one\n)",
+            },
+            ReadingCase {
+                name: "an if equ block keeps its breaks",
+                text: "if %a% equ 1 (\necho one\n)",
+                expected: "if %a% equ 1 (\necho one\n)",
+            },
+            ReadingCase {
+                name: "an if /i block keeps its breaks",
+                text: "if /i \"A\"==\"a\" (\necho same\n)",
+                expected: "if /i \"A\"==\"a\" (\necho same\n)",
+            },
+            ReadingCase {
+                name: "a for whose body is an if keeps its breaks",
+                text: "for %f in (*.txt) do if exist %f (\ndel %f\n)",
+                expected: "for %f in (*.txt) do if exist %f (\ndel %f\n)",
+            },
+            ReadingCase {
+                name: "an else-if chain keeps its breaks",
+                text: "if exist x (\necho a\n) else if exist y (\necho b\n)",
+                expected: "if exist x (\necho a\n) else if exist y (\necho b\n)",
+            },
+            ReadingCase {
+                name: "a for set spanning lines keeps its break",
+                text: "for %f in (a\nb) do echo %f",
+                expected: "for %f in (a\nb) do echo %f",
+            },
+            ReadingCase {
+                name: "a for set of patterns spanning lines keeps its breaks",
+                text: "for %f in (*.txt\n*.md) do (\ndel %f\n)",
+                expected: "for %f in (*.txt\n*.md) do (\ndel %f\n)",
+            },
+            // A `(` opening no group is ordinary text.
+            ReadingCase {
+                name: "a closed argument paren is ordinary text",
+                text: "echo (a) done\nmore",
+                expected: "echo (a) done&more",
+            },
+            ReadingCase {
+                name: "a parenthesised argument is ordinary text",
+                text: "echo (see the log) below\ndir",
+                expected: "echo (see the log) below&dir",
+            },
+            // A statement body on the block's last line is not still waiting.
+            ReadingCase {
+                name: "a statement body on a block's last line is complete",
+                text: "if exist x (\ndir\n) echo b",
+                expected: "if exist x (\ndir\n) echo b",
+            },
+            ReadingCase {
+                name: "a for body on a block's last line is complete",
+                text: "for %f in (*.txt) do (\necho %f\n) echo t",
+                expected: "for %f in (*.txt) do (\necho %f\n) echo t",
+            },
+            ReadingCase {
+                name: "a statement body followed by an ampersand command",
+                text: "for %f in (*.txt) do (\necho %f\n)& dir",
+                expected: "for %f in (*.txt) do (\necho %f\n)& dir",
+            },
+            // A statement's own text written on a line runs to that line's end;
+            // a statement whose text the text itself ends is followed by nothing.
+            ReadingCase {
+                name: "a statement behind a break is a command of its own",
+                text: "echo a\nif exist x echo b",
+                expected: "echo a&if exist x echo b",
+            },
+            ReadingCase {
+                name: "a trailing break leaves a complete statement",
+                text: "echo a\nif exist x echo b\n",
+                expected: "echo a&if exist x echo b",
+            },
+            ReadingCase {
+                name: "a trailing break leaves a for block",
+                text: "for %f in (*.txt) do (\ndel %f\n)\n",
+                expected: "for %f in (*.txt) do (\ndel %f\n)",
+            },
+            ReadingCase {
+                name: "a trailing break leaves an if block",
+                text: "if exist x (\ndir\n) echo b\n",
+                expected: "if exist x (\ndir\n) echo b",
+            },
+            // A block bounds the statement written in it.
+            ReadingCase {
+                name: "a block bounds a statement written in it",
+                text: "(if exist x mkdir out)\ncopy a b",
+                expected: "(if exist x mkdir out)&copy a b",
+            },
+            ReadingCase {
+                name: "a block bounds a for written in it",
+                text: "(for %f in (*.log) do type %f)\ndel *.log",
+                expected: "(for %f in (*.log) do type %f)&del *.log",
+            },
+            ReadingCase {
+                name: "an argument paren bounds the statement it holds",
+                text: "echo (if exist y mkdir z)\ndir2",
+                expected: "echo (if exist y mkdir z)&dir2",
+            },
+            ReadingCase {
+                name: "a single-line command is never respelled",
+                text: "if not exist out mkdir out",
+                expected: "if not exist out mkdir out",
+            },
+            // A `(` a pipeline hands to another interpreter is not proven.
+            ReadingCase {
+                name: "a pipeline right-hand group under || is read as written",
+                text: "dir || (a\nb)",
+                expected: "dir || (a\nb)",
+            },
+            ReadingCase {
+                name: "a pipeline right-hand group under && is read as written",
+                text: "dir && (a\nb)",
+                expected: "dir && (a\nb)",
+            },
+            ReadingCase {
+                name: "a pipeline right-hand group under & is read as written",
+                text: "dir & (a\nb)",
+                expected: "dir & (a\nb)",
+            },
+            ReadingCase {
+                name: "an @group after || is read as written",
+                text: "dir || @(\nb\n)",
+                expected: "dir || @(\nb\n)",
+            },
+            // A `)` closing this platform's own block leaves the reader looking
+            // for a command, so the next `(` opens a block.
+            ReadingCase {
+                name: "a block after a closed block is a separator apart",
+                text: "(\ndir\n)\n(\ndel x\n)",
+                expected: "(\ndir\n)&(\ndel x\n)",
+            },
+            ReadingCase {
+                name: "a group after a closed group keeps its block",
+                text: "(a)\n(b\nc)",
+                expected: "(a)&(b\nc)",
+            },
+            ReadingCase {
+                name: "an @block keeps its breaks",
+                text: "@(\necho a\necho b\n)",
+                expected: "@(\necho a\necho b\n)",
+            },
+            ReadingCase {
+                name: "an if after a statement's group keeps its own block",
+                text: "if exist x (dir) if exist y (b\nc)",
+                expected: "if exist x (dir) if exist y (b\nc)",
+            },
+            // A break behind an operator is joined to its operand.
+            ReadingCase {
+                name: "a break behind && joins the next line",
+                text: "dir &&\nnext",
+                expected: "dir &&next",
+            },
+            ReadingCase {
+                name: "a break behind > joins its target",
+                text: "dir >\nout.txt",
+                expected: "dir >out.txt",
+            },
+            ReadingCase {
+                name: "a break behind < joins its target",
+                text: "dir <\nin.txt",
+                expected: "dir <in.txt",
+            },
+            ReadingCase {
+                name: "a break behind | joins the next command",
+                text: "dir |\nmore",
+                expected: "dir |more",
+            },
+            ReadingCase {
+                name: "a quoted operand ends the command before the break",
+                text: "dir >\"out.txt\"\nnext",
+                expected: "dir >\"out.txt\"&next",
+            },
+            ReadingCase {
+                name: "a group after a joined && is read against its breaks",
+                text: "dir &&\n(echo a\necho b)",
+                expected: "dir &&(echo a\necho b)",
+            },
+            // A plain break before a redirection is a separator.
+            ReadingCase {
+                name: "a plain break before > stays a separator",
+                text: "dir\n> out.txt",
+                expected: "dir& > out.txt",
+            },
+            ReadingCase {
+                name: "a plain break before >> stays a separator",
+                text: "dir\n>> out.txt",
+                expected: "dir& >> out.txt",
+            },
+            ReadingCase {
+                name: "a plain break before < stays a separator",
+                text: "dir\n< in.txt",
+                expected: "dir& < in.txt",
+            },
+            ReadingCase {
+                name: "a blank line before a redirection keeps the separator",
+                text: "dir\n\n> out.txt",
+                expected: "dir& > out.txt",
+            },
+            // A caret with a line to reach runs as written.
+            ReadingCase {
+                name: "a caret continuation runs as written",
+                text: "echo a ^\nb",
+                expected: "echo a ^\nb",
+            },
+            ReadingCase {
+                name: "a caret continuation keeps a trailing break",
+                text: "echo a ^\nb\n",
+                expected: "echo a ^\nb",
+            },
+            ReadingCase {
+                name: "an even caret run before a break ends the command",
+                text: "echo a ^^\nb",
+                expected: "echo a ^^&b",
+            },
+            ReadingCase {
+                name: "a blank line after a caret continuation is a command",
+                text: "echo a ^\n  \nb",
+                expected: "echo a ^\n  &b",
+            },
+            ReadingCase {
+                name: "a tab-only line after a caret continuation is a command",
+                text: "echo a ^\n \t\nb",
+                expected: "echo a ^\n \t&b",
+            },
+            // The full mode consults no guard reader: the same texts are read as
+            // the platform reads them.
+            ReadingCase {
+                name: "a single-quoted word is ordinary text in the full mode",
+                text: "echo 'a\nb'",
+                expected: "echo 'a&b'",
+            },
+            ReadingCase {
+                name: "a backslash before a break is ordinary text in the full mode",
+                text: "dir C:\\ws\\\ndel x",
+                expected: "dir C:\\ws\\&del x",
+            },
+            ReadingCase {
+                name: "a caret-escaped operator is ordinary text",
+                text: "dir ^& x\ndir y",
+                expected: "dir ^& x&dir y",
+            },
+            ReadingCase {
+                name: "a caret-escaped > keeps the lines one command",
+                text: "echo a ^>\nbuild.bat",
+                expected: "echo a ^>&build.bat",
+            },
+            ReadingCase {
+                name: "a caret-escaped operator continues the line",
+                text: "dir /b *.txt ^\n| findstr x",
+                expected: "dir /b *.txt ^\n| findstr x",
+            },
+            // A comment or label word read where the reader looks for a command.
+            ReadingCase {
+                name: "a word merely spelling rem is ordinary text",
+                text: "remainder\ndir",
+                expected: "remainder&dir",
+            },
+            ReadingCase {
+                name: "a rem-prefixed file name is ordinary text",
+                text: "rem.txt\ndir",
+                expected: "rem.txt&dir",
+            },
+            ReadingCase {
+                name: "a comment in an argument is ordinary text",
+                text: "echo rem\ndir",
+                expected: "echo rem&dir",
+            },
+            ReadingCase {
+                name: "a comment in a quoted word is ordinary text",
+                text: "echo \"rem note\"\ndir",
+                expected: "echo \"rem note\"&dir",
+            },
+            ReadingCase {
+                name: "a label in an argument is ordinary text",
+                text: "echo :label\ndir",
+                expected: "echo :label&dir",
+            },
+            ReadingCase {
+                name: "rem with a character appended is no comment command",
+                text: "rem. note\ndir",
+                expected: "rem. note&dir",
+            },
+            ReadingCase {
+                name: "a caret-escaped label is no label",
+                text: "echo a ^\n:not-a-label\nmore",
+                expected: "echo a ^\n:not-a-label&more",
+            },
+            ReadingCase {
+                name: "a trailing break leaves a swallowed comment line",
+                text: "rem note\n",
+                expected: "rem note",
+            },
+            ReadingCase {
+                name: "a comment line after a separator is the separator's command",
+                text: "dir\nrem note",
+                expected: "dir&rem note",
+            },
+            ReadingCase {
+                name: "a label line after a separator is the separator's command",
+                text: "echo a\n:: b",
+                expected: "echo a&:: b",
+            },
+            ReadingCase {
+                name: "a rem after a proven group is an argument",
+                text: "echo (a) rem note\ndir",
+                expected: "echo (a) rem note&dir",
+            },
+            ReadingCase {
+                name: "a rem inside an argument paren is an argument",
+                text: "echo (rem note)\ndir",
+                expected: "echo (rem note)&dir",
+            },
+            ReadingCase {
+                name: "a rem after an unprovable paren is an argument",
+                text: "dir (x) rem note\ndir2",
+                expected: "dir (x) rem note&dir2",
+            },
+            ReadingCase {
+                name: "a comment line inside a group keeps its breaks",
+                text: "(rem note\ndir\n)",
+                expected: "(rem note\ndir\n)",
+            },
+        ];
+        for case in cases {
             assert_eq!(
-                executable(one_line, ShellPlatform::Windows, ShellMode::ReadOnly).as_deref(),
-                Ok(before_first_break(one_line)),
-                "{one_line:?}"
+                read(case.text).as_deref(),
+                Ok(case.expected),
+                "{}: {:?}",
+                case.name,
+                case.text
             );
         }
-        // Nothing after the break is true of a break wherever it stands, so the same
-        // holds for the trailing break of a longer text: it is dropped like the blank
-        // lines' breaks, and the shape it ends on is not read as a break either. The
-        // text is read as the same line with and without it, so a statement the text
-        // ends on is still one the reader is left waiting for.
-        for (text, written) in [
-            ("dir&rem note", "dir\nrem note\n"),
-            ("echo a&dir C:\\ws\\", "echo a\ndir C:\\ws\\\n"),
-            ("dir&dir C:\\ws\\", "dir\ndir C:\\ws\\\n"),
+        // A carriage return run immediately before a break belongs to the break:
+        // the reading goes on to re-spell the lines exactly as under one `\r`.
+        for (name, one, run) in [
+            (
+                "an operator join reads the same under a carriage run",
+                "dir &&\r\nnext",
+                "dir &&\r\r\nnext",
+            ),
+            (
+                "a plain separator reads the same under a carriage run",
+                "dir\r\n\r\r\ndel x",
+                "dir\r\r\n\r\r\ndel x",
+            ),
         ] {
-            reads(written, text);
-            assert_eq!(
-                executable(written, ShellPlatform::Windows, ShellMode::ReadOnly).as_deref(),
-                Ok(text),
-                "{written:?}"
+            assert_eq!(read(run), read(one), "{name}: {run:?}");
+        }
+    }
+
+    /// Every shape the full mode refuses, as one table: one row per spelling,
+    /// with the cause it must name.
+    #[test]
+    #[expect(clippy::too_many_lines)] // one cohesive table over the refusal's shapes
+    fn refusal_cases() {
+        let cases: &[RefusalCase] = &[
+            // A statement the reader is left waiting for: the same text with and
+            // without a trailing break, and the same refusal.
+            RefusalCase {
+                name: "a statement waiting for its own text",
+                text: "dir\nif exist x",
+                needle: "waiting for its own",
+            },
+            RefusalCase {
+                name: "a statement waiting for its own text across a trailing break",
+                text: "dir\nif exist x\n",
+                needle: "waiting for its own",
+            },
+            // A statement's own `)` ends its word positions; the word after it is
+            // a command of its own and the break behind it is refused.
+            RefusalCase {
+                name: "a break behind a statement's own group is refused",
+                text: "if exist x (dir) cls\ndir",
+                needle: "runs that command",
+            },
+            RefusalCase {
+                name: "a break behind a statement's own group with no command",
+                text: "if exist x (dir)\ndir",
+                needle: "runs that command",
+            },
+            // A statement's own text runs to the line's end.
+            RefusalCase {
+                name: "a statement's governed command absorbs the next line",
+                text: "if exist x echo a\ndel C:\\ws\\x.txt",
+                needle: "runs that command to the end",
+            },
+            RefusalCase {
+                name: "a not-exist statement absorbs the next line",
+                text: "if not exist out mkdir out\ncopy a b",
+                needle: "runs that command to the end",
+            },
+            RefusalCase {
+                name: "a block body does not end the statement",
+                text: "if exist x (dir)\ncopy a b",
+                needle: "runs that command to the end",
+            },
+            RefusalCase {
+                name: "a block body with a command behind it still absorbs",
+                text: "if exist x (\ndir\n) echo b\ncopy a b",
+                needle: "runs that command to the end",
+            },
+            RefusalCase {
+                name: "a do body absorbs the next line",
+                text: "for %f in (*.log) do type %f\ndel *.log",
+                needle: "runs that command to the end",
+            },
+            RefusalCase {
+                name: "a nested statement absorbs the next line",
+                text: "if exist x if exist y dir\ncopy a b",
+                needle: "runs that command to the end",
+            },
+            RefusalCase {
+                name: "a caret-spelled statement absorbs the next line",
+                text: "dir & ^if exist x echo b\ncopy a b",
+                needle: "runs that command to the end",
+            },
+            RefusalCase {
+                name: "a paren on a statement's line does not end its text",
+                text: "if exist x echo (a) done\nmore",
+                needle: "runs that command",
+            },
+            RefusalCase {
+                name: "a paren in a do body does not end its text",
+                text: "for %f in (*.txt) do echo %f (x)\ndir",
+                needle: "runs that command",
+            },
+            RefusalCase {
+                name: "a paren in a not-exist body does not end its text",
+                text: "if not exist out mkdir out (x)\ncopy a b",
+                needle: "runs that command",
+            },
+            RefusalCase {
+                name: "a group on a statement's line does not end its text",
+                text: "if exist x (echo a) & (b c)\ndir",
+                needle: "runs that command",
+            },
+            RefusalCase {
+                name: "a joined comparison leaves the reader waiting",
+                text: "if x ==1\nmore",
+                needle: "waiting for its own",
+            },
+            RefusalCase {
+                name: "a statement whose own command is a block is not bounded",
+                text: "if exist x (if exist y (\ndir\n))\ncopy a b",
+                needle: "runs that command",
+            },
+            RefusalCase {
+                name: "an agent's own ampersand behind a statement is refused",
+                text: "if exist x (\ndir\n) & echo b\ndir2",
+                needle: "runs that command",
+            },
+            // A `)` the reading cannot pair, and a `(` whose group cannot be
+            // proven.
+            RefusalCase {
+                name: "a paren inside a group counts against an untellable group",
+                text: "if exist x (\ndir C:\\ws\\(a)\ndel C:\\ws\\x.txt\n)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "an unpaired ) at a command position is discarded",
+                text: "dir\n) echo b",
+                needle: "discards",
+            },
+            RefusalCase {
+                name: "an unpaired ) after a block is discarded",
+                text: "(\ndel C:\\ws\\x.txt)\necho tail\n)",
+                needle: "discards",
+            },
+            RefusalCase {
+                name: "an unpaired ) after a statement's group is discarded",
+                text: "if exist x (echo a\n) )\ndir",
+                needle: "discards",
+            },
+            RefusalCase {
+                name: "a pipeline's right-hand group cannot be proven",
+                text: "echo x | (\ndir\n)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "an if pipeline's right-hand group cannot be proven",
+                text: "if exist x | (\ndir\n)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "a for pipeline's right-hand group cannot be proven",
+                text: "for %f in (a) do | (\ndir\n)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "an else pipeline's right-hand group cannot be proven",
+                text: "if exist x (dir) else | (\ndir\n)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "an @group on a pipeline's right cannot be proven",
+                text: "dir | @(\nb\n)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "a paren after a closed argument paren cannot be proven",
+                text: "echo (a) (b\nc)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "an empty argument paren cannot be proven",
+                text: "echo () (b\nc)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "a parenthesised word inside a proven block is refused",
+                text: "if exist x (\necho (a)\n)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "a parenthesised argument path is refused",
+                text: "if exist x (\ndir C:\\ws (x86)\\bin\n)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "a paren in an operand position opens no proven group",
+                text: "dir >\n(echo a\necho b)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "a paren after a statement's group is an argument",
+                text: "if exist x (dir) echo (b\nc)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "a paren after a statement's group and a command",
+                text: "if exist x (dir) cls (b\nc)",
+                needle: "bracketed group",
+            },
+            // A join that would spell an operator of its own.
+            RefusalCase {
+                name: "joining > and > spells an operator",
+                text: "dir >\n> next",
+                needle: "operator",
+            },
+            RefusalCase {
+                name: "joining > and < spells an operator",
+                text: "dir >\n< next",
+                needle: "operator",
+            },
+            RefusalCase {
+                name: "joining < and < spells an operator",
+                text: "dir <\n< next",
+                needle: "operator",
+            },
+            RefusalCase {
+                name: "joining < and > spells an operator",
+                text: "dir <\n> next",
+                needle: "operator",
+            },
+            RefusalCase {
+                name: "joining & and > spells an operator",
+                text: "dir &\n> out.txt",
+                needle: "operator",
+            },
+            RefusalCase {
+                name: "joining | and > spells an operator",
+                text: "dir |\n> out.txt",
+                needle: "operator",
+            },
+            RefusalCase {
+                name: "joining && and > spells an operator",
+                text: "dir &&\n> out.txt",
+                needle: "operator",
+            },
+            // Shapes the two readers disagree about: an open span, a caret over
+            // a paren, a text block, and an unclosed span or bracket.
+            RefusalCase {
+                name: "a break inside the platform's own quote span",
+                text: "echo \"a\nb\"",
+                needle: "double-quoted",
+            },
+            RefusalCase {
+                name: "a caret escape reaching a paren",
+                text: "if exist x ^\n(\ndel y\n)",
+                needle: "escapes",
+            },
+            RefusalCase {
+                name: "a caret escape reaching a paren after joining",
+                text: "dir &&^\n(del x\ndel y)",
+                needle: "escapes",
+            },
+            RefusalCase {
+                name: "a text block this platform has none of",
+                text: "cat <<EOF\nx\nEOF",
+                needle: "text block",
+            },
+            RefusalCase {
+                name: "a caret-hidden text block is still a text block",
+                text: "cat ^<<EOF\nx\nEOF",
+                needle: "text block",
+            },
+            RefusalCase {
+                name: "an unterminated quote span",
+                text: "echo \"unterminated\nb",
+                needle: "double-quoted",
+            },
+            RefusalCase {
+                name: "an unclosed quote word",
+                text: "echo a\necho \"b",
+                needle: "unclosed",
+            },
+            RefusalCase {
+                name: "an unclosed bracket",
+                text: "(\ndir\n",
+                needle: "unclosed",
+            },
+            RefusalCase {
+                name: "a caret with nothing to escape",
+                text: "dir\necho b^",
+                needle: "left waiting",
+            },
+            RefusalCase {
+                name: "a connector behind a separator break",
+                text: "dir\n&& next",
+                needle: "connector",
+            },
+            RefusalCase {
+                name: "a connector behind an operator join",
+                text: "dir &\n& x",
+                needle: "connector",
+            },
+            RefusalCase {
+                name: "a pipe behind a pipe join",
+                text: "dir |\n| more",
+                needle: "connector",
+            },
+            RefusalCase {
+                name: "a paren in an argument of any command",
+                text: "echo a (\necho b)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "a paren in a short argument",
+                text: "echo (\nb)",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "a #-comment-looking argument with a paren",
+                text: "echo 'total ('\necho more",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "a hash argument with a paren",
+                text: "echo a # (note\necho b",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "a paren after an if's command word",
+                text: "if exist x echo (\nmore",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "a paren in an argument path",
+                text: "dir C:\\ws (\nmore",
+                needle: "bracketed group",
+            },
+            RefusalCase {
+                name: "a paren after an argument",
+                text: "echo (a\necho b)",
+                needle: "bracketed group",
+            },
+            // A caret left with nothing to escape, whichever break follows it.
+            RefusalCase {
+                name: "a caret at the last line's end",
+                text: "dir\necho b^",
+                needle: "left waiting",
+            },
+            RefusalCase {
+                name: "a caret before a dropped trailing break",
+                text: "dir\necho b^\n",
+                needle: "left waiting",
+            },
+            RefusalCase {
+                name: "a caret before a dropped trailing carriage break",
+                text: "dir\necho b^\r\n",
+                needle: "left waiting",
+            },
+            RefusalCase {
+                name: "a caret before a dropped trailing break alone",
+                text: "echo a ^\n",
+                needle: "left waiting",
+            },
+            RefusalCase {
+                name: "a caret before a dropped trailing carriage break alone",
+                text: "echo a ^\r\n",
+                needle: "left waiting",
+            },
+            RefusalCase {
+                name: "caret-only lines paired across dropped breaks",
+                text: "||\n^\n^\n^",
+                needle: "left waiting",
+            },
+            RefusalCase {
+                name: "caret-only lines paired across dropped breaks with a trailing break",
+                text: "||\n^\n^\n^\n",
+                needle: "left waiting",
+            },
+            RefusalCase {
+                name: "a caret left taking a blank line's break",
+                text: "echo a ^\n\n",
+                needle: "left taking",
+            },
+            RefusalCase {
+                name: "a caret left taking a blank carriage-line's break",
+                text: "echo a ^\r\n\r\n",
+                needle: "left taking",
+            },
+            RefusalCase {
+                name: "a caret left taking a blank line's break before a group",
+                text: "dir ^\n\n(x)",
+                needle: "left taking",
+            },
+            // A comment or label word at a command position swallows its line.
+            RefusalCase {
+                name: "a rem comment at a command position swallows the line",
+                text: "rem note\ndir",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "a bare rem swallows the line",
+                text: "rem\ndir",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "an @rem swallows the line",
+                text: "@rem note\ndir",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "an upper-case REM swallows the line",
+                text: "REM NOTE\ndir",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "an indented rem swallows the line",
+                text: "  rem note\ndir",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "rem with a comma swallows the line",
+                text: "rem,note\ndir",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "a caret-spelled rem swallows the line",
+                text: "dir & ^rem x\ndir2",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "a caret continuation into a rem swallows the lines",
+                text: "del x & ^\nrem note\nmore",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "a :: label swallows the line",
+                text: ":: note\ndir",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "a :label swallows the line",
+                text: ":label\ndir",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "a :: label after a separator swallows the line",
+                text: "echo a\n:: b\nmore",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "a label after an & swallows the line",
+                text: "dir & :label\nmore",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "a label after a pipe swallows the line",
+                text: "dir | :label\nmore",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "a label after a group swallows the line",
+                text: "(dir) :label\nmore",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "an @-prefixed label swallows the line",
+                text: "@:label\ndir",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "an @-space-prefixed label swallows the line",
+                text: "@ :label\ndir",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "an @-tab-prefixed label swallows the line",
+                text: "@\t:label\ndir",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "a rem inside a group leaves the group unclosed",
+                text: "echo a\n(rem note)",
+                needle: "unclosed bracketed group",
+            },
+            RefusalCase {
+                name: "a rem line opens a group that the line never closes",
+                text: "(rem note)\ndir",
+                needle: "unclosed bracketed group",
+            },
+            RefusalCase {
+                name: "a paren on a rem's line is the comment's text",
+                text: "rem note (x)\ndir",
+                needle: "comment (`rem`) or a label",
+            },
+            RefusalCase {
+                name: "a rem after a proven block's ) is a command",
+                text: "(dir) rem note\ndir2",
+                needle: "comment (`rem`) or a label",
+            },
+        ];
+        for case in cases {
+            assert!(
+                refused(case.text).contains(case.needle),
+                "{}: {:?} = {:?}",
+                case.name,
+                case.text,
+                refused(case.text)
             );
         }
+        // A trailing break changes nothing about the statement the text ends on.
         assert_eq!(
-            read("dir\nif exist x\n"),
-            read("dir\nif exist x"),
+            refused("dir\nif exist x\n"),
+            refused("dir\nif exist x"),
             "a trailing break changes nothing about the statement the text ends on"
         );
-    }
-
-    #[test]
-    fn a_crlf_break_is_one_break() {
-        reads("a\r\nb", "a&b");
-        // The spelling of the break is the only difference: nothing else about the
-        // reading depends on it, down to the word a line ends on and the character a
-        // caret's escape reaches.
-        for (lf, crlf) in [
-            ("if exist x echo\nmore", "if exist x echo\r\nmore"),
+        // One break reads as one break however it is spelled: a shape refused
+        // under one `\r` is refused under a run of them.
+        for (name, one, run, needle) in [
             (
-                "if exist x (\ndir\n) echo b",
-                "if exist x (\r\ndir\r\n) echo b",
+                "a dangling caret is refused under a carriage run",
+                "echo a ^\r\n",
+                "echo a ^\r\r\n",
+                Some("left waiting"),
             ),
-            ("if exist x (dir) cls\ndir", "if exist x (dir) cls\r\ndir"),
             (
-                "if exist x echo (a) done\nmore",
-                "if exist x echo (a) done\r\nmore",
+                "a comment line is refused under a carriage run",
+                "dir\nrem\r\ndel x",
+                "dir\nrem\r\r\ndel x",
+                Some("comment"),
             ),
-            ("if x ==1\nmore", "if x ==1\r\nmore"),
-            ("echo a ^\nb", "echo a ^\r\nb"),
-            ("echo a ^\n\n", "echo a ^\r\n\r\n"),
-            ("dir || (a\nb)", "dir || (a\r\nb)"),
+            (
+                "a label line is refused under a carriage run",
+                "dir\n:: note\r\ndel x",
+                "dir\n:: note\r\r\ndel x",
+                None,
+            ),
+            (
+                "a statement's own text is refused under a carriage run",
+                "if exist x echo\r\nmore",
+                "if exist x echo\r\r\nmore",
+                None,
+            ),
         ] {
-            match (read(lf), read(crlf)) {
-                (Ok(left), Ok(right)) => assert_eq!(right.replace("\r\n", "\n"), left, "{crlf:?}"),
-                (Err(left), Err(right)) => assert_eq!(right, left, "{crlf:?}"),
-                pair => panic!("{crlf:?}: the spelling of the break changed the reading: {pair:?}"),
+            assert_eq!(refused(run), refused(one), "{name}: {run:?}");
+            if let Some(needle) = needle {
+                assert!(
+                    refused(run).contains(needle),
+                    "{name}: {run:?} = {:?}",
+                    refused(run)
+                );
             }
         }
     }
 
-    /// One break reads as one break however it is spelled: every `\r` standing
-    /// immediately before the break belongs to the break, so a rule that reads the line
-    /// before it — the caret the reader is left waiting for, the comment command, the
-    /// guard's own `\` — reads the same shape under a longer run of them as under one,
-    /// and a shape refused under one spelling is refused under the other.
-    #[test]
-    fn a_run_of_carriage_returns_is_the_one_break() {
-        for (one, run) in [
-            // A caret whose escape has nothing left to take, so the reader is left
-            // waiting for a character the text never supplies.
-            ("echo a ^\r\n", "echo a ^\r\r\n"),
-            // A comment line, which takes the rest of its line — the separator a break
-            // would be joined with included — as the comment's own text.
-            ("dir\nrem\r\ndel x", "dir\nrem\r\r\ndel x"),
-            // A label line, whose name is the rest of its line.
-            ("dir\n:: note\r\ndel x", "dir\n:: note\r\r\ndel x"),
-            // A line whose own text runs to its end: the separator would become part of
-            // the statement rather than a command of its own.
-            ("if exist x echo\r\nmore", "if exist x echo\r\r\nmore"),
-        ] {
-            assert_eq!(refused(run), refused(one), "{run:?}");
-        }
-        assert!(refused("echo a ^\r\r\n").contains("left waiting"));
-        assert!(refused("dir\nrem\r\r\ndel x").contains("comment"));
-        // The shapes the reading goes on to re-spell read the same under either spelling
-        // of the break: an operator joining its operand, and the separator of a plain
-        // line.
-        for (one, run) in [
-            ("dir &&\r\nnext", "dir &&\r\r\nnext"),
-            ("dir\r\n\r\r\ndel x", "dir\r\r\n\r\r\ndel x"),
-        ] {
-            assert_eq!(
-                read(run).expect("read"),
-                read(one).expect("read"),
-                "{run:?}"
-            );
-        }
-        // The guard's own reading of an odd `\` run is decided in the mode whose guard
-        // read the original text, and reads the run of carriage returns the same way.
-        for (one, run) in [
-            ("dir \\\\\\\r\ndel x", "dir \\\\\\\r\r\ndel x"),
-            ("(echo a\\\r\ndel x)", "(echo a\\\r\r\ndel x)"),
-        ] {
-            assert_eq!(refused_read_only(run), refused_read_only(one), "{run:?}");
-        }
-        // A break the platform's reader continues across is kept byte for byte, the run
-        // of carriage returns included: nothing is re-spelled into a command the agent
-        // did not write.
-        reads("echo a ^\r\r\nb", "echo a ^\r\r\nb");
-        reads("(\r\r\ndir\r\r\n)", "(\r\r\ndir\r\r\n)");
-        // A carriage return with no line feed behind it is no break to this reading:
-        // such a text is the one line it was written as, handed over byte for byte,
-        // never respelled into a second command — a platform reader that ended a line
-        // at one would lose everything after it (rule 8).
-        reads("dir\rdel x", "dir\rdel x");
-        reads("echo a\rb", "echo a\rb");
-    }
-
-    #[test]
-    fn the_platforms_own_continuations_stay_as_written() {
-        // An odd caret run escapes the break, whose continuation is the command the
-        // caret spread: the two lines are one command and are left as written.
-        reads("echo a ^\nb", "echo a ^\nb");
-        reads("copy a.txt ^\nb.txt", "copy a.txt ^\nb.txt");
-        // An even one is a literal caret before a break that ends the command.
-        reads("echo a ^^\nb", "echo a ^^&b");
-        // An escaped caret at the end of the text is not a pending escape either.
-        reads("dir\necho b^^", "dir&echo b^^");
-        // A break inside a bracketed group, blank line included, is the
-        // platform's own multi-line block.
-        reads(
-            "for %f in (*.txt) do (\ndel x\n)",
-            "for %f in (*.txt) do (\ndel x\n)",
-        );
-        reads(
-            "for %f in (*.txt) do (\n\ndel x\n)",
-            "for %f in (*.txt) do (\n\ndel x\n)",
-        );
-        // The group openers this platform puts at an argument position: the `)`
-        // of a statement's own group, and the `if` condition's end.
-        reads(
-            "if exist C:\\ws\\x.txt (\ndel C:\\ws\\x.txt\n)",
-            "if exist C:\\ws\\x.txt (\ndel C:\\ws\\x.txt\n)",
-        );
-        reads(
-            "if exist x (echo a\n) else (\necho b\n)",
-            "if exist x (echo a\n) else (\necho b\n)",
-        );
-        reads(
-            "@if not defined DEBUG (\necho release\n)",
-            "@if not defined DEBUG (\necho release\n)",
-        );
-        reads("if %a%==1 (\necho one\n)", "if %a%==1 (\necho one\n)");
-        // The rest of this platform's `if` conditions: a comparison's second
-        // string, a comparison operator, and the `/i` switch.
-        reads(
-            "if \"%a%\" == \"1\" (\necho one\n)",
-            "if \"%a%\" == \"1\" (\necho one\n)",
-        );
-        reads("if %a% equ 1 (\necho one\n)", "if %a% equ 1 (\necho one\n)");
-        reads(
-            "if /i \"A\"==\"a\" (\necho same\n)",
-            "if /i \"A\"==\"a\" (\necho same\n)",
-        );
-        // A statement's body written as another statement, and the `else if` chain.
-        reads(
-            "for %f in (*.txt) do if exist %f (\ndel %f\n)",
-            "for %f in (*.txt) do if exist %f (\ndel %f\n)",
-        );
-        reads(
-            "if exist x (\necho a\n) else if exist y (\necho b\n)",
-            "if exist x (\necho a\n) else if exist y (\necho b\n)",
-        );
-        // A `for`'s set spans lines: this platform appends the next line to it and
-        // the statement's own `do` still follows.
-        reads("for %f in (a\nb) do echo %f", "for %f in (a\nb) do echo %f");
-        reads(
-            "for %f in (*.txt\n*.md) do (\ndel %f\n)",
-            "for %f in (*.txt\n*.md) do (\ndel %f\n)",
-        );
-        // A `(` that opens no group is ordinary text, so a break after both
-        // parens are closed is the separator it is. The statement is over by then,
-        // which the separators after it show.
-        reads("echo (a) done\nmore", "echo (a) done&more");
-        reads(
-            "echo (see the log) below\ndir",
-            "echo (see the log) below&dir",
-        );
-        // The word a line ends on is a word like any other: a statement completed by
-        // it is not one still waiting for its own text, so a statement body on the
-        // block's last line — with a command after the `)` and with none — leaves a
-        // text the reader is not waiting for.
-        reads("if exist x (\ndir\n) echo b", "if exist x (\ndir\n) echo b");
-        reads(
-            "for %f in (*.txt) do (\necho %f\n) echo t",
-            "for %f in (*.txt) do (\necho %f\n) echo t",
-        );
-        reads(
-            "for %f in (*.txt) do (\necho %f\n)& dir",
-            "for %f in (*.txt) do (\necho %f\n)& dir",
-        );
-        // A statement's own `)` ends its word positions: what follows at the same
-        // position is a command of its own — and a statement whose own text that word
-        // belongs to has still absorbed the line, which is why the break behind it is
-        // refused rather than respelled (see the statement test below).
-        assert!(refused("if exist x (dir) cls\ndir").contains("runs that command"));
-        assert!(refused("if exist x (dir)\ndir").contains("runs that command"));
-    }
-
-    /// A statement's own text written on a line runs to that line's end, so a
-    /// separator behind it would be read as part of the statement: the following line
-    /// would run under the condition, or once per iteration, instead of as a command
-    /// of its own. The whole text is refused rather than run as something else.
-    #[test]
-    fn a_break_behind_a_statements_own_text_is_refused() {
-        let task = "runs that command to the end";
-        for text in [
-            // The command its condition governs, written on the line.
-            "if exist x echo a\ndel C:\\ws\\x.txt",
-            "if not exist out mkdir out\ncopy a b",
-            // The same through the block a statement's body is written as: the `)`
-            // does not end the statement for this platform's reader.
-            "if exist x (dir)\ncopy a b",
-            "if exist x (\ndir\n) echo b\ncopy a b",
-            // A `do` body, and a nested statement as one.
-            "for %f in (*.log) do type %f\ndel *.log",
-            "if exist x if exist y dir\ncopy a b",
-            // A statement whose first letter a caret escape carried is the statement it
-            // spells: the escape was over a letter and removed nothing but itself.
-            "dir & ^if exist x echo b\ncopy a b",
-        ] {
-            assert!(refused(text).contains(task), "{text:?}");
-        }
-        // A statement whose text the text itself ends is not followed by anything, and
-        // a statement behind the break is a command of its own.
-        reads("echo a\nif exist x echo b", "echo a&if exist x echo b");
-        // A break with nothing after it separates nothing, so a trailing break cannot
-        // turn such a text into a refusal: the text the platform runs is the same.
-        reads("echo a\nif exist x echo b\n", "echo a&if exist x echo b");
-        reads(
-            "for %f in (*.txt) do (\ndel %f\n)\n",
-            "for %f in (*.txt) do (\ndel %f\n)",
-        );
-        reads(
-            "if exist x (\ndir\n) echo b\n",
-            "if exist x (\ndir\n) echo b",
-        );
-        // A `(` on the line does not end a statement's own text: whether the group it
-        // opens is one this reading can name (the words restart inside it) or not (they
-        // stay the argument's), the line after the break would still be read inside the
-        // statement.
-        for text in [
-            "if exist x echo (a) done\nmore",
-            "for %f in (*.txt) do echo %f (x)\ndir",
-            "if not exist out mkdir out (x)\ncopy a b",
-            "if exist x (echo a) & (b c)\ndir",
-        ] {
-            assert!(refused(text).contains("runs that command"), "{text:?}");
-            // The reading of the breaks is the same in both modes: the guard's
-            // divergences are all this module decides in one of them alone.
-            assert!(
-                refused_read_only(text).contains("runs that command"),
-                "{text:?}"
-            );
-        }
-        // A comparison's operator with its second string joined to it is the
-        // condition's text, not the statement's command: the reader is left waiting for
-        // what the condition governs, which is the cause it reports.
-        assert!(refused("if x ==1\nmore").contains("waiting for its own"));
-        // A block bounds the statement written in it, so the break behind the block is
-        // the separator it is.
-        reads(
-            "(if exist x mkdir out)\ncopy a b",
-            "(if exist x mkdir out)&copy a b",
-        );
-        reads(
-            "(for %f in (*.log) do type %f)\ndel *.log",
-            "(for %f in (*.log) do type %f)&del *.log",
-        );
-        // A statement whose own text is bounded by a `(` it does not own — an argument
-        // paren, whose group this reading cannot name — ends where that group closes.
-        reads(
-            "echo (if exist y mkdir z)\ndir2",
-            "echo (if exist y mkdir z)&dir2",
-        );
-        // A statement whose *own* command is a block is not bounded by it: the block is
-        // part of the text this platform's reader runs to the end of the line.
-        assert!(
-            refused("if exist x (if exist y (\ndir\n))\ncopy a b").contains("runs that command"),
-        );
-        // An agent's own `&` behind a statement's text is the agent's own reading, and
-        // the break behind *that* is refused like any other (see the test above).
-        assert!(refused("if exist x (\ndir\n) & echo b\ndir2").contains("runs that command"),);
-        // A single-line command is never respelled, whatever it holds (see
-        // [`unix_and_single_line_texts_are_handed_back_untouched`]).
-        reads("if not exist out mkdir out", "if not exist out mkdir out");
-    }
-
-    #[test]
-    fn a_statement_cut_by_a_break_is_refused_rather_than_split() {
-        // The statement's own text is missing, and the break ends the command where
-        // this platform's reader is still waiting for it: running the next line as a
-        // command of its own would run what the statement never named.
-        for text in [
-            "for %f in\ndo echo %f",
-            "for %f in (a b)\ndo echo %f",
-            "if exist x\ndel C:\\ws\\x.txt",
-            "if not exist x\ndel C:\\ws\\x.txt",
-        ] {
-            assert!(refused(text).contains("waiting"), "{text:?}");
-        }
-        // The split between a `for`'s set and its `do`.
-        assert!(refused("for %f in (a\nb)\ndo echo %f").contains("waiting"));
-        // A statement whose own command the last line carries is not one of these:
-        // its text is written, and this reading refuses the break for a different
-        // reason ([`STATEMENT_SPANS_LINE`], see the statement test below).
-        assert!(refused("if exist x echo\nmore").contains("runs that command to the end"));
-    }
-
-    #[test]
-    fn a_paren_whose_group_cannot_be_told_is_refused() {
-        // A `)` this platform's reader counts against a group this reading cannot
-        // name: it may close the group below it, so the lines after it are unknown.
-        assert!(
-            refused("if exist x (\ndir C:\\ws\\(a)\ndel C:\\ws\\x.txt\n)")
-                .contains("bracketed group")
-        );
-        // A `)` this platform's counter cannot pair, where its reader is looking for
-        // a command: its own reading discards the rest of the line there.
-        assert!(refused("dir\n) echo b").contains("discards"));
-        assert!(refused("(\ndel C:\\ws\\x.txt)\necho tail\n)").contains("discards"));
-        // The same `)` right after a statement's own group: the reader is looking for
-        // a command there too, so the rest of the line is discarded as well.
-        assert!(refused("if exist x (echo a\n) )\ndir").contains("discards"));
-        // A `(` a pipeline's right-hand side opens: the interpreter the pipeline
-        // hands that side to is the one that counts it, so a break reaching it is
-        // refused rather than read as the block it may have been. `||` — which this
-        // platform runs in this interpreter, like `&`/`&&` — is not that case, and
-        // neither is the pipeline's own `@(` prefix, which is the same position.
-        for text in [
-            "echo x | (\ndir\n)",
-            "if exist x | (\ndir\n)",
-            "for %f in (a) do | (\ndir\n)",
-            "if exist x (dir) else | (\ndir\n)",
-            "dir | @(\nb\n)",
-        ] {
-            assert!(refused(text).contains("bracketed group"), "{text:?}");
-        }
-        reads("dir || (a\nb)", "dir || (a\nb)");
-        reads("dir && (a\nb)", "dir && (a\nb)");
-        reads("dir & (a\nb)", "dir & (a\nb)");
-        reads("dir || @(\nb\n)", "dir || @(\nb\n)");
-        // A `)` that closed a block of this platform's own leaves the reader looking
-        // for a command, so the `(` after it opens a block like the one before it —
-        // and so does the `@` this platform suppresses the echo of a block with.
-        reads("(\ndir\n)\n(\ndel x\n)", "(\ndir\n)&(\ndel x\n)");
-        reads("(a)\n(b\nc)", "(a)&(b\nc)");
-        reads("@(\necho a\necho b\n)", "@(\necho a\necho b\n)");
-        assert!(refused("echo (a) (b\nc)").contains("bracketed group"));
-        assert!(refused("echo () (b\nc)").contains("bracketed group"));
-        // A parenthesised word inside a proven block, where this platform's `)` is the
-        // counter's and not the argument's: the block it closes is not the one the text
-        // was written as, so the command is refused rather than run as the two
-        // different texts the two readings make of it. (The rule list in the module doc
-        // states this one.)
-        assert!(refused("if exist x (\necho (a)\n)").contains("bracketed group"));
-        assert!(refused("if exist x (\ndir C:\\ws (x86)\\bin\n)").contains("bracketed group"));
-        // A break behind an operator joins the lines into one command, so the line
-        // the operand continues is the line the operator was written on: a `(` there
-        // is still in the operand's position and opens no proven group.
-        assert!(refused("dir >\n(echo a\necho b)").contains("bracketed group"));
-        // A `(` after a statement's own `)` is the same: the statement is over, so
-        // the `(` stands in the argument of the command after it and opens no group
-        // of a statement — while the `if`/`for` that may start there keeps its own.
-        assert!(refused("if exist x (dir) echo (b\nc)").contains("bracketed group"));
-        assert!(refused("if exist x (dir) cls (b\nc)").contains("bracketed group"));
-        reads(
-            "if exist x (dir) if exist y (b\nc)",
-            "if exist x (dir) if exist y (b\nc)",
-        );
-    }
-
-    #[test]
-    fn a_break_after_an_operator_is_joined_to_its_operand() {
-        reads("dir &&\nnext", "dir &&next");
-        reads("dir >\nout.txt", "dir >out.txt");
-        reads("dir <\nin.txt", "dir <in.txt");
-        reads("dir |\nmore", "dir |more");
-        // A quoted operand is the break's last significant character, so the break
-        // is not behind the operator the target was written after: it ends the
-        // command instead of joining the two lines.
-        reads("dir >\"out.txt\"\nnext", "dir >\"out.txt\"&next");
-        // The joined line is one command, and a `(` after the operator a command
-        // starts with opens a group the block's own breaks are read against.
-        reads("dir &&\n(echo a\necho b)", "dir &&(echo a\necho b)");
-    }
-
-    #[test]
-    fn a_join_that_would_spell_an_operator_of_its_own_is_refused() {
-        // The two characters the join would put together spell an operator the command
-        // never wrote, so the lines are refused rather than joined.
-        for text in [
-            "dir >\n> next",
-            "dir >\n< next",
-            "dir <\n< next",
-            "dir <\n> next",
-            "dir &\n> out.txt",
-            "dir |\n> out.txt",
-            "dir &&\n> out.txt",
-        ] {
-            assert!(refused(text).contains("operator"), "{text:?}");
-        }
-        // A plain break before a line that opens with a redirection is a separator
-        // like any other: the two operator characters are kept apart by a space, so
-        // nothing spells `&>`, and the second line runs as the line it is — a
-        // redirection with no command, which is an error this platform reports.
-        reads("dir\n> out.txt", "dir& > out.txt");
-        reads("dir\n>> out.txt", "dir& >> out.txt");
-        reads("dir\n< in.txt", "dir& < in.txt");
-        // The redirect written on the line after a blank one is the same shape.
-        reads("dir\n\n> out.txt", "dir& > out.txt");
-        // The redirection the *joined* line takes is the operator's operand, so the
-        // line after a break opening with anything else is its own text.
-        reads("dir >\nout.txt", "dir >out.txt");
-    }
-
-    #[test]
-    fn shapes_the_two_readers_disagree_about_are_refused() {
-        // A break inside this platform's own `"` span: the argument would reach
-        // its program truncated.
-        assert!(refused("echo \"a\nb\"").contains("double-quoted"));
-        // A caret at the end of a line whose escape reaches a paren: the character is
-        // ordinary text here, so this reading's own group counter — the pairs its
-        // breaks are read against — would be left out of step with the text.
-        assert!(refused("if exist x ^\n(\ndel y\n)").contains("escapes"));
-        assert!(refused("dir &&^\n(del x\ndel y)").contains("escapes"));
-        // A text block: this platform has none, and a caret over its first `<`
-        // does not hide the `<<` from the parser that reads the text.
-        assert!(refused("cat <<EOF\nx\nEOF").contains("text block"));
-        assert!(refused("cat ^<<EOF\nx\nEOF").contains("text block"));
-        // A span or bracket the text never closes, and a caret with nothing left
-        // to escape.
-        assert!(refused("echo \"unterminated\nb").contains("double-quoted"));
-        assert!(refused("echo a\necho \"b").contains("unclosed"));
-        assert!(refused("(\ndir\n").contains("unclosed"));
-        assert!(refused("dir\necho b^").contains("left waiting"));
-        // A connector as the first significant character after a break: behind a
-        // separator break, and behind an operator whose join would otherwise eat
-        // the agent's operator into one it never wrote.
-        assert!(refused("dir\n&& next").contains("connector"));
-        assert!(refused("dir &\n& x").contains("connector"));
-        assert!(refused("dir |\n| more").contains("connector"));
-        // A `(` whose group cannot be proved: this platform's reader opens one only
-        // where it is looking for a command, and the text after the break may be
-        // the block's body or a command of its own. A `(` in an argument of any
-        // command, a `#`-comment-looking argument, and a `(` after an `if`'s
-        // command word instead of after its condition.
-        for text in [
-            "echo a (\necho b)",
-            "echo (\nb)",
-            "echo 'total ('\necho more",
-            "echo a # (note\necho b",
-            "if exist x echo (\nmore",
-            "dir C:\\ws (\nmore",
-            "echo (a\necho b)",
-        ] {
-            assert!(refused(text).contains("bracketed group"), "{text:?}");
-        }
-    }
-
-    /// The caret's escape has nothing to take in the text that runs, whichever
-    /// break the caret was written behind: a break the respelling drops must not
-    /// turn a dangling caret into a live one.
-    #[test]
-    fn a_caret_left_with_nothing_to_escape_is_refused() {
-        // A caret at the end of the last line has nothing to reach, whether the text
-        // ends there or a break the respelling drops follows it.
-        for text in [
-            "dir\necho b^",
-            "dir\necho b^\n",
-            "dir\necho b^\r\n",
-            "echo a ^\n",
-            "echo a ^\r\n",
-            // Caret-only lines: their carets pair off across the breaks the respelling
-            // deletes, so the walk's own pending escape is what refuses the text.
-            "||\n^\n^\n^",
-            "||\n^\n^\n^\n",
-        ] {
-            assert!(refused(text).contains("left waiting"), "{text:?}");
-        }
-        // A caret whose escape is left taking the break of a blank line — the
-        // spelling this platform reads as a literal line break — is refused too: the
-        // rebuilt text drops that break, so the escape would reach the line's first
-        // character instead.
-        for text in ["echo a ^\n\n", "echo a ^\r\n\r\n", "dir ^\n\n(x)"] {
-            assert!(refused(text).contains("left taking"), "{text:?}");
-        }
-        // The same caret with a line to reach runs as written, and a break after the
-        // text does not change what it escapes.
-        reads("echo a ^\nb", "echo a ^\nb");
-        reads("echo a ^\nb\n", "echo a ^\nb");
-        // An even run is a literal caret before a break that ends the command.
-        reads("echo a ^^\nb", "echo a ^^&b");
-        // A blank line after the line a caret continues is a command of its own: the
-        // continuation takes only the line after it, so the blank line's break needs
-        // the separator its own blankness would otherwise drop.
-        reads("echo a ^\n  \nb", "echo a ^\n  &b");
-        reads("echo a ^\n \t\nb", "echo a ^\n \t&b");
-    }
-
-    #[test]
-    fn the_guards_own_divergences_are_refused_in_the_mode_that_reads_them() {
-        // An odd `\` run before a break is a line continuation for the guard's reader
-        // and an ordinary character here, and a `'…'` word is one quoted word there
-        // and two ordinary pieces of text here: in read-only mode the guard judged a
-        // text the execution would not run, so the shape is refused whole.
-        for text in [
-            "echo 'a\nb'",
-            "echo It's here\ndir C:\\ws",
-            "echo ^'a\ndel C:\\ws\\x.txt\necho ^'b",
-            "echo ^\"a\ndel C:\\ws\\x.txt\necho ^\"b",
-            "echo ^\"a b\ndir",
-            "(echo a\\\ndel C:\\ws\\x.txt)",
-            "(echo 'a\ndel C:\\ws\\x.txt')",
-            "dir C:\\ws\\\ndel x",
-            // A `'…'` word whose line ends on an odd `\` run.
-            "echo 'a\\\nb'",
-            // A `'…'` word left open at the end of the text: a quoted word to that
-            // reader, ordinary text to this platform, and no span of its own.
-            "echo a\necho 'b",
-            // An operator the caret escapes: literal text here, structure there —
-            // inside a line, and as the character a trailing caret's escape reaches.
-            "dir ^& x\ndir y",
-            "echo a ^>\nbuild.bat",
-            "dir /b *.txt ^\n| findstr x",
-        ] {
-            assert!(read(text).is_ok(), "{text:?}");
-            let cause = refused_read_only(text);
-            assert!(cause.contains("Nothing ran."), "{text:?}: {cause}");
-        }
-        // Each divergence is refused under the rule that actually holds: a `\` before a
-        // break inside the `'…'` word is ordinary text to the guard's reader too, so the
-        // quoted word the break falls in is what it names, while a `\` run holding the
-        // break outside any quoted word is the line continuation.
-        let quoted = refused_read_only("echo 'a\\\nb'");
-        assert!(quoted.contains("single-quoted word"), "{quoted}");
-        let continued = refused_read_only("(echo a\\\ndel C:\\ws\\x.txt)");
-        assert!(
-            continued.contains("odd number of backslashes"),
-            "{continued}"
-        );
-        // The full mode consults no such reader: there the platform's own reading of
-        // the two lines is the only one there is, so the same texts are run as the
-        // platform reads them.
-        reads("echo 'a\nb'", "echo 'a&b'");
-        reads("dir C:\\ws\\\ndel x", "dir C:\\ws\\&del x");
-        reads("dir ^& x\ndir y", "dir ^& x&dir y");
-        reads("echo a ^>\nbuild.bat", "echo a ^>&build.bat");
-        // The caret escapes the operator, so the two lines stay one command.
-        reads("dir /b *.txt ^\n| findstr x", "dir /b *.txt ^\n| findstr x");
-    }
-
+    /// The cap is the platform's own line limit, measured in the platform's own
+    /// unit, and the remedy names the mode's own escape.
     #[test]
     fn the_cap_is_the_platforms_own_limit_and_the_remedy_is_the_modes() {
         let at_cap = "a".repeat(TEXT_UNIT_LIMIT);
@@ -2344,94 +2803,340 @@ mod tests {
         assert_ne!(full, read_only);
     }
 
-    /// A comment (`rem`) or a label (`:`) word, read where this platform's reader
-    /// looks for a command: it takes the rest of that line — including the separator a
-    /// break would be joined with, and a paren — as the comment's text or the label's
-    /// name, so the lines after that break would be swallowed with no error and no
-    /// status of their own. The whole text is refused rather than run as less than it
-    /// is.
+    /// The read-only guard's own reader: the divergences it decides alone, the
+    /// projection it makes of a text whose breaks all stand at its end, and the
+    /// carriage-run equivalence of its refusals.
     #[test]
-    fn a_swallowed_line_at_a_break_is_refused_rather_than_separated() {
-        let task = "comment (`rem`) or a label";
-        for text in [
-            // The comment command at a command position, in this platform's own
-            // spellings.
-            "rem note\ndir",
-            "rem\ndir",
-            "@rem note\ndir",
-            "REM NOTE\ndir",
-            "  rem note\ndir",
-            "rem,note\ndir",
-            // A word whose first letter a caret escape carried is the word it spells:
-            // the escape was over a letter, which had no special meaning to lose.
-            "dir & ^rem x\ndir2",
-            "del x & ^\nrem note\nmore",
-            // A label word, which takes the rest of the line whatever it holds — read
-            // at every command position, a separator's included, like the comment.
-            ":: note\ndir",
-            ":label\ndir",
-            "echo a\n:: b\nmore",
-            "dir & :label\nmore",
-            "dir | :label\nmore",
-            "(dir) :label\nmore",
-            // The `@` prefix, with and without a space between it and the label.
-            "@:label\ndir",
-            "@ :label\ndir",
-            "@\t:label\ndir",
-        ] {
-            assert!(refused(text).contains(task), "{text:?}");
-            assert!(refused_read_only(text).contains(task), "{text:?}");
+    #[expect(clippy::too_many_lines)] // one cohesive table over the guard's cases
+    fn read_only_cases() {
+        let cases: &[ReadOnlyCase] = &[
+            // A trailing break is never reached by this reader: the same text
+            // reads as `before_first_break` reads it.
+            ReadOnlyCase {
+                name: "a trailing break leaves an unclosed paren shape",
+                text: "echo a (\n",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Projection,
+            },
+            ReadOnlyCase {
+                name: "a trailing break leaves an open quote shape",
+                text: "echo \"a\n",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Projection,
+            },
+            ReadOnlyCase {
+                name: "a trailing break leaves a statement's own text",
+                text: "if exist x\n",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Projection,
+            },
+            ReadOnlyCase {
+                name: "a trailing break leaves the guard's backslash shape",
+                text: "dir C:\\ws\\\n",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Projection,
+            },
+            ReadOnlyCase {
+                name: "two trailing breaks leave the guard's backslash shape",
+                text: "dir C:\\ws\\\n\n",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Projection,
+            },
+            ReadOnlyCase {
+                name: "a trailing break leaves a comment line",
+                text: "rem note\n",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Projection,
+            },
+            ReadOnlyCase {
+                name: "a trailing break leaves a comment after a separator",
+                text: "dir\nrem note\n",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Reads("dir&rem note"),
+            },
+            ReadOnlyCase {
+                name: "a trailing break leaves a guard backslash before a separator",
+                text: "echo a\ndir C:\\ws\\\n",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Reads("echo a&dir C:\\ws\\"),
+            },
+            ReadOnlyCase {
+                name: "a trailing break leaves two plain lines",
+                text: "dir\ndir C:\\ws\\\n",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Reads("dir&dir C:\\ws\\"),
+            },
+            // The guard's divergences: refused whole, because the reader it used
+            // judged a text this platform would not run.
+            ReadOnlyCase {
+                name: "a single-quoted word spanning a break",
+                text: "echo 'a\nb'",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("Nothing ran."),
+            },
+            ReadOnlyCase {
+                name: "an apostrophe word and a plain line",
+                text: "echo It's here\ndir C:\\ws",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("Nothing ran."),
+            },
+            ReadOnlyCase {
+                name: "a caret-escaped single-quoted span",
+                text: "echo ^'a\ndel C:\\ws\\x.txt\necho ^'b",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("Nothing ran."),
+            },
+            ReadOnlyCase {
+                name: "a caret-escaped double-quoted span",
+                text: "echo ^\"a\ndel C:\\ws\\x.txt\necho ^\"b",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("Nothing ran."),
+            },
+            ReadOnlyCase {
+                name: "a caret-escaped quoted word and a line",
+                text: "echo ^\"a b\ndir",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("Nothing ran."),
+            },
+            ReadOnlyCase {
+                name: "a backslash before a break in a group",
+                text: "(echo a\\\ndel C:\\ws\\x.txt)",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("Nothing ran."),
+            },
+            ReadOnlyCase {
+                name: "a single-quoted span in a group",
+                text: "(echo 'a\ndel C:\\ws\\x.txt')",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("Nothing ran."),
+            },
+            ReadOnlyCase {
+                name: "a backslash run holding a break",
+                text: "dir C:\\ws\\\ndel x",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("Nothing ran."),
+            },
+            ReadOnlyCase {
+                name: "a single-quoted word ending on a backslash run",
+                text: "echo 'a\\\nb'",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("Nothing ran."),
+            },
+            ReadOnlyCase {
+                name: "a single-quoted word left open at the text's end",
+                text: "echo a\necho 'b",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("Nothing ran."),
+            },
+            ReadOnlyCase {
+                name: "a caret-escaped operator inside a line",
+                text: "dir ^& x\ndir y",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("Nothing ran."),
+            },
+            ReadOnlyCase {
+                name: "a caret-escaped redirect at a line's end",
+                text: "echo a ^>\nbuild.bat",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("Nothing ran."),
+            },
+            ReadOnlyCase {
+                name: "a caret-escaped pipe at a line's end",
+                text: "dir /b *.txt ^\n| findstr x",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("Nothing ran."),
+            },
+            // Each divergence is named by the rule that actually holds.
+            ReadOnlyCase {
+                name: "a quoted word's own break is the single-quoted word",
+                text: "echo 'a\\\nb'",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("single-quoted word"),
+            },
+            ReadOnlyCase {
+                name: "a backslash run outside a quote is the continuation",
+                text: "(echo a\\\ndel C:\\ws\\x.txt)",
+                reads_in_full: true,
+                expected: ReadOnlyExpect::Refused("odd number of backslashes"),
+            },
+            // The statement reading is the same in both modes.
+            ReadOnlyCase {
+                name: "a paren on a statement's line in the guard mode",
+                text: "if exist x echo (a) done\nmore",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("runs that command"),
+            },
+            ReadOnlyCase {
+                name: "a paren in a do body in the guard mode",
+                text: "for %f in (*.txt) do echo %f (x)\ndir",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("runs that command"),
+            },
+            ReadOnlyCase {
+                name: "a paren in a not-exist body in the guard mode",
+                text: "if not exist out mkdir out (x)\ncopy a b",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("runs that command"),
+            },
+            ReadOnlyCase {
+                name: "a group on a statement's line in the guard mode",
+                text: "if exist x (echo a) & (b c)\ndir",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("runs that command"),
+            },
+            // A comment or label swallowed at a break is refused in both modes.
+            ReadOnlyCase {
+                name: "a rem comment in the guard mode",
+                text: "rem note\ndir",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "a bare rem in the guard mode",
+                text: "rem\ndir",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "an @rem in the guard mode",
+                text: "@rem note\ndir",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "an upper-case REM in the guard mode",
+                text: "REM NOTE\ndir",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "an indented rem in the guard mode",
+                text: "  rem note\ndir",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "rem with a comma in the guard mode",
+                text: "rem,note\ndir",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "a caret-spelled rem in the guard mode",
+                text: "dir & ^rem x\ndir2",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "a caret continuation into a rem in the guard mode",
+                text: "del x & ^\nrem note\nmore",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "a :: label in the guard mode",
+                text: ":: note\ndir",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "a :label in the guard mode",
+                text: ":label\ndir",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "a :: label after a separator in the guard mode",
+                text: "echo a\n:: b\nmore",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "a label after an & in the guard mode",
+                text: "dir & :label\nmore",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "a label after a pipe in the guard mode",
+                text: "dir | :label\nmore",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "a label after a group in the guard mode",
+                text: "(dir) :label\nmore",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "an @-prefixed label in the guard mode",
+                text: "@:label\ndir",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "an @-space-prefixed label in the guard mode",
+                text: "@ :label\ndir",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+            ReadOnlyCase {
+                name: "an @-tab-prefixed label in the guard mode",
+                text: "@\t:label\ndir",
+                reads_in_full: false,
+                expected: ReadOnlyExpect::Refused("comment (`rem`) or a label"),
+            },
+        ];
+        for case in cases {
+            if case.reads_in_full {
+                assert!(read(case.text).is_ok(), "{}: full mode reads", case.name);
+            }
+            match case.expected {
+                ReadOnlyExpect::Refused(needle) => {
+                    let cause = refused_read_only(case.text);
+                    assert!(
+                        cause.contains(needle),
+                        "{}: {:?} = {cause:?}",
+                        case.name,
+                        case.text
+                    );
+                }
+                ReadOnlyExpect::Projection => assert_eq!(
+                    executable(case.text, ShellPlatform::Windows, ShellMode::ReadOnly).as_deref(),
+                    Ok(before_first_break(case.text)),
+                    "{}: {:?}",
+                    case.name,
+                    case.text
+                ),
+                ReadOnlyExpect::Reads(expected) => assert_eq!(
+                    executable(case.text, ShellPlatform::Windows, ShellMode::ReadOnly).as_deref(),
+                    Ok(expected),
+                    "{}: {:?}",
+                    case.name,
+                    case.text
+                ),
+            }
         }
-        // A word that merely spells one, a comment in an argument, and a comment
-        // inside a quoted word: this platform's reader looks for a command at a
-        // command position alone.
-        reads("remainder\ndir", "remainder&dir");
-        reads("rem.txt\ndir", "rem.txt&dir");
-        reads("echo rem\ndir", "echo rem&dir");
-        reads("echo \"rem note\"\ndir", "echo \"rem note\"&dir");
-        reads("echo :label\ndir", "echo :label&dir");
-        // `rem` with a character appended is not this platform's comment command: its
-        // parser drops the character later and reads the control operators after it.
-        reads("rem. note\ndir", "rem. note&dir");
-        // A label's first character is its own, so an escape over it makes that
-        // character inert and no label of it — the word is the ordinary one it spells,
-        // and the break behind it is the separator it is.
-        reads(
-            "echo a ^\n:not-a-label\nmore",
-            "echo a ^\n:not-a-label&more",
-        );
-        // Nothing follows the swallowed line, so the break loses nothing: a trailing
-        // break adds no command, and a line after the swallowed one keeps the break it
-        // already has.
-        reads("rem note\n", "rem note");
-        reads("dir\nrem note", "dir&rem note");
-        reads("echo a\n:: b", "echo a&:: b");
-        // A comment word read where the reader looks for a command inside a proven
-        // group takes that line's rest, its `)` included: this reading's counter never
-        // sees that paren either, so the group the `(` opened is never closed and the
-        // text is refused for the unclosed group it is. A `)` on a line after the
-        // comment's own line closes that group as written.
-        for text in ["echo a\n(rem note)", "(rem note)\ndir"] {
-            assert!(
-                refused(text).contains("unclosed bracketed group"),
-                "{text:?}"
+        // A carriage return run immediately before a break belongs to the break:
+        // the guard's reader refuses the same shapes under either spelling.
+        for (name, one, run) in [
+            (
+                "a backslash-run break is refused under a carriage run",
+                "dir \\\\\\\r\ndel x",
+                "dir \\\\\\\r\r\ndel x",
+            ),
+            (
+                "a group's backslash break is refused under a carriage run",
+                "(echo a\\\r\ndel x)",
+                "(echo a\\\r\r\ndel x)",
+            ),
+        ] {
+            assert_eq!(
+                refused_read_only(run),
+                refused_read_only(one),
+                "{name}: {run:?}"
             );
         }
-        // A `rem` written in an argument — after a `(` this reading cannot prove, and
-        // after the `)` closing one — is an argument like any other, and the parens
-        // are the reader's own counter's.
-        reads("echo (a) rem note\ndir", "echo (a) rem note&dir");
-        reads("echo (rem note)\ndir", "echo (rem note)&dir");
-        reads("dir (x) rem note\ndir2", "dir (x) rem note&dir2");
-        // A paren on a comment's line is that line's text, so the `)` inside one closes
-        // no group — while a `rem` read after the `)` of a block this reading proved is
-        // a command like any other.
-        for text in ["rem note (x)\ndir", "(dir) rem note\ndir2"] {
-            assert!(refused(text).contains(task), "{text:?}");
-        }
-        // A break this reading keeps — inside the group the comment line sits in — is
-        // left exactly as written: the platform's own reader ends that line at the
-        // break, so the `)` on a later line is that counter's own.
-        reads("(rem note\ndir\n)", "(rem note\ndir\n)");
     }
 }

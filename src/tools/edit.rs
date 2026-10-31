@@ -1081,38 +1081,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn segment_at_rejects_malformed_segments() {
-        // Normal segments always cover the full span contiguously, but a
-        // future normalize_ws bug could leave gaps. Verify that segment_at
-        // returns an error for gap positions, not just positions beyond all segments.
-        let segments = vec![
-            Segment {
-                norm_range: 0..5,
-                orig_range: 0..5,
-            },
-            // Gap: positions 5-6 not covered (first segment covers 0..4,
-            // second starts at 7). Positions 5-6 are in the gap.
-            Segment {
-                norm_range: 7..10,
-                orig_range: 10..13,
-            },
-        ];
-        // Position beyond all segments should produce an error
-        assert!(segment_at(15, &segments).is_err());
-        // Empty segments should produce an error
-        assert!(segment_at(0, &[]).is_err());
-        // Positions in the gap between segments should produce an error
-        assert!(
-            segment_at(6, &segments).is_err(),
-            "position 6 is in the gap (0..5, 7..10)"
-        );
-        // Valid position in first segment should still work
-        assert!(segment_at(3, &segments).is_ok());
-        // Valid position at segment boundary is ok
-        assert!(segment_at(7, &segments).is_ok());
-    }
-
     #[tokio::test]
     async fn file_edit_multiple_replacements() {
         let dir = TempDir::new().unwrap();
@@ -1270,46 +1238,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_write_mode_treats_omitted_and_empty_old_string_alike() {
-        struct Case {
-            name: &'static str,
-            old_string: Option<&'static str>,
-        }
-        for case in [
-            Case {
-                name: "omitted old_string",
-                old_string: None,
-            },
-            Case {
-                name: "empty old_string",
-                old_string: Some(""),
-            },
-        ] {
-            let dir = TempDir::new().unwrap();
-
-            let mut args = json!({"path": "out.txt", "new_string": "written!"});
-            if let Some(old) = case.old_string {
-                args["old_string"] = json!(old);
-            }
-
-            let result = EditTool::confined()
-                .execute(&test_ws(dir.path()), args)
-                .await;
-            assert!(result.is_ok(), "{} should succeed: {result:?}", case.name);
-            assert!(
-                result.unwrap().contains("8 bytes"),
-                "{} should report written size",
-                case.name
-            );
-
-            let content = tokio::fs::read_to_string(dir.path().join("out.txt"))
-                .await
-                .unwrap();
-            assert_eq!(content, "written!", "{}", case.name);
-        }
-    }
-
-    #[tokio::test]
     async fn edit_write_mode_creates_parent_dirs() {
         let dir = TempDir::new().unwrap();
 
@@ -1324,6 +1252,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, "deep");
+
+        // An omitted anchor and an empty one are the same write mode: both create
+        // the file with `new_string` as its content.
+        for (name, old_string) in [
+            ("an omitted old_string", None),
+            ("an empty old_string", Some("")),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mut args = json!({"path": "out.txt", "new_string": "written!"});
+            if let Some(old) = old_string {
+                args["old_string"] = json!(old);
+            }
+            let result = EditTool::confined()
+                .execute(&test_ws(dir.path()), args)
+                .await;
+            assert!(result.is_ok(), "{name} should write: {result:?}");
+            assert!(
+                result.unwrap().contains("8 bytes"),
+                "{name} should report the written size"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(dir.path().join("out.txt"))
+                    .await
+                    .unwrap(),
+                "written!",
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1375,6 +1331,48 @@ mod tests {
                 assert!(result.is_ok(), "relative path edit: {result:?}");
                 let content = tokio::fs::read_to_string(workspace.join("nested/target.txt")).await.unwrap();
                 assert_eq!(content, "hello mahbot");
+
+                // An absolute path that resolves inside the workspace is the same
+                // file: both write and edit accept it.
+                let workspace = tokio::fs::canonicalize(&workspace).await.unwrap();
+                let absolute_edit = workspace.join("nested/target.txt");
+                let result = EditTool::confined()
+                    .execute(
+                        &test_ws(&workspace),
+                        json!({
+                            "path": absolute_edit.to_string_lossy().to_string(),
+                            "old_string": "mahbot",
+                            "new_string": "absolute",
+                        }),
+                    )
+                    .await;
+                assert!(
+                    result.is_ok(),
+                    "editing via an absolute workspace path: {result:?}"
+                );
+                assert_eq!(
+                    tokio::fs::read_to_string(&absolute_edit).await.unwrap(),
+                    "hello absolute"
+                );
+
+                let absolute_write = workspace.join("written.txt");
+                let result = EditTool::confined()
+                    .execute(
+                        &test_ws(&workspace),
+                        json!({
+                            "path": absolute_write.to_string_lossy().to_string(),
+                            "new_string": "written",
+                        }),
+                    )
+                    .await;
+                assert!(
+                    result.is_ok(),
+                    "writing via an absolute workspace path: {result:?}"
+                );
+                assert_eq!(
+                    tokio::fs::read_to_string(&absolute_write).await.unwrap(),
+                    "written"
+                );
             },
         )
         .await;
@@ -1440,27 +1438,6 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
-    async fn file_edit_absolute_path_in_workspace() {
-        with_temp_workspace(
-            &[("target.txt", "old content")],
-            |dir| async move {
-                // Canonicalize so the workspace dir matches resolved paths on macOS (/private/var/…)
-                let dir = tokio::fs::canonicalize(&dir).await.unwrap();
-                let abs_path = dir.join("target.txt");
-                let result = EditTool::confined()
-                    .execute(
-                        &test_ws(&dir), json!({"path": abs_path.to_string_lossy().to_string(), "old_string": "old content", "new_string": "new content"}),
-                    )
-                    .await;
-                assert!(result.is_ok(), "editing via absolute workspace path should succeed, error: {:?}", result.as_ref().unwrap_err());
-                let content = tokio::fs::read_to_string(dir.join("target.txt")).await.unwrap();
-                assert_eq!(content, "new content");
-            },
-        )
-        .await;
-    }
-
     // ── WS-insensitive ambiguity tests ────────────────────────────
 
     #[tokio::test]
@@ -1493,30 +1470,6 @@ mod tests {
                 // File must not be modified
                 let content = tokio::fs::read_to_string(dir.join("lib.rs")).await.unwrap();
                 assert_eq!(content, "let  x  =  1;\nlet  x  =  1;\nlet  y  =  2;\n");
-            },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn ws_unambiguous_single_match_still_works() {
-        // Regression: a .rs file with a single WS-only match should still succeed.
-        with_temp_workspace(
-            &[("lib.rs", "let  x  =  1;\nlet  y  =  2;\n")],
-            |dir| async move {
-                let result = EditTool::confined()
-                    .execute(
-                        &test_ws(&dir),
-                        json!({
-                            "path": "lib.rs",
-                            "old_string": "let x = 1;",  // exact match not found, WS fallback finds unique match
-                            "new_string": "let x = 42;"
-                        }),
-                    )
-                    .await;
-                assert!(result.is_ok(), "Single WS match should succeed: {result:?}");
-                let content = tokio::fs::read_to_string(dir.join("lib.rs")).await.unwrap();
-                assert_eq!(content, "let x = 42;\nlet  y  =  2;\n");
             },
         )
         .await;
@@ -1629,386 +1582,321 @@ mod tests {
         }
     }
 
-    /// `multiple` has no whitespace-tolerant fallback, but line endings are not
-    /// whitespace: an `old_string` read from a CRLF file matches every
-    /// occurrence, and each written copy takes the file's ending.
-    #[tokio::test]
-    async fn crlf_multiple_mode_replaces_every_match() {
-        let dir = TempDir::new().unwrap();
-        tokio::fs::write(
-            dir.path().join("data.txt"),
-            b"item = 1\r\nkeep = 0\r\nitem = 1\r\nkeep = 0\r\n",
-        )
-        .await
-        .unwrap();
-        let ws = test_ws(dir.path());
-        assert_eq!(
-            read_view(&ws, "data.txt").await,
-            "item = 1\nkeep = 0\nitem = 1\nkeep = 0"
-        );
-
-        let result = EditTool::confined()
-            .execute(
-                &ws,
-                json!({
-                    "path": "data.txt",
-                    "old_string": "item = 1\nkeep = 0", // built from the reading
-                    "new_string": "item = 2\nkeep = 1",
-                    "multiple": true,
-                }),
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "multiple mode must work on a CRLF file: {result:?}"
-        );
-        assert!(result.unwrap().contains("replaced 2 occurrences"));
-        assert_eq!(
-            file_bytes(dir.path(), "data.txt").await,
-            b"item = 2\r\nkeep = 1\r\nitem = 2\r\nkeep = 1\r\n".as_slice()
-        );
+    /// One edit against a file with its own ending — the bytes before, the edits
+    /// asked for, and the bytes each of them must leave behind (or the words of
+    /// the refusal, with the file untouched).
+    struct LineEndingStep {
+        old: &'static str,
+        new: &'static str,
+        multiple: bool,
+        /// `Ok(after)`: the edit lands and leaves these bytes; `Err(words)`: the
+        /// edit is refused with every one of `words` in its message.
+        outcome: Result<&'static [u8], &'static [&'static str]>,
+        /// A fragment of the success's own note, when one is worth pinning.
+        note: &'static str,
     }
 
-    /// Surfaces that keep the carriage returns (a zoomed symbol, a redirected
-    /// command) hand the agent a CR-spelled `old_string`. It keeps matching,
-    /// and the text the edit writes still takes the file's ending.
-    #[tokio::test]
-    async fn old_string_spelled_with_carriage_returns_still_matches() {
-        let dir = TempDir::new().unwrap();
-        tokio::fs::write(dir.path().join("zoom.txt"), b"one\r\ntwo\r\nthree\r\n")
-            .await
-            .unwrap();
-
-        let result = EditTool::confined()
-            .execute(
-                &test_ws(dir.path()),
-                json!({
-                    "path": "zoom.txt",
-                    "old_string": "one\r\ntwo",     // spelled with CRLF
-                    "new_string": "one\ntwo\nhalf", // spelled with LF
-                }),
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "CR-spelled old_string must land: {result:?}"
-        );
-        assert_eq!(
-            file_bytes(dir.path(), "zoom.txt").await,
-            b"one\r\ntwo\r\nhalf\r\nthree\r\n".as_slice(),
-            "the written line took the file's CRLF, not the LF it was spelled with"
-        );
+    struct LineEndingCase {
+        name: &'static str,
+        file: &'static str,
+        initial: &'static [u8],
+        /// The text the read tool shows for `initial` — every ending hidden, so
+        /// an `old_string` built from a reading is spelled with LF.
+        read_view: Option<&'static str>,
+        steps: &'static [LineEndingStep],
     }
 
-    /// An LF file behaves exactly as it did before line endings were handled at
-    /// all, and a replacement spelled with CRLF puts no carriage return into it.
+    const LINE_ENDING_CASES: &[LineEndingCase] = &[
+        LineEndingCase {
+            name: "multiple_matches_every_occurrence_of_a_read_spelled_pattern",
+            file: "data.txt",
+            initial: b"item = 1\r\nkeep = 0\r\nitem = 1\r\nkeep = 0\r\n",
+            read_view: Some("item = 1\nkeep = 0\nitem = 1\nkeep = 0"),
+            steps: &[LineEndingStep {
+                old: "item = 1\nkeep = 0",
+                new: "item = 2\nkeep = 1",
+                multiple: true,
+                outcome: Ok(b"item = 2\r\nkeep = 1\r\nitem = 2\r\nkeep = 1\r\n"),
+                note: "replaced 2 occurrences",
+            }],
+        },
+        LineEndingCase {
+            name: "a_cr_spelled_old_string_still_matches",
+            file: "zoom.txt",
+            initial: b"one\r\ntwo\r\nthree\r\n",
+            read_view: None,
+            steps: &[LineEndingStep {
+                old: "one\r\ntwo",
+                new: "one\ntwo\nhalf",
+                multiple: false,
+                outcome: Ok(b"one\r\ntwo\r\nhalf\r\nthree\r\n"),
+                note: "",
+            }],
+        },
+        LineEndingCase {
+            name: "unix_endings_are_preserved_and_no_foreign_ending_is_introduced",
+            file: "unix.txt",
+            initial: b"a\nb\nc\n",
+            read_view: None,
+            steps: &[
+                LineEndingStep {
+                    old: "b\nc",
+                    new: "b\nC",
+                    multiple: false,
+                    outcome: Ok(b"a\nb\nC\n"),
+                    note: "",
+                },
+                LineEndingStep {
+                    old: "a\nb",
+                    new: "a\r\nB",
+                    multiple: false,
+                    outcome: Ok(b"a\nB\nC\n"),
+                    note: "",
+                },
+            ],
+        },
+        LineEndingCase {
+            name: "a_mixed_file_keeps_its_mixture_outside_the_edit",
+            file: "mixed.txt",
+            initial: b"head\nmid\r\ntail\n",
+            read_view: None,
+            steps: &[LineEndingStep {
+                old: "mid",
+                new: "mid\nmiddle",
+                multiple: false,
+                outcome: Ok(b"head\nmid\r\nmiddle\r\ntail\n"),
+                note: "",
+            }],
+        },
+        LineEndingCase {
+            name: "a_lone_carriage_return_is_content",
+            file: "classic.txt",
+            initial: b"a\rb\r\nc\r\n",
+            read_view: None,
+            steps: &[
+                LineEndingStep {
+                    old: "a\rb",
+                    new: "a\rB",
+                    multiple: false,
+                    outcome: Ok(b"a\rB\r\nc\r\n"),
+                    note: "",
+                },
+                LineEndingStep {
+                    old: "c",
+                    new: "c\rd\ne",
+                    multiple: false,
+                    outcome: Ok(b"a\rB\r\nc\rd\r\ne\r\n"),
+                    note: "",
+                },
+                LineEndingStep {
+                    // A lone CR is content, so it cannot be matched as an ending.
+                    old: "a\nb",
+                    new: "x",
+                    multiple: false,
+                    outcome: Err(&[]),
+                    note: "",
+                },
+            ],
+        },
+        LineEndingCase {
+            name: "respelling_the_files_own_endings_is_a_no_op",
+            file: "lf_spelling.txt",
+            initial: b"a\r\nb\r\n",
+            read_view: None,
+            steps: &[LineEndingStep {
+                old: "a\r\nb",
+                new: "a\nb",
+                multiple: false,
+                outcome: Err(&["no change needed"]),
+                note: "",
+            }],
+        },
+        LineEndingCase {
+            name: "respelling_the_files_own_endings_is_a_no_op_the_other_way",
+            file: "crlf_spelling.txt",
+            initial: b"a\r\nb\r\n",
+            read_view: None,
+            steps: &[LineEndingStep {
+                old: "a\nb",
+                new: "a\r\nb",
+                multiple: false,
+                outcome: Err(&["no change needed"]),
+                note: "",
+            }],
+        },
+        LineEndingCase {
+            name: "several_matches_are_ambiguous_in_a_text_file",
+            file: "dup.txt",
+            initial: b"x = 1\r\nkeep\r\nx = 1\r\nkeep\r\n",
+            read_view: None,
+            steps: &[LineEndingStep {
+                old: "x = 1\nkeep",
+                new: "x = 2\nkeep",
+                multiple: false,
+                outcome: Err(&["matches 2 times", "must match exactly once"]),
+                note: "",
+            }],
+        },
+        LineEndingCase {
+            name: "several_matches_are_ambiguous_in_a_code_file",
+            file: "dup.rs",
+            initial: b"x = 1\r\nkeep\r\nx = 1\r\nkeep\r\n",
+            read_view: None,
+            steps: &[LineEndingStep {
+                old: "x = 1\nkeep",
+                new: "x = 2\nkeep",
+                multiple: false,
+                outcome: Err(&["matches 2 times", "must match exactly once"]),
+                note: "",
+            }],
+        },
+        LineEndingCase {
+            name: "a_cr_spelled_old_string_matches_an_lf_file",
+            file: "unix.txt",
+            initial: b"a\nb\n",
+            read_view: None,
+            steps: &[LineEndingStep {
+                old: "a\r\nb",
+                new: "a\nB",
+                multiple: false,
+                outcome: Ok(b"a\nB\n"),
+                note: "",
+            }],
+        },
+        LineEndingCase {
+            name: "written_text_takes_the_ending_of_the_line_it_lands_in",
+            file: "mid.txt",
+            initial: b"one two\r\nthree\r\n",
+            read_view: None,
+            steps: &[LineEndingStep {
+                old: "ne",
+                new: "NE\nline",
+                multiple: false,
+                outcome: Ok(b"oNE\r\nline two\r\nthree\r\n"),
+                note: "",
+            }],
+        },
+        LineEndingCase {
+            name: "written_text_over_an_unterminated_last_line",
+            file: "tail.txt",
+            initial: b"a\r\nb",
+            read_view: None,
+            steps: &[LineEndingStep {
+                old: "b",
+                new: "b\nx",
+                multiple: false,
+                outcome: Ok(b"a\r\nb\r\nx"),
+                note: "",
+            }],
+        },
+        LineEndingCase {
+            name: "a_file_with_no_ending_gets_the_text_as_written",
+            file: "oneline",
+            initial: b"abc",
+            read_view: None,
+            steps: &[LineEndingStep {
+                old: "b",
+                new: "x\ny\r\nz",
+                multiple: false,
+                outcome: Ok(b"ax\ny\r\nzc"),
+                note: "",
+            }],
+        },
+        LineEndingCase {
+            name: "a_pattern_starting_on_the_lf_of_a_pair_stays_on_crlf",
+            file: "pair.txt",
+            initial: b"alpha\r\nbeta\r\ngamma\r\n",
+            read_view: None,
+            steps: &[LineEndingStep {
+                old: "\nbeta",
+                new: "\nBETA\ninserted",
+                multiple: false,
+                outcome: Ok(b"alpha\r\nBETA\r\ninserted\r\ngamma\r\n"),
+                note: "",
+            }],
+        },
+        LineEndingCase {
+            name: "deleting_a_line_break_takes_the_whole_ending",
+            file: "windows.txt",
+            initial: b"a\r\nb",
+            read_view: None,
+            steps: &[LineEndingStep {
+                old: "\n",
+                new: " ",
+                multiple: false,
+                outcome: Ok(b"a b"),
+                note: "",
+            }],
+        },
+    ];
+
     #[tokio::test]
-    async fn unix_endings_are_preserved_and_no_foreign_ending_is_introduced() {
-        let dir = TempDir::new().unwrap();
-        tokio::fs::write(dir.path().join("unix.txt"), b"a\nb\nc\n")
-            .await
-            .unwrap();
-        let ws = test_ws(dir.path());
-
-        let result = EditTool::confined()
-            .execute(
-                &ws,
-                json!({"path": "unix.txt", "old_string": "b\nc", "new_string": "b\nC"}),
-            )
-            .await;
-        assert!(result.is_ok(), "multi-line edit: {result:?}");
-        assert_eq!(
-            file_bytes(dir.path(), "unix.txt").await,
-            b"a\nb\nC\n".as_slice()
-        );
-
-        let result = EditTool::confined()
-            .execute(
-                &ws,
-                json!({"path": "unix.txt", "old_string": "a\nb", "new_string": "a\r\nB"}),
-            )
-            .await;
-        assert!(result.is_ok(), "CRLF-spelled replacement: {result:?}");
-        assert_eq!(
-            file_bytes(dir.path(), "unix.txt").await,
-            b"a\nB\nC\n".as_slice(),
-            "an LF file stays LF"
-        );
-    }
-
-    /// A file whose endings are already mixed keeps that mixture everywhere the
-    /// edit did not reach; the text written into a line takes that line's ending.
-    #[tokio::test]
-    async fn mixed_endings_survive_outside_the_edit() {
-        let dir = TempDir::new().unwrap();
-        tokio::fs::write(dir.path().join("mixed.txt"), b"head\nmid\r\ntail\n")
-            .await
-            .unwrap();
-
-        let result = EditTool::confined()
-            .execute(
-                &test_ws(dir.path()),
-                json!({"path": "mixed.txt", "old_string": "mid", "new_string": "mid\nmiddle"}),
-            )
-            .await;
-        assert!(result.is_ok(), "edit in a mixed file: {result:?}");
-        assert_eq!(
-            file_bytes(dir.path(), "mixed.txt").await,
-            b"head\nmid\r\nmiddle\r\ntail\n".as_slice(),
-            "the untouched LF line and CRLF pair kept their bytes; the written line \
-             took the CRLF of the line it was written into"
-        );
-    }
-
-    /// A `\r` that is not followed by `\n` is content, not an ending: it is
-    /// never converted, and it is not matched across.
-    #[tokio::test]
-    async fn lone_carriage_return_is_content() {
-        let dir = TempDir::new().unwrap();
-        tokio::fs::write(dir.path().join("classic.txt"), b"a\rb\r\nc\r\n")
-            .await
-            .unwrap();
-        let ws = test_ws(dir.path());
-
-        let result = EditTool::confined()
-            .execute(
-                &ws,
-                json!({"path": "classic.txt", "old_string": "a\rb", "new_string": "a\rB"}),
-            )
-            .await;
-        assert!(result.is_ok(), "lone CR in old_string: {result:?}");
-        assert_eq!(
-            file_bytes(dir.path(), "classic.txt").await,
-            b"a\rB\r\nc\r\n".as_slice()
-        );
-
-        // A lone `\r` inside the replacement survives; only real endings are
-        // rewritten to the file's ending.
-        let result = EditTool::confined()
-            .execute(
-                &ws,
-                json!({"path": "classic.txt", "old_string": "c", "new_string": "c\rd\ne"}),
-            )
-            .await;
-        assert!(result.is_ok(), "lone CR in new_string: {result:?}");
-        assert_eq!(
-            file_bytes(dir.path(), "classic.txt").await,
-            b"a\rB\r\nc\rd\r\ne\r\n".as_slice()
-        );
-
-        // An LF-spelled pattern does not match across the lone CR.
-        let result = EditTool::confined()
-            .execute(
-                &ws,
-                json!({"path": "classic.txt", "old_string": "a\nb", "new_string": "x"}),
-            )
-            .await;
-        assert!(
-            result.is_err(),
-            "a lone CR is content, so it cannot be matched as an ending: {result:?}"
-        );
-    }
-
-    /// An edit that is a no-op once the endings are accounted for is rejected
-    /// as a no-op and leaves the file untouched — in either spelling.
-    #[tokio::test]
-    async fn edit_that_only_respells_endings_is_a_no_op() {
-        // The file's own CRLF, asked for with a read-spelled old_string and with
-        // a CR-spelled new_string alike: both edits are already satisfied.
-        for (name, old, new) in [
-            ("lf_spelling.txt", "a\r\nb", "a\nb"),
-            ("crlf_spelling.txt", "a\nb", "a\r\nb"),
-        ] {
+    async fn line_ending_cases() {
+        for case in LINE_ENDING_CASES {
             let dir = TempDir::new().unwrap();
-            let before = b"a\r\nb\r\n".as_slice();
-            tokio::fs::write(dir.path().join(name), before)
+            tokio::fs::write(dir.path().join(case.file), case.initial)
                 .await
                 .unwrap();
-
-            let result = EditTool::confined()
-                .execute(
-                    &test_ws(dir.path()),
-                    json!({"path": name, "old_string": old, "new_string": new}),
-                )
-                .await;
-            let err = format!(
-                "{}",
-                result.expect_err("respelling the file's endings is a no-op")
-            );
-            assert!(err.contains("no change needed"), "{name}: {err}");
-            assert_eq!(file_bytes(dir.path(), name).await, before, "{name}");
-        }
-    }
-
-    /// Several places matching after the endings are ignored is an error, for
-    /// code and non-code files alike — the first match is never picked. The
-    /// pattern is multi-line and read-spelled, so it has no exact match at all.
-    #[tokio::test]
-    async fn line_ending_match_reports_ambiguity() {
-        for name in ["dup.txt", "dup.rs"] {
-            let dir = TempDir::new().unwrap();
-            tokio::fs::write(dir.path().join(name), b"x = 1\r\nkeep\r\nx = 1\r\nkeep\r\n")
-                .await
-                .unwrap();
-
-            let result = EditTool::confined()
-                .execute(
-                    &test_ws(dir.path()),
-                    json!({
-                        "path": name,
-                        "old_string": "x = 1\nkeep", // built from the reading
-                        "new_string": "x = 2\nkeep",
-                    }),
-                )
-                .await;
-            let err = format!("{}", result.expect_err("two matches are ambiguous"));
-            assert!(err.contains("matches 2 times"), "{name}: {err}");
-            assert!(err.contains("must match exactly once"), "{name}: {err}");
-            assert_eq!(
-                file_bytes(dir.path(), name).await,
-                b"x = 1\r\nkeep\r\nx = 1\r\nkeep\r\n".as_slice()
-            );
-        }
-    }
-
-    /// The line-ending tolerance is symmetric: a CR-spelled `old_string` also
-    /// matches content that has no carriage returns, and the file keeps its LF.
-    #[tokio::test]
-    async fn cr_spelled_old_string_matches_content_without_carriage_returns() {
-        let dir = TempDir::new().unwrap();
-        tokio::fs::write(dir.path().join("unix.txt"), b"a\nb\n")
-            .await
-            .unwrap();
-
-        let result = EditTool::confined()
-            .execute(
-                &test_ws(dir.path()),
-                json!({"path": "unix.txt", "old_string": "a\r\nb", "new_string": "a\nB"}),
-            )
-            .await;
-        assert!(result.is_ok(), "CR-spelled old on an LF file: {result:?}");
-        assert_eq!(
-            file_bytes(dir.path(), "unix.txt").await,
-            b"a\nB\n".as_slice()
-        );
-    }
-
-    /// The written text takes the ending of the line it is written into; over a
-    /// final line the file left unterminated it takes the file's prevailing
-    /// ending instead.
-    #[tokio::test]
-    async fn written_text_takes_the_files_ending() {
-        // A whole line of a CRLF file.
-        let dir = TempDir::new().unwrap();
-        tokio::fs::write(dir.path().join("mid.txt"), b"one two\r\nthree\r\n")
-            .await
-            .unwrap();
-        let ws = test_ws(dir.path());
-
-        let result = EditTool::confined()
-            .execute(
-                &ws,
-                json!({"path": "mid.txt", "old_string": "ne", "new_string": "NE\nline"}),
-            )
-            .await;
-        assert!(result.is_ok(), "mid-word edit: {result:?}");
-        assert_eq!(
-            file_bytes(dir.path(), "mid.txt").await,
-            b"oNE\r\nline two\r\nthree\r\n".as_slice()
-        );
-
-        // A last line with no ending of its own.
-        let dir = TempDir::new().unwrap();
-        tokio::fs::write(dir.path().join("tail.txt"), b"a\r\nb")
-            .await
-            .unwrap();
-
-        let result = EditTool::confined()
-            .execute(
-                &test_ws(dir.path()),
-                json!({"path": "tail.txt", "old_string": "b", "new_string": "b\nx"}),
-            )
-            .await;
-        assert!(result.is_ok(), "unterminated last line: {result:?}");
-        assert_eq!(
-            file_bytes(dir.path(), "tail.txt").await,
-            b"a\r\nb\r\nx".as_slice()
-        );
-    }
-
-    /// Over a file with no ending at all the written text is left as it is
-    /// spelled.
-    #[tokio::test]
-    async fn a_file_with_no_ending_gets_the_text_as_written() {
-        let dir = TempDir::new().unwrap();
-        tokio::fs::write(dir.path().join("oneline"), b"abc")
-            .await
-            .unwrap();
-
-        let result = EditTool::confined()
-            .execute(
-                &test_ws(dir.path()),
-                json!({"path": "oneline", "old_string": "b", "new_string": "x\ny\r\nz"}),
-            )
-            .await;
-        assert!(result.is_ok(), "single-line file: {result:?}");
-        assert_eq!(
-            file_bytes(dir.path(), "oneline").await,
-            b"ax\ny\r\nzc".as_slice()
-        );
-    }
-
-    /// A pattern that starts on the `\n` of a `\r\n` pair leaves that pair's
-    /// `\r` outside the match. The written text must not then bring its own
-    /// carriage return — which would strand the pair's `\r` as content — while
-    /// its other line breaks still take the file's ending.
-    #[tokio::test]
-    async fn pattern_starting_on_the_lf_of_a_crlf_pair_stays_on_crlf() {
-        let dir = TempDir::new().unwrap();
-        tokio::fs::write(dir.path().join("pair.txt"), b"alpha\r\nbeta\r\ngamma\r\n")
-            .await
-            .unwrap();
-
-        let result = EditTool::confined()
-            .execute(
-                &test_ws(dir.path()),
-                json!({
-                    "path": "pair.txt",
-                    "old_string": "\nbeta",
-                    "new_string": "\nBETA\ninserted",
-                }),
-            )
-            .await;
-        assert!(result.is_ok(), "pattern starting on a bare LF: {result:?}");
-        assert_eq!(
-            file_bytes(dir.path(), "pair.txt").await,
-            b"alpha\r\nBETA\r\ninserted\r\ngamma\r\n".as_slice()
-        );
-    }
-
-    /// A pattern that is nothing but a line break removes the whole ending —
-    /// rather than leaving the carriage return of a `\r\n` pair behind as
-    /// content — so a CRLF file and its LF twin give the same visible text.
-    #[tokio::test]
-    async fn deleting_a_line_break_removes_the_whole_ending() {
-        for (name, ending) in [("unix.txt", "\n"), ("windows.txt", "\r\n")] {
-            let dir = TempDir::new().unwrap();
-            tokio::fs::write(dir.path().join(name), format!("a{ending}b"))
-                .await
-                .unwrap();
-
-            let result = EditTool::confined()
-                .execute(
-                    &test_ws(dir.path()),
-                    json!({"path": name, "old_string": "\n", "new_string": " "}),
-                )
-                .await;
-            assert!(result.is_ok(), "{name}: deleting a line break: {result:?}");
-            assert_eq!(
-                file_bytes(dir.path(), name).await,
-                b"a b".as_slice(),
-                "{name}: the ending went with the line break it spelled"
-            );
+            let ws = test_ws(dir.path());
+            if let Some(reading) = case.read_view {
+                assert_eq!(
+                    read_view(&ws, case.file).await,
+                    reading,
+                    "{}: the reading hides the endings",
+                    case.name
+                );
+            }
+            let mut bytes = case.initial.to_vec();
+            for step in case.steps {
+                let result = EditTool::confined()
+                    .execute(
+                        &ws,
+                        json!({
+                            "path": case.file,
+                            "old_string": step.old,
+                            "new_string": step.new,
+                            "multiple": step.multiple,
+                        }),
+                    )
+                    .await;
+                match step.outcome {
+                    Ok(after) => {
+                        let note = result
+                            .unwrap_or_else(|e| panic!("{}: the edit must land: {e}", case.name));
+                        if !step.note.is_empty() {
+                            assert!(
+                                note.contains(step.note),
+                                "{}: the note does not say {:?}: {note}",
+                                case.name,
+                                step.note
+                            );
+                        }
+                        bytes = after.to_vec();
+                    }
+                    Err(words) => {
+                        let err = format!(
+                            "{}",
+                            result.err().unwrap_or_else(|| panic!(
+                                "{}: the edit must be refused",
+                                case.name
+                            ))
+                        );
+                        for word in words {
+                            assert!(
+                                err.contains(word),
+                                "{}: the refusal does not say {word:?}: {err}",
+                                case.name
+                            );
+                        }
+                    }
+                }
+                assert_eq!(
+                    file_bytes(dir.path(), case.file).await,
+                    bytes,
+                    "{}: the file's bytes after the edit",
+                    case.name
+                );
+            }
         }
     }
 

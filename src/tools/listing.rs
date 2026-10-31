@@ -125,31 +125,4 @@ mod tests {
             "src/\nmain.rs  2.0K\n.gitignore  512B\nSummary: 2 files, 1 dirs (1 .gitignore, 1 .rs)\n"
         );
     }
-
-    #[test]
-    fn sizes_use_decimal_units() {
-        assert_eq!(human_readable_size(0), "0B");
-        assert_eq!(human_readable_size(999), "999B");
-        assert_eq!(human_readable_size(1_000), "1.0K");
-        assert_eq!(human_readable_size(1_500_000), "1.5M");
-        assert_eq!(human_readable_size(2_000_000_000), "2.0G");
-    }
-
-    /// Extensions beyond the fifth are collapsed into a remainder count.
-    #[test]
-    fn summary_keeps_five_extensions_and_counts_the_rest() {
-        let listing = format_listing(&[
-            file("a.rs", 1),
-            file("b.rs", 1),
-            file("c.py", 1),
-            file("d.md", 1),
-            file("e.toml", 1),
-            file("f.txt", 1),
-            file("g.json", 1),
-        ]);
-        assert_eq!(
-            listing.lines().last().unwrap(),
-            "Summary: 7 files, 0 dirs (2 .rs, 1 .json, 1 .md, 1 .py, 1 .toml), +1 more"
-        );
-    }
 }

@@ -782,11 +782,10 @@ mod tests {
         assert_eq!(args, *expected, "case '{name}' failed");
     }
 
-    /// Table-driven test for query alias resolution: pattern / search /
-    /// search_term / grep_search → canonical "query" key, priority ordering,
-    /// and the invariant that an existing "query" blocks alias consumption.
+    /// Every alias, mode, grep_mode and non-object normalization in one table.
+    #[expect(clippy::too_many_lines)] // one row per accepted alias and mode spelling
     #[test]
-    fn normalize_search_args_alias_mapping() {
+    fn normalize_search_args_cases() {
         let cases = [
             NormalizeCase {
                 name: "pattern alias maps to query",
@@ -841,17 +840,6 @@ mod tests {
                 input: json!({"query": "existing", "pattern": "alias"}),
                 expected: json!({"query": "existing", "pattern": "alias"}),
             },
-        ];
-        for c in &cases {
-            assert_normalize(&c.input, &c.expected, c.name);
-        }
-    }
-
-    /// Table-driven test for file_pattern → query mapping, including
-    /// mode inference and the orphan-key behavior when query already exists.
-    #[test]
-    fn normalize_search_args_file_pattern() {
-        let cases = [
             NormalizeCase {
                 name: "file_pattern without existing mode sets mode=files",
                 input: json!({"file_pattern": "*.rs"}),
@@ -872,19 +860,6 @@ mod tests {
                 input: json!({"pattern": "my_query", "file_pattern": "*.rs"}),
                 expected: json!({"query": "my_query", "file_pattern": "*.rs"}),
             },
-        ];
-        for c in &cases {
-            assert_normalize(&c.input, &c.expected, c.name);
-        }
-    }
-
-    /// Table-driven test for mode-value remapping.
-    /// `plain_text`, `regex`, `content`, and `code` are all rewritten to
-    /// `"grep"` (with an implied `grep_mode`), while `"files"` and unknown
-    /// values pass through unchanged.
-    #[test]
-    fn normalize_search_args_mode_mapping() {
-        let cases = [
             // ── plain_text ──────────────────────────────────────────────
             NormalizeCase {
                 name: "plain_text sets mode=grep and grep_mode=plain_text",
@@ -931,21 +906,6 @@ mod tests {
                 input: json!({"mode": "unknown_value"}),
                 expected: json!({"mode": "unknown_value"}),
             },
-        ];
-        for c in &cases {
-            assert_normalize(&c.input, &c.expected, c.name);
-        }
-    }
-
-    /// Table-driven test for grep_mode rewrites.
-    ///
-    /// The first case covers the subtle double-mapping interaction:
-    /// mode=plain_text sets grep_mode=plain_text (stage 1), then the
-    /// grep_mode remapping sees the already-valid "plain_text" value and
-    /// leaves it unchanged rather than rewriting the original "exact".
-    #[test]
-    fn normalize_search_args_grep_mode_mapping() {
-        let cases = [
             // ════════════════════════════════════════════════════════════
             // Double-mapping: mode remapping runs BEFORE grep_mode
             // remapping.  "plain_text" mode first sets grep_mode to
@@ -980,16 +940,6 @@ mod tests {
                 input: json!({"mode": "grep", "grep_mode": "files"}),
                 expected: json!({"mode": "files"}),
             },
-        ];
-        for c in &cases {
-            assert_normalize(&c.input, &c.expected, c.name);
-        }
-    }
-
-    /// Edge cases: non-object values and empty objects pass through unchanged.
-    #[test]
-    fn normalize_search_args_edge_cases() {
-        let cases = [
             NormalizeCase {
                 name: "non-object string passes through unchanged",
                 input: json!("string_value"),
@@ -1075,11 +1025,10 @@ mod tests {
         assert_eq!(result.as_deref(), expected, "case '{name}' failed");
     }
 
-    /// Table-driven test for query alias resolution: canonical "query"
-    /// takes priority, aliases follow pattern > search > search_term,
-    /// and grep_search is intentionally excluded from resolve_query.
+    /// Every query alias and constraint combination in one table.
+    #[expect(clippy::too_many_lines)] // one row per alias, constraint and empty-query spelling
     #[test]
-    fn resolve_query_alias_priority() {
+    fn resolve_query_cases() {
         let cases = [
             // ── Individual aliases ──────────────────────────────────────
             ResolveCase {
@@ -1130,17 +1079,6 @@ mod tests {
                 }),
                 expected: Some("from_search"),
             },
-        ];
-        for c in &cases {
-            assert_resolve(&c.input, c.expected, c.name);
-        }
-    }
-
-    /// Table-driven test for path constraint normalization:
-    /// trailing-slash enforcement and empty/root suppression.
-    #[test]
-    fn resolve_query_path_constraint() {
-        let cases = [
             ResolveCase {
                 name: "path gets trailing slash",
                 input: json!({"path": "src"}),
@@ -1161,17 +1099,6 @@ mod tests {
                 input: json!({"path": "/"}),
                 expected: None,
             },
-        ];
-        for c in &cases {
-            assert_resolve(&c.input, c.expected, c.name);
-        }
-    }
-
-    /// Table-driven test for ext constraint normalization:
-    /// glob prefix addition, leading-dot/asterisk stripping, empty suppression.
-    #[test]
-    fn resolve_query_ext_constraint() {
-        let cases = [
             ResolveCase {
                 name: "ext gets glob prefix",
                 input: json!({"ext": "rs"}),
@@ -1197,16 +1124,6 @@ mod tests {
                 input: json!({"ext": ""}),
                 expected: None,
             },
-        ];
-        for c in &cases {
-            assert_resolve(&c.input, c.expected, c.name);
-        }
-    }
-
-    /// Table-driven test for constraint combinations and empty-query behavior.
-    #[test]
-    fn resolve_query_combinations_and_empty() {
-        let cases = [
             // ── Constraint combinations ─────────────────────────────────
             ResolveCase {
                 name: "query with path constraint",
@@ -1249,16 +1166,6 @@ mod tests {
                 input: json!({"query": "", "ext": "rs"}),
                 expected: Some("*.rs"),
             },
-        ];
-        for c in &cases {
-            assert_resolve(&c.input, c.expected, c.name);
-        }
-    }
-
-    /// Non-string values are silently ignored (filtered by get_opt_str).
-    #[test]
-    fn resolve_query_non_string_values() {
-        let cases = [
             ResolveCase {
                 name: "non-string query returns None",
                 input: json!({"query": 42}),
@@ -1284,32 +1191,66 @@ mod tests {
 
     /// Lock the zero-result diagnostics format (byte-identical output).
     #[test]
-    fn format_files_zero_result_diagnostics() {
-        let constraints = [Constraint::Extension("rs")];
-        let diag = SearchTool::format_files_zero_result("foo", 50, 0, &constraints, 0, 123);
-        assert_eq!(
-            diag,
-            "No files matching 'foo' found in workspace.\n\
-             Total: 0 files\n\
-             ── diagnostics ──\n  \
-             total_files: 123 (files in index)\n  \
-             total_matched: 0 (matches before pagination)\n  \
-             offset: 0  limit: 50\n  \
-             constraints: *.rs\n  \
-             ℹ 0 files matched before pagination — try broader query or remove constraints\n"
-        );
-
-        // Pagination-past-end branch: offset past the pre-pagination matches.
-        let diag = SearchTool::format_files_zero_result("bar", 50, 40, &[], 30, 200);
-        assert_eq!(
-            diag,
-            "No files matching 'bar' found in workspace.\n\
-             Total: 0 files\n\
-             ── diagnostics ──\n  \
-             total_files: 200 (files in index)\n  \
-             total_matched: 30 (matches before pagination)\n  \
-             offset: 40  limit: 50\n  \
-             ⚠ offset=40 exceeds total prefiltered files (30) — no files to search. Try offset=0.\n"
-        );
+    fn format_files_zero_result_cases() {
+        struct ZeroResultCase {
+            name: &'static str,
+            query: &'static str,
+            max_results: usize,
+            offset: usize,
+            constraints: &'static [Constraint<'static>],
+            total_matched: usize,
+            total_files: usize,
+            expected: &'static str,
+        }
+        let cases = [
+            ZeroResultCase {
+                name: "no match with a constraint",
+                query: "foo",
+                max_results: 50,
+                offset: 0,
+                constraints: &[Constraint::Extension("rs")],
+                total_matched: 0,
+                total_files: 123,
+                expected: concat!(
+                    "No files matching 'foo' found in workspace.\n",
+                    "Total: 0 files\n",
+                    "── diagnostics ──\n",
+                    "  total_files: 123 (files in index)\n",
+                    "  total_matched: 0 (matches before pagination)\n",
+                    "  offset: 0  limit: 50\n",
+                    "  constraints: *.rs\n",
+                    "  ℹ 0 files matched before pagination — try broader query or remove constraints\n",
+                ),
+            },
+            ZeroResultCase {
+                name: "pagination past the prefiltered matches",
+                query: "bar",
+                max_results: 50,
+                offset: 40,
+                constraints: &[],
+                total_matched: 30,
+                total_files: 200,
+                expected: concat!(
+                    "No files matching 'bar' found in workspace.\n",
+                    "Total: 0 files\n",
+                    "── diagnostics ──\n",
+                    "  total_files: 200 (files in index)\n",
+                    "  total_matched: 30 (matches before pagination)\n",
+                    "  offset: 40  limit: 50\n",
+                    "  ⚠ offset=40 exceeds total prefiltered files (30) — no files to search. Try offset=0.\n",
+                ),
+            },
+        ];
+        for case in cases {
+            let diag = SearchTool::format_files_zero_result(
+                case.query,
+                case.max_results,
+                case.offset,
+                case.constraints,
+                case.total_matched,
+                case.total_files,
+            );
+            assert_eq!(diag, case.expected, "{}", case.name);
+        }
     }
 }

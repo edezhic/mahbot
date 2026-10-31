@@ -320,119 +320,189 @@ mod tests {
         args.iter().map(String::as_str).collect()
     }
 
+    /// The wait args forward the timeout for every target and the expect args cover every variant.
     #[test]
-    fn wait_args_forwards_timeout_for_every_target() {
-        let cases = [
-            (WaitTarget::Selector("#main".into()), vec!["wait", "#main"]),
-            (
-                WaitTarget::Url("https://example.com".into()),
-                vec!["wait", "--url", "https://example.com"],
-            ),
-            (
-                WaitTarget::Text("Loaded".into()),
-                vec!["wait", "--text", "Loaded"],
-            ),
-        ];
-        for (target, mut expected) in cases {
-            expected.extend(["--timeout", "8000"]);
-            assert_eq!(argv(&wait_args(&target, 8000)), expected);
+    fn wait_and_expect_args_carry_every_target() {
+        {
+            let case = "wait args forwards timeout for every target";
+            let wait_cases = [
+                (
+                    "selector",
+                    WaitTarget::Selector("#main".into()),
+                    vec!["wait", "#main"],
+                ),
+                (
+                    "url",
+                    WaitTarget::Url("https://example.com".into()),
+                    vec!["wait", "--url", "https://example.com"],
+                ),
+                (
+                    "text",
+                    WaitTarget::Text("Loaded".into()),
+                    vec!["wait", "--text", "Loaded"],
+                ),
+            ];
+            for (name, target, mut expected) in wait_cases {
+                expected.extend(["--timeout", "8000"]);
+                assert_eq!(
+                    argv(&wait_args(&target, 8000)),
+                    expected,
+                    "case {case}: {name}"
+                );
+            }
+        }
+
+        {
+            let case = "expect args covers every variant";
+            let expect_cases = [
+                (
+                    "state",
+                    ExpectCond::State {
+                        selector: "#main".into(),
+                        state: "visible",
+                    },
+                    vec!["expect", "#main", "visible"],
+                ),
+                (
+                    "count",
+                    ExpectCond::Count {
+                        selector: ".card".into(),
+                        op: "==".into(),
+                        n: 3,
+                    },
+                    vec!["expect", "count", ".card", "==", "3"],
+                ),
+                (
+                    "text",
+                    ExpectCond::Text {
+                        selector: "#main".into(),
+                        predicate: "contains",
+                        value: "hello".into(),
+                    },
+                    vec!["expect", "text", "#main", "contains", "hello"],
+                ),
+                (
+                    "value",
+                    ExpectCond::Value {
+                        selector: "input".into(),
+                        predicate: "equals",
+                        value: "abc".into(),
+                    },
+                    vec!["expect", "value", "input", "equals", "abc"],
+                ),
+                (
+                    "attr",
+                    ExpectCond::Attr {
+                        selector: "a".into(),
+                        name: "href".into(),
+                        predicate: "matches",
+                        value: "example.com".into(),
+                    },
+                    vec!["expect", "attr", "a", "href", "matches", "example.com"],
+                ),
+                (
+                    "url",
+                    ExpectCond::Url {
+                        predicate: "contains",
+                        pattern: "dashboard".into(),
+                    },
+                    vec!["expect", "url", "contains", "dashboard"],
+                ),
+            ];
+            for (name, cond, mut expected) in expect_cases {
+                expected.extend(["--timeout", "8000"]);
+                assert_eq!(
+                    argv(&expect_args(&cond, 8000)),
+                    expected,
+                    "case {case}: {name}"
+                );
+            }
         }
     }
 
+    /// The wait state, predicate and count operators each parse their documented
+    /// spellings and reject the rest.
     #[test]
-    fn expect_args_covers_every_variant() {
-        let cases = [
-            (
-                ExpectCond::State {
-                    selector: "#main".into(),
-                    state: "visible",
-                },
-                vec!["expect", "#main", "visible"],
-            ),
-            (
-                ExpectCond::Count {
-                    selector: ".card".into(),
-                    op: "==".into(),
-                    n: 3,
-                },
-                vec!["expect", "count", ".card", "==", "3"],
-            ),
-            (
-                ExpectCond::Text {
-                    selector: "#main".into(),
-                    predicate: "contains",
-                    value: "hello".into(),
-                },
-                vec!["expect", "text", "#main", "contains", "hello"],
-            ),
-            (
-                ExpectCond::Value {
-                    selector: "input".into(),
-                    predicate: "equals",
-                    value: "abc".into(),
-                },
-                vec!["expect", "value", "input", "equals", "abc"],
-            ),
-            (
-                ExpectCond::Attr {
-                    selector: "a".into(),
-                    name: "href".into(),
-                    predicate: "matches",
-                    value: "example.com".into(),
-                },
-                vec!["expect", "attr", "a", "href", "matches", "example.com"],
-            ),
-            (
-                ExpectCond::Url {
-                    predicate: "contains",
-                    pattern: "dashboard".into(),
-                },
-                vec!["expect", "url", "contains", "dashboard"],
-            ),
-        ];
-        for (cond, mut expected) in cases {
-            expected.extend(["--timeout", "8000"]);
-            assert_eq!(argv(&expect_args(&cond, 8000)), expected);
+    fn parse_each_wait_predicate_part_accepts_and_rejects() {
+        {
+            let case = "parse state accepts and rejects";
+            for state in ["visible", "hidden", "present"] {
+                assert_eq!(
+                    parse_state(state),
+                    Some(state),
+                    "case {case}: {state:?} is a documented state"
+                );
+            }
+            for state in ["gone", "VISIBLE", ""] {
+                assert_eq!(
+                    parse_state(state),
+                    None,
+                    "case {case}: {state:?} is not a state"
+                );
+            }
+        }
+
+        {
+            let case = "parse predicate accepts and rejects";
+            for predicate in ["equals", "contains", "matches"] {
+                assert_eq!(
+                    parse_predicate(predicate),
+                    Some(predicate),
+                    "case {case}: {predicate:?} is a documented predicate"
+                );
+            }
+            for predicate in ["regex", "EQUALS", ""] {
+                assert_eq!(
+                    parse_predicate(predicate),
+                    None,
+                    "case {case}: {predicate:?} is not a predicate"
+                );
+            }
+        }
+
+        {
+            let case = "parse count op accepts symbols and words";
+            for op in [
+                "==", "!=", ">", "<", ">=", "<=", "eq", "ne", "gt", "lt", "ge", "le",
+            ] {
+                assert_eq!(
+                    parse_count_op(op).as_deref(),
+                    Some(op),
+                    "case {case}: op {op:?} should parse"
+                );
+            }
+        }
+
+        {
+            let case = "parse count op rejects unknowns";
+            for op in [">>", "=", "like", " between ", ""] {
+                assert_eq!(
+                    parse_count_op(op),
+                    None,
+                    "case {case}: op {op:?} should be rejected"
+                );
+            }
         }
     }
 
+    /// The count verb's JS wrapper escapes the selector, so a quote or a
+    /// backslash in it can neither end nor alter the single-quoted literal.
     #[test]
-    fn parse_state_accepts_and_rejects() {
-        assert_eq!(parse_state("visible"), Some("visible"));
-        assert_eq!(parse_state("hidden"), Some("hidden"));
-        assert_eq!(parse_state("present"), Some("present"));
-        assert_eq!(parse_state("gone"), None);
-        assert_eq!(parse_state("VISIBLE"), None);
-        assert_eq!(parse_state(""), None);
-    }
-
-    #[test]
-    fn parse_predicate_accepts_and_rejects() {
-        assert_eq!(parse_predicate("equals"), Some("equals"));
-        assert_eq!(parse_predicate("contains"), Some("contains"));
-        assert_eq!(parse_predicate("matches"), Some("matches"));
-        assert_eq!(parse_predicate("regex"), None);
-        assert_eq!(parse_predicate("EQUALS"), None);
-        assert_eq!(parse_predicate(""), None);
-    }
-
-    #[test]
-    fn parse_count_op_accepts_symbols_and_words() {
-        for op in [
-            "==", "!=", ">", "<", ">=", "<=", "eq", "ne", "gt", "lt", "ge", "le",
+    fn count_eval_js_escapes_single_quotes_and_backslashes() {
+        for (name, selector, js) in [
+            ("quote", "a'b", "document.querySelectorAll('a\\'b').length"),
+            (
+                "backslash",
+                "a\\b",
+                "document.querySelectorAll('a\\\\b').length",
+            ),
+            (
+                "plain",
+                "div.c",
+                "document.querySelectorAll('div.c').length",
+            ),
         ] {
-            assert_eq!(
-                parse_count_op(op).as_deref(),
-                Some(op),
-                "op {op:?} should parse"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_count_op_rejects_unknowns() {
-        for op in [">>", "=", "like", " between ", ""] {
-            assert_eq!(parse_count_op(op), None, "op {op:?} should be rejected");
+            assert_eq!(count_eval_js(selector), js, "{name}");
         }
     }
 
@@ -460,79 +530,92 @@ mod tests {
         assert!(wait_target(Some("#x"), Some("d"), Some("t")).is_err());
     }
 
+    /// The `get:` grammar: `text`/`html`/`value` and `@<attribute>` pass,
+    /// everything else is refused.
     #[test]
-    fn count_eval_js_escapes_single_quotes_and_backslashes() {
-        assert_eq!(
-            count_eval_js("a'b"),
-            "document.querySelectorAll('a\\'b').length"
-        );
-        assert_eq!(
-            count_eval_js("a\\b"),
-            "document.querySelectorAll('a\\\\b').length"
-        );
-        assert_eq!(
-            count_eval_js("div.c"),
-            "document.querySelectorAll('div.c').length"
-        );
-    }
+    fn validate_extract_getters_accepts_the_grammar_and_rejects_the_rest() {
+        struct Case {
+            name: &'static str,
+            schema: Value,
+            /// Substrings the refusal must name; `None` means the schema is valid.
+            refused: Option<&'static [&'static str]>,
+        }
 
-    #[test]
-    fn validate_extract_getters_accepts_documented_grammar() {
-        // text/html/value and "@<attribute>" all pass; missing get passes.
-        let schema = serde_json::json!({
-            "rows": ".card",
-            "fields": {
-                "t": {"sel": ".a", "get": "text"},
-                "h": {"sel": ".b", "get": "html"},
-                "v": {"sel": ".c", "get": "value"},
-                "u": {"sel": "a", "get": "@href"},
-                "plain": ".title",
+        let cases = [
+            Case {
+                // accepts_documented_grammar: text/html/value and "@<attribute>"
+                // all pass, and a plain CSS-selector string field needs no getter.
+                name: "accepts_documented_grammar",
+                schema: serde_json::json!({
+                    "rows": ".card",
+                    "fields": {
+                        "t": {"sel": ".a", "get": "text"},
+                        "h": {"sel": ".b", "get": "html"},
+                        "v": {"sel": ".c", "get": "value"},
+                        "u": {"sel": "a", "get": "@href"},
+                        "plain": ".title",
+                    },
+                }),
+                refused: None,
             },
-        });
-        assert!(
-            validate_extract_getters(&schema).is_ok(),
-            "doc grammar passes"
-        );
+            Case {
+                // A field object with no "get" key is fine (defaults to text).
+                name: "field_object_without_get",
+                schema: serde_json::json!({"fields": {"title": {"sel": ".title"}}}),
+                refused: None,
+            },
+            Case {
+                // Plain string fields (CSS selectors) are fine.
+                name: "plain_string_fields",
+                schema: serde_json::json!({"fields": {"title": ".title", "url": "a"}}),
+                refused: None,
+            },
+            Case {
+                // Missing or non-object "fields" is shape-checked elsewhere — Ok here.
+                name: "missing_fields",
+                schema: serde_json::json!({"rows": ".card"}),
+                refused: None,
+            },
+            Case {
+                name: "non_object_fields",
+                schema: serde_json::json!({"fields": ".title"}),
+                refused: None,
+            },
+            Case {
+                // Bare attribute name (no "@") is rejected with the convention taught.
+                name: "bare_attribute_name",
+                schema: serde_json::json!({"fields": {"link": {"sel": "a", "get": "href"}}}),
+                refused: Some(&["@", "getter", "href"]),
+            },
+            Case {
+                // Empty "@" is rejected.
+                name: "empty_getter",
+                schema: serde_json::json!({"fields": {"u": {"sel": "a", "get": "@"}}}),
+                refused: Some(&["empty getter"]),
+            },
+            Case {
+                // Non-string get is rejected.
+                name: "non_string_getter",
+                schema: serde_json::json!({"fields": {"u": {"sel": "a", "get": 42}}}),
+                refused: Some(&["non-string getter"]),
+            },
+        ];
 
-        // A field object with no "get" key is fine (defaults to text).
-        let no_get = serde_json::json!({"fields": {"title": {"sel": ".title"}}});
-        assert!(validate_extract_getters(&no_get).is_ok());
-    }
-
-    #[test]
-    fn validate_extract_getters_rejects_bad_getters() {
-        // Bare attribute name (no "@") is rejected with the convention taught.
-        let err = validate_extract_getters(&serde_json::json!({
-            "fields": {"link": {"sel": "a", "get": "href"}}
-        }))
-        .unwrap_err();
-        assert!(err.contains('@'), "err: {err}");
-        assert!(err.contains("getter"), "err: {err}");
-        assert!(err.contains("href"), "err: {err}");
-
-        // Empty "@" is rejected.
-        let err = validate_extract_getters(&serde_json::json!({
-            "fields": {"u": {"sel": "a", "get": "@"}}
-        }))
-        .unwrap_err();
-        assert!(err.contains("empty getter"), "err: {err}");
-
-        // Non-string get is rejected.
-        let err = validate_extract_getters(&serde_json::json!({
-            "fields": {"u": {"sel": "a", "get": 42}}
-        }))
-        .unwrap_err();
-        assert!(err.contains("non-string getter"), "err: {err}");
-    }
-
-    #[test]
-    fn validate_extract_getters_ignores_non_object_fields_and_shapes() {
-        // Plain string fields (CSS selectors) are fine.
-        let schema = serde_json::json!({"fields": {"title": ".title", "url": "a"}});
-        assert!(validate_extract_getters(&schema).is_ok());
-
-        // Missing or non-object "fields" is shape-checked elsewhere — Ok here.
-        assert!(validate_extract_getters(&serde_json::json!({"rows": ".card"})).is_ok());
-        assert!(validate_extract_getters(&serde_json::json!({"fields": ".title"})).is_ok());
+        for case in cases {
+            match case.refused {
+                None => assert!(
+                    validate_extract_getters(&case.schema).is_ok(),
+                    "{}: must pass",
+                    case.name
+                ),
+                Some(substrings) => {
+                    let err = validate_extract_getters(&case.schema)
+                        .expect_err("the getter must be refused");
+                    for needle in substrings {
+                        assert!(err.contains(needle), "{}: {err}", case.name);
+                    }
+                }
+            }
+        }
     }
 }

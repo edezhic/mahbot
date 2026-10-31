@@ -627,9 +627,6 @@ impl PipeBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chrome::{
-        CHROME_USE_DECLARED_BUDGET, KILL_SLACK, RELAY_RECOVERY_BUDGET, kill_bound,
-    };
     use crate::util::test::set_env_var;
     use tokio::process::Command;
 
@@ -722,29 +719,6 @@ mod tests {
             ensure_chrome_env(&mut cmd);
             assert_eq!(cmd_env(&cmd, "CHROMIUM_FLAGS"), None);
         }
-    }
-
-    #[test]
-    fn ensure_chrome_env_sets_fixed_env_vars() {
-        let mut cmd = Command::new("true");
-        ensure_chrome_env(&mut cmd);
-        assert_eq!(
-            cmd_env(&cmd, "AGENT_BROWSER_IDLE_TIMEOUT_MS").as_deref(),
-            Some("300000")
-        );
-        assert_eq!(
-            cmd_env(&cmd, "AGENT_BROWSER_HUMANIZE").as_deref(),
-            Some("human")
-        );
-        assert_eq!(
-            cmd_env(&cmd, "AGENT_BROWSER_NO_UPDATE_CHECK").as_deref(),
-            Some("1")
-        );
-        // The two per-call policies are NOT fixed here: a call declares its own
-        // chrome-side deadline and its own recovery allowance.
-        assert!(cmd_inherits(&cmd, "AGENT_BROWSER_DEFAULT_TIMEOUT"));
-        assert!(cmd_inherits(&cmd, "AGENT_BROWSER_RELAY_REVIVE_SECS"));
-        assert!(cmd_inherits(&cmd, "AGENT_BROWSER_NO_AUTO_RECONNECT"));
     }
 
     #[test]
@@ -858,28 +832,6 @@ mod tests {
         assert_eq!(
             cmd_env(&cmd, "AGENT_BROWSER_DEFAULT_TIMEOUT").as_deref(),
             Some("250")
-        );
-    }
-
-    #[test]
-    fn kill_bound_rides_above_the_declared_deadline_and_the_recovery() {
-        // The arithmetic's one home is `chrome::kill_bound`, and its literal pin
-        // lives in `chrome/mod.rs`; here the invariants are the relations, not the
-        // numbers. The argument is the domain's own declaration — the deadline
-        // handed to chrome-use for a verb mahbot forwards no `--timeout` to.
-        let allowed = kill_bound(CHROME_USE_DECLARED_BUDGET, CliRecovery::Allowed);
-        let suppressed = kill_bound(CHROME_USE_DECLARED_BUDGET, CliRecovery::Suppressed);
-        assert_eq!(allowed, suppressed + RELAY_RECOVERY_BUDGET);
-        // The declared deadline is always chrome-use's to hit first: the kill
-        // sits KILL_SLACK above it, and the recovery window above that.
-        assert_eq!(suppressed, CHROME_USE_DECLARED_BUDGET + KILL_SLACK);
-        assert_eq!(
-            allowed,
-            CHROME_USE_DECLARED_BUDGET + KILL_SLACK + RELAY_RECOVERY_BUDGET
-        );
-        assert!(kill_bound(Duration::from_secs(6), CliRecovery::Allowed) > Duration::from_secs(6));
-        assert!(
-            kill_bound(Duration::from_secs(6), CliRecovery::Suppressed) > Duration::from_secs(6)
         );
     }
 

@@ -884,8 +884,7 @@ mod tests {
     #[test]
     fn only_the_products_own_output_path_is_recognised() {
         let temp = std::env::temp_dir();
-        // The generated shape is one of these: `launch_quick_exit_appends_annotation`
-        // runs the predicate against the path a real session hands out.
+        // A real session hands out one of these shapes.
         for name in ["bg_1a2b.out", "bg_ffff.out", "bg_0000.out"] {
             assert!(is_output_file(&temp.join(".agent").join(name)), "{name}");
         }
@@ -925,31 +924,64 @@ mod tests {
             .await
     }
 
+    /// A case for the finished-session annotation: the command, the text its output
+    /// file carries besides the status, and the status the annotation states.
+    struct LaunchExitCase {
+        name: &'static str,
+        command: &'static str,
+        contains: &'static str,
+        annotation: &'static str,
+    }
+
+    /// A launch that exits quickly is a successful launch, its output file carrying
+    /// the product's own name shape and the command's own status as its annotation —
+    /// a legitimate non-zero exit (grep no-match semantics) included.
     #[tokio::test]
-    async fn launch_quick_exit_appends_annotation() {
-        let dir = TempDir::new().expect("tempdir");
-        let ws = test_ws(dir.path());
-        let sessions = Arc::new(BackgroundSessions::default());
+    async fn launch_finishes_with_its_own_status_annotation() {
+        let cases = [
+            LaunchExitCase {
+                name: "a quick exit",
+                command: "echo hello-bg",
+                contains: "hello-bg",
+                annotation: "[exit status: 0]",
+            },
+            LaunchExitCase {
+                name: "a legitimate non-zero early exit",
+                command: "echo legit-bg && exit 3",
+                contains: "legit-bg",
+                annotation: "[exit status: 3]",
+            },
+        ];
+        for case in cases {
+            let dir = TempDir::new().expect("tempdir");
+            let ws = test_ws(dir.path());
+            let sessions = Arc::new(BackgroundSessions::default());
 
-        let path = launch_command(&sessions, ws.as_path(), "echo hello-bg")
-            .await
-            .expect("launch succeeds");
-        // The name this session hands out is the product's own output shape, which
-        // is what makes the read tool read it as a program's output
-        // ([`is_output_file`]).
-        assert!(
-            is_output_file(&path),
-            "bg output must be the product's own output name: {}",
-            path.display()
-        );
-
-        assert!(
-            wait_finished(&sessions, &path, Duration::from_secs(10)).await,
-            "quick command should finish"
-        );
-        let out = read_file(&path);
-        assert!(out.contains("hello-bg"), "output: {out}");
-        assert!(out.contains("[exit status: 0]"), "output: {out}");
+            let path = launch_command(&sessions, ws.as_path(), case.command)
+                .await
+                .expect("launch succeeds");
+            // The name this session hands out is the product's own output shape, which
+            // is what makes the read tool read it as a program's output
+            // ([`is_output_file`]).
+            assert!(
+                is_output_file(&path),
+                "[{}] bg output must be the product's own output name: {}",
+                case.name,
+                path.display()
+            );
+            assert!(
+                wait_finished(&sessions, &path, Duration::from_secs(10)).await,
+                "[{}] the command should finish",
+                case.name
+            );
+            let out = read_file(&path);
+            assert!(out.contains(case.contains), "[{}] output: {out}", case.name);
+            assert!(
+                out.contains(case.annotation),
+                "[{}] output: {out}",
+                case.name
+            );
+        }
     }
 
     #[tokio::test]
@@ -989,7 +1021,9 @@ mod tests {
     }
 
     // The 126/127 launch-failure probe is Unix-shell-specific (cmd.exe exits 1
-    // for these cases); both tests are Unix-gated.
+    // for these cases); both tests are Unix-gated. Each is a synchronous launch
+    // error naming the shell's own exit code, and no session or output file is
+    // left behind.
     #[cfg(unix)]
     #[tokio::test]
     async fn launch_failure_command_not_found_errors() {
@@ -1005,7 +1039,6 @@ mod tests {
             "error message: {err}"
         );
         assert!(err.contains("127"), "error should mention exit 127: {err}");
-        // No session registered, no stray output file left behind.
         assert!(
             sessions.inner.lock().unwrap_poison().is_empty(),
             "no session should be registered after a launch failure"
@@ -1032,26 +1065,10 @@ mod tests {
             "error message: {err}"
         );
         assert!(err.contains("126"), "error should mention exit 126: {err}");
-        assert!(sessions.inner.lock().unwrap_poison().is_empty());
-    }
-
-    #[tokio::test]
-    async fn launch_legit_nonzero_early_exit_is_successful_launch() {
-        let dir = TempDir::new().expect("tempdir");
-        let ws = test_ws(dir.path());
-        let sessions = Arc::new(BackgroundSessions::default());
-
-        // A legitimate non-zero early exit (grep no-match semantics) is a
-        // successful launch surfaced via the annotation.
-        let path = launch_command(&sessions, ws.as_path(), "exit 3")
-            .await
-            .expect("exit 3 is a successful launch");
         assert!(
-            wait_finished(&sessions, &path, Duration::from_secs(10)).await,
-            "should finish"
+            sessions.inner.lock().unwrap_poison().is_empty(),
+            "no session should be registered after a launch failure"
         );
-        let out = read_file(&path);
-        assert!(out.contains("[exit status: 3]"), "output: {out}");
     }
 
     #[tokio::test]

@@ -754,47 +754,104 @@ mod tests {
     const EMPTY_DOCX_BODY: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body></w:body></w:document>"#;
 
-    /// A text-free document is called provided as images only when images actually
-    /// were attached: one with neither text nor images says the plain sentence
-    /// (never "could not be read" for a document that converted fine), and one
-    /// whose images are all over the cap points at the folder instead of claiming
-    /// they were attached.
-    #[tokio::test]
-    async fn text_free_documents_claim_images_only_when_attached() {
-        let empty = zip_fixture(&[("word/document.xml", EMPTY_DOCX_BODY)]);
-        let owner = SpillOwner::new();
-        let (_dir, ws) = temp_workspace(&[("empty.docx", &empty)]);
-        let out = convert(&owner, &ws, "empty.docx", PathAccess::Allowlisted)
-            .await
-            .expect("a .docx is a document");
-        assert_eq!(out.image_payloads.len(), 0);
-        assert!(
-            out.text.contains("empty.docx: no text could be extracted]"),
-            "{:?}",
-            out.text
-        );
+    /// A text-free Word package and what its reading must say: a document with
+    /// neither text nor images says the plain sentence (never "could not be
+    /// read" for a document that converted fine), and one whose images are all
+    /// over the cap points at the folder instead of claiming they were attached.
+    struct TextFreeCase {
+        name: &'static str,
+        file: &'static str,
+        fixture: Vec<u8>,
+        /// Substrings the answer must carry.
+        present: &'static [&'static str],
+        /// Substrings the answer must not carry.
+        absent: &'static [&'static str],
+        /// How many image paths the over-the-cap envelope must list.
+        listed: Option<usize>,
+    }
 
-        let with_media = docx_with_images(EMPTY_DOCX_BODY, 6);
-        let (_dir, ws) = temp_workspace(&[("scanned.docx", &with_media)]);
-        let out = convert(&owner, &ws, "scanned.docx", PathAccess::Allowlisted)
-            .await
-            .expect("a .docx is a document");
-        assert_eq!(
-            out.image_payloads.len(),
-            0,
-            "over the cap nothing is attached"
-        );
-        assert!(
-            out.text
-                .contains("scanned.docx: no text could be extracted]\n"),
-            "{:?}",
-            out.text
-        );
-        assert!(
-            !out.text.contains(crate::document::NO_TEXT_LAYER_NOTE),
-            "images that were not attached are not called attached: {:?}",
-            out.text
-        );
+    #[tokio::test]
+    async fn text_free_docx_cases() {
+        let owner = SpillOwner::new();
+        let cases = vec![
+            TextFreeCase {
+                name: "no_text_and_no_images",
+                file: "empty.docx",
+                fixture: zip_fixture(&[("word/document.xml", EMPTY_DOCX_BODY)]),
+                present: &["empty.docx: no text could be extracted]"],
+                absent: &[],
+                listed: None,
+            },
+            TextFreeCase {
+                name: "media_over_the_cap_is_attached_nothing",
+                file: "scanned.docx",
+                fixture: docx_with_images(EMPTY_DOCX_BODY, 6),
+                present: &["scanned.docx: no text could be extracted]\n"],
+                // Images that were not attached are not called attached.
+                absent: &[crate::document::NO_TEXT_LAYER_NOTE],
+                listed: None,
+            },
+            TextFreeCase {
+                name: "over_the_cap_images_are_delivered_as_paths",
+                file: "report.docx",
+                fixture: docx_with_images(DOCX_BODY, 6),
+                present: &[
+                    "6 extracted image(s) were not attached (5 is the per-call limit); read them individually as images:]",
+                ],
+                absent: &[],
+                listed: Some(6),
+            },
+        ];
+        for case in cases {
+            let (_dir, ws) = temp_workspace(&[(case.file, &case.fixture)]);
+            let out = convert(&owner, &ws, case.file, PathAccess::Allowlisted)
+                .await
+                .unwrap_or_else(|| panic!("{}: a .docx is a document", case.name));
+            assert!(
+                out.image_payloads.is_empty(),
+                "{}: nothing may be attached: {}",
+                case.name,
+                out.text
+            );
+            for expected in case.present {
+                assert!(
+                    out.text.contains(expected),
+                    "{}: the answer does not say {expected:?}: {}",
+                    case.name,
+                    out.text
+                );
+            }
+            for unexpected in case.absent {
+                assert!(
+                    !out.text.contains(unexpected),
+                    "{}: the answer claims {unexpected:?}: {}",
+                    case.name,
+                    out.text
+                );
+            }
+            let Some(expected) = case.listed else {
+                continue;
+            };
+            let listed: Vec<&str> = out
+                .text
+                .lines()
+                .skip_while(|line| !line.contains("were not attached"))
+                .skip(1)
+                .collect();
+            assert_eq!(
+                listed.len(),
+                expected,
+                "{}: one line per produced image: {listed:?}",
+                case.name
+            );
+            assert!(
+                listed
+                    .iter()
+                    .all(|path| std::path::Path::new(path).is_absolute()),
+                "{}: each image is named by its absolute path: {listed:?}",
+                case.name
+            );
+        }
     }
 
     /// The read tool's own resolution and delivery do not bypass the page's visible
@@ -1038,43 +1095,6 @@ mod tests {
         zip_fixture(&entries)
     }
 
-    /// Over the per-call cap nothing is attached, but every produced image is
-    /// still delivered — as its path in the call's own directory.
-    #[tokio::test]
-    async fn images_over_the_cap_are_delivered_as_paths() {
-        let fixture = docx_with_images(DOCX_BODY, 6);
-        let owner = SpillOwner::new();
-        let (_dir, ws) = temp_workspace(&[("report.docx", &fixture)]);
-
-        let out = convert(&owner, &ws, "report.docx", PathAccess::Allowlisted)
-            .await
-            .expect("a .docx is a document");
-        assert!(
-            out.image_payloads.is_empty(),
-            "nothing may be attached: {}",
-            out.text
-        );
-        assert!(
-            out.text
-                .contains("6 extracted image(s) were not attached (5 is the per-call limit); read them individually as images:]"),
-            "the annotation is one closed envelope: {}",
-            out.text
-        );
-        let listed: Vec<&str> = out
-            .text
-            .lines()
-            .skip_while(|line| !line.contains("were not attached"))
-            .skip(1)
-            .collect();
-        assert_eq!(listed.len(), 6, "one line per produced image: {listed:?}");
-        assert!(
-            listed
-                .iter()
-                .all(|path| std::path::Path::new(path).is_absolute()),
-            "each image is named by its absolute path: {listed:?}"
-        );
-    }
-
     /// A reading of an old binary document delivers its embedded pictures exactly
     /// as a reading of a modern one does: the picture is written out, attached to
     /// the conversation as a native image, and no line reports it as left out —
@@ -1111,30 +1131,6 @@ mod tests {
                 "{name}: the reading never modifies the source file"
             );
         }
-    }
-
-    /// A listing too long to fit the budget is replaced by the folder holding
-    /// the images: the formatter must never drop paths from the middle of it.
-    #[tokio::test]
-    async fn a_listing_too_long_to_fit_names_the_folder() {
-        // ~60 bytes per path, so this listing cannot fit the 5 KB budget.
-        let fixture = docx_with_images(DOCX_BODY, 120);
-        let owner = SpillOwner::new();
-        let (_dir, ws) = temp_workspace(&[("many.docx", &fixture)]);
-
-        let out = convert(&owner, &ws, "many.docx", PathAccess::Allowlisted)
-            .await
-            .expect("a .docx is a document");
-        assert!(
-            out.text.len() <= crate::util::TOOL_OUTPUT_BUDGET_BYTES,
-            "the answer must fit the budget it is formatted against: {} bytes",
-            out.text.len()
-        );
-        assert!(
-            out.text.contains("they are all in "),
-            "the folder is named rather than a truncated listing: {}",
-            out.text
-        );
     }
 
     /// A plain text file is not a document: the read tool's ordinary path owns
@@ -1308,39 +1304,37 @@ mod tests {
                 .all(|path| path.is_absolute() && path.exists() && path.starts_with(&folder)),
             "{marked:?}"
         );
+
+        // A non-document is the ordinary read: its line-numbered rendering is
+        // written as the text, never a refusal. An empty file has no rendering,
+        // so nothing is written and the answer is the empty one the read tool
+        // gives it.
+        let (_text_dir, text_ws) =
+            temp_workspace(&[("notes.md", b"first\nsecond\n"), ("empty.md", b"")]);
+        let text_destination = TempDir::new().expect("destination");
+        let answer = command_line_read(&text_ws, text_destination.path(), "notes.md", None)
+            .await
+            .expect("a text file is read");
+        assert!(!answer.partial);
+        let rendered = std::fs::read_to_string(text_destination.path().join("notes/notes.txt"))
+            .expect("the ordinary read's rendering");
+        assert!(
+            rendered.contains("1: first") && rendered.contains("2: second"),
+            "the fallback is the read tool's line-numbered rendering: {rendered}"
+        );
+
+        let empty = command_line_read(&text_ws, text_destination.path(), "empty.md", None)
+            .await
+            .expect("an empty file is read");
+        assert_eq!(empty.text, "", "the read tool's answer for it is empty");
+        assert!(
+            !text_destination.path().join("empty").exists(),
+            "nothing produced, so no folder"
+        );
     }
 
     /// An old binary Office document converts through the command line exactly as
     /// it does for an agent: its text and its embedded picture land in the folder.
-    #[tokio::test]
-    async fn command_line_reading_converts_an_old_binary_document() {
-        crate::util::test::init_test_stores().await;
-        let png = noisy_png(16, 16);
-        let fixture = doc_picture_fixture("Legacy body text", &png);
-        let (_dir, ws) = temp_workspace(&[("old.doc", &fixture)]);
-        let destination = TempDir::new().expect("destination");
-
-        let answer = command_line_read(&ws, destination.path(), "old.doc", None)
-            .await
-            .expect("an old document is read");
-        assert!(!answer.partial);
-
-        let folder = destination.path().join("old");
-        let text = std::fs::read_to_string(folder.join("old.txt")).expect("the text is written");
-        assert!(text.contains("Legacy body text"), "{text}");
-        assert_eq!(
-            files_with_extension(&folder, "png").len(),
-            1,
-            "the embedded picture is written beside the text"
-        );
-        assert_eq!(
-            marked_files(&answer.text).len(),
-            2,
-            "the text and the picture are named: {}",
-            answer.text
-        );
-    }
-
     /// A document with no text layer is delivered the same way: one raster per
     /// page and no text file, with the read tool's own "no text" sentence.
     #[tokio::test]
@@ -1441,80 +1435,62 @@ mod tests {
         );
     }
 
-    /// A document the reader cannot parse is the read tool's own refusal — and a
-    /// failed reading leaves no folder behind.
-    #[tokio::test]
-    async fn command_line_reading_leaves_no_folder_for_an_unreadable_document() {
-        crate::util::test::init_test_stores().await;
-        let (_dir, ws) = temp_workspace(&[("broken.pdf", b"%PDF-1.4\ngarbage")]);
-        let destination = TempDir::new().expect("destination");
-
-        let error = command_line_read(&ws, destination.path(), "broken.pdf", None)
-            .await
-            .err()
-            .expect("a corrupt PDF is a refusal");
-        let message = format!("{error:#}");
-        assert!(message.contains("could not be parsed"), "{message}");
-        assert!(message.contains("broken.pdf"), "{message}");
-        assert!(
-            !destination.path().join("broken").exists(),
-            "a failed reading leaves no folder"
-        );
+    /// A document the reader cannot deliver, and the refusal the command line
+    /// must give: the reader's own words, and no folder left behind.
+    struct CommandLineRefusalCase {
+        name: &'static str,
+        file: &'static str,
+        fixture: Vec<u8>,
+        /// Substrings the refusal must carry.
+        message: &'static [&'static str],
+        /// The folder the reading would have written into.
+        folder: &'static str,
     }
 
-    /// A protected document is the reader's own refusal too, in the reader's own
-    /// words (`password-protected`), and it also leaves no folder.
-    #[tokio::test]
-    async fn command_line_reading_reports_a_protected_document_in_the_readers_words() {
-        crate::util::test::init_test_stores().await;
-        let fixture = doc_fixture("secret", &[], true);
-        let (_dir, ws) = temp_workspace(&[("secret.doc", &fixture)]);
-        let destination = TempDir::new().expect("destination");
-
-        let error = command_line_read(&ws, destination.path(), "secret.doc", None)
-            .await
-            .err()
-            .expect("a protected document is a refusal");
-        let message = format!("{error:#}");
-        assert!(message.contains("password-protected"), "{message}");
-        assert_eq!(
-            std::fs::read_dir(destination.path())
-                .expect("the destination")
-                .count(),
-            0,
-            "a failed reading writes nothing"
-        );
+    fn refusal_cases() -> Vec<CommandLineRefusalCase> {
+        vec![
+            CommandLineRefusalCase {
+                name: "an_unreadable_document",
+                file: "broken.pdf",
+                fixture: b"%PDF-1.4\ngarbage".to_vec(),
+                message: &["could not be parsed", "broken.pdf"],
+                folder: "broken",
+            },
+            CommandLineRefusalCase {
+                name: "a_protected_document",
+                file: "secret.doc",
+                fixture: doc_fixture("secret", &[], true),
+                message: &["password-protected"],
+                folder: "secret",
+            },
+        ]
     }
 
-    /// A file that is not a document takes the read tool's ordinary fallback —
-    /// the line-numbered rendering, written as the text — never a refusal. An
-    /// empty file has no rendering, so nothing is written and the answer is the
-    /// empty one the read tool gives it.
     #[tokio::test]
-    async fn command_line_reading_of_a_non_document_is_the_ordinary_read() {
+    async fn command_line_refusal_cases() {
         crate::util::test::init_test_stores().await;
-        let (_dir, ws) = temp_workspace(&[("notes.md", b"first\nsecond\n"), ("empty.md", b"")]);
-        let destination = TempDir::new().expect("destination");
+        for case in refusal_cases() {
+            let (_dir, ws) = temp_workspace(&[(case.file, &case.fixture)]);
+            let destination = TempDir::new().expect("destination");
 
-        let answer = command_line_read(&ws, destination.path(), "notes.md", None)
-            .await
-            .expect("a text file is read");
-        assert!(!answer.partial);
-        let text = std::fs::read_to_string(destination.path().join("notes/notes.txt"))
-            .expect("the ordinary read's rendering");
-        assert!(
-            text.contains("1: first") && text.contains("2: second"),
-            "the fallback is the read tool's line-numbered rendering: {text}"
-        );
-
-        let empty = command_line_read(&ws, destination.path(), "empty.md", None)
-            .await
-            .expect("an empty file is read");
-        assert_eq!(empty.text, "", "the read tool's answer for it is empty");
-        assert!(
-            !destination.path().join("empty").exists(),
-            "nothing produced, so no folder"
-        );
+            let error = command_line_read(&ws, destination.path(), case.file, None)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{}: the reading must be refused", case.name));
+            let message = format!("{error:#}");
+            for expected in case.message {
+                assert!(
+                    message.contains(expected),
+                    "{}: the refusal does not say {expected:?}: {message}",
+                    case.name
+                );
+            }
+            assert!(
+                !destination.path().join(case.folder).exists(),
+                "{}: a failed reading writes nothing",
+                case.name
+            );
+        }
     }
 
     /// The command line has no length limit: a long text and a hundred images
@@ -1567,64 +1543,83 @@ mod tests {
         );
     }
 
-    /// `--file-name` replaces the folder's base name through the family's own
-    /// sanitisation, and the text file inside takes that name.
-    #[tokio::test]
-    async fn command_line_reading_takes_its_folder_name_from_the_flag() {
-        crate::util::test::init_test_stores().await;
-        let fixture = zip_fixture(&[("word/document.xml", DOCX_BODY)]);
-        let (_dir, ws) = temp_workspace(&[("report.docx", &fixture)]);
-        let destination = TempDir::new().expect("destination");
-
-        command_line_read(&ws, destination.path(), "report.docx", Some("dir/summary"))
-            .await
-            .expect("a document is read");
-        // A name carrying a directory is reduced to its last component, like every
-        // other name the family writes.
-        assert_eq!(
-            folder_names(&destination.path().join("summary")),
-            ["summary.txt"]
-        );
+    /// A reading (or a sequence of them) into one destination and the folders
+    /// each must produce: `--file-name` replaces the base name through the
+    /// family's own sanitisation, and a repeat gets its numeric suffix while the
+    /// first folder is left untouched.
+    struct NamingCase {
+        name: &'static str,
+        file: &'static str,
+        /// The `--file-name` flag of each reading, in order.
+        reads: &'static [Option<&'static str>],
+        /// The folder each reading must write into, and the text file inside it.
+        folders: &'static [(&'static str, &'static str)],
     }
 
-    /// A second reading into the same destination gets the family's numeric
-    /// suffix, and the first folder is left untouched. A dotted base keeps its
-    /// dots: a folder has no extension, so the suffix goes at the end.
+    const NAMING_CASES: &[NamingCase] = &[
+        NamingCase {
+            name: "the_flag_names_the_folder_and_its_text_file",
+            file: "report.docx",
+            reads: &[Some("dir/summary")],
+            // A name carrying a directory is reduced to its last component, like
+            // every other name the family writes.
+            folders: &[("summary", "summary.txt")],
+        },
+        NamingCase {
+            name: "a_second_reading_gets_the_numeric_suffix",
+            file: "2024.report.docx",
+            reads: &[None, None],
+            // A dotted base keeps its dots: a folder has no extension, so the
+            // suffix goes at the end.
+            folders: &[
+                ("2024.report", "2024.report.txt"),
+                ("2024.report_2", "2024.report_2.txt"),
+            ],
+        },
+    ];
+
     #[tokio::test]
-    async fn command_line_reading_twice_gets_the_familys_numeric_suffix() {
+    async fn command_line_naming_cases() {
         crate::util::test::init_test_stores().await;
-        let fixture = zip_fixture(&[("word/document.xml", DOCX_BODY)]);
-        let (_dir, ws) = temp_workspace(&[("2024.report.docx", &fixture)]);
-        let destination = TempDir::new().expect("destination");
+        for case in NAMING_CASES {
+            let fixture = zip_fixture(&[("word/document.xml", DOCX_BODY)]);
+            let (_dir, ws) = temp_workspace(&[(case.file, &fixture)]);
+            let destination = TempDir::new().expect("destination");
 
-        command_line_read(&ws, destination.path(), "2024.report.docx", None)
-            .await
-            .expect("first reading");
-        let first = std::fs::read_to_string(destination.path().join("2024.report/2024.report.txt"))
-            .expect("the first folder's text");
-        let second = command_line_read(&ws, destination.path(), "2024.report.docx", None)
-            .await
-            .expect("second reading");
-        assert!(!second.partial);
-
-        let second_folder = destination.path().join("2024.report_2");
-        assert!(
-            second_folder.is_dir(),
-            "the family's numeric suffix disambiguates a dotted base: {:?}",
-            folder_names(destination.path())
-        );
-        assert_eq!(
-            std::fs::read_to_string(second_folder.join("2024.report_2.txt"))
-                .expect("the second text"),
-            first,
-            "the same reading, delivered again"
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.path().join("2024.report/2024.report.txt"))
-                .expect("the first folder is still there"),
-            first,
-            "the first reading is untouched"
-        );
+            let mut texts: Vec<String> = Vec::new();
+            for (read, (folder, text_file)) in case.reads.iter().zip(case.folders) {
+                let answer = command_line_read(&ws, destination.path(), case.file, *read)
+                    .await
+                    .unwrap_or_else(|e| panic!("{}: a document is read: {e}", case.name));
+                assert!(!answer.partial, "{}: {}", case.name, answer.text);
+                let folder = destination.path().join(folder);
+                assert!(
+                    folder.is_dir(),
+                    "{}: the reading's folder: {:?}",
+                    case.name,
+                    folder_names(destination.path())
+                );
+                texts.push(
+                    std::fs::read_to_string(folder.join(text_file))
+                        .unwrap_or_else(|e| panic!("{}: {text_file}: {e}", case.name)),
+                );
+                assert_eq!(
+                    folder_names(&folder),
+                    [text_file.to_string()],
+                    "{}: the folder holds its own text file",
+                    case.name
+                );
+            }
+            // Every reading delivered the same text, and the first one is still
+            // there to say so.
+            for text in &texts {
+                assert_eq!(
+                    text, &texts[0],
+                    "{}: the same reading, delivered again",
+                    case.name
+                );
+            }
+        }
     }
 
     /// The product's live store is refused by the read tool's own resolution,

@@ -620,57 +620,69 @@ mod tests {
         );
     }
 
-    /// The name IS the admin marker, so `add_user` refuses the reserved admin
-    /// name — this path only ever mints guest accounts.
-    #[tokio::test]
-    async fn add_user_refuses_the_admin_name() {
-        crate::util::test::init_test_stores().await;
-        let tool = MahbotConfigTool;
-        let ws = test_ws("/tmp/test_ws");
-
-        let err = tool
-            .execute(
-                &ws,
-                json!({ "action": "add_user", "name": "admin", "telegram": "@a" }),
-            )
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("only guest accounts can be created"),
-            "the reserved admin name must be refused, got: {err}"
-        );
+    /// What an `add_user` call must refuse.
+    enum AddUserExpect {
+        /// The reserved admin name.
+        AdminName,
+        /// A name an existing account matches, ignoring case.
+        NameTaken,
     }
 
-    /// The account-naming rule reaches this path too: a name that, ignoring
-    /// case, is an existing account's is refused by `add_user`, before any row
-    /// or folder exists for it.
+    struct AddUserRefusalCase {
+        name: &'static str,
+        /// An account created before the call, if any.
+        existing: Option<&'static str>,
+        args: serde_json::Value,
+        expected: AddUserExpect,
+    }
+
     #[tokio::test]
-    async fn add_user_refuses_a_name_an_existing_account_matches_ignoring_case() {
+    async fn add_user_refusal_cases() {
         crate::util::test::init_test_stores().await;
         let tool = MahbotConfigTool;
         let ws = test_ws("/tmp/test_ws");
-        crate::users::store().add_user("CaseGuest").await.unwrap();
 
-        let err = tool
-            .execute(
-                &ws,
-                json!({ "action": "add_user", "name": "caseguest", "telegram": "@case_guest" }),
-            )
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains(&crate::users::name_taken_message("caseguest")),
-            "a colliding name must be refused the way an exact duplicate is, got: {err}"
-        );
-        assert!(
-            !crate::users::store()
-                .user_exists("caseguest")
-                .await
-                .unwrap(),
-            "a refused name must not leave an account row"
-        );
+        for case in [
+            AddUserRefusalCase {
+                name: "the reserved admin name is refused",
+                existing: None,
+                args: json!({ "action": "add_user", "name": "admin", "telegram": "@a" }),
+                expected: AddUserExpect::AdminName,
+            },
+            AddUserRefusalCase {
+                name: "a case-insensitive collision with an existing account is refused",
+                existing: Some("CaseGuest"),
+                args: json!({ "action": "add_user", "name": "caseguest", "telegram": "@case_guest" }),
+                expected: AddUserExpect::NameTaken,
+            },
+        ] {
+            if let Some(existing) = case.existing {
+                crate::users::store().add_user(existing).await.unwrap();
+            }
+            let err = tool.execute(&ws, case.args).await.unwrap_err().to_string();
+            match case.expected {
+                AddUserExpect::AdminName => assert!(
+                    err.contains("only guest accounts can be created"),
+                    "[{}] the reserved admin name must be refused, got: {err}",
+                    case.name
+                ),
+                AddUserExpect::NameTaken => {
+                    assert!(
+                        err.contains(&crate::users::name_taken_message("caseguest")),
+                        "[{}] a colliding name must be refused the way an exact duplicate is, got: {err}",
+                        case.name
+                    );
+                    assert!(
+                        !crate::users::store()
+                            .user_exists("caseguest")
+                            .await
+                            .unwrap(),
+                        "[{}] a refused name must not leave an account row",
+                        case.name
+                    );
+                }
+            }
+        }
     }
 
     /// The assistant's config surface prints a role's kind grants: a bare entry

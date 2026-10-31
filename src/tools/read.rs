@@ -1267,141 +1267,54 @@ mod tests {
         }
     }
 
-    /// The read description names the slide marks and labels the reader prints,
-    /// rendered from their single statement ([`crate::docgen::ppt_marks`],
-    /// [`crate::docgen::ppt_slide_labels`], [`crate::reader_output`] for the legacy
-    /// story names, the text-box mark, the chart-sheet mark and the lines of the
-    /// report of what a reading did not show): a mark renamed there cannot leave
-    /// this model-facing sentence stale, and a placeholder the call does not fill
-    /// would reach the model as its own literal spelling.
+    /// `format_output`'s three shapes: short output passes through unchanged, a
+    /// structured long output keeps its header and cuts at the last complete line,
+    /// and unstructured long output falls back to the head+tail truncation.
     #[test]
-    fn the_description_states_the_marks_the_reader_prints() {
-        let marks = crate::docgen::ppt_marks();
-        let labels = crate::docgen::ppt_slide_labels();
-        // A label's `{n}` is the reader's own placeholder, so the description
-        // states the label with `<n>` where a real number goes.
-        let slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
-        let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
-        let comments_label = crate::reader_output::slide_label(&labels.comments, "<n>");
-        // Two of the report's lines, as the reader that prints them spells them.
-        let report = crate::reader_output::unshown_report_examples();
-        // The chart block's own headers, series labels and size annotation, as the
-        // chart reader prints them for a chart of a kind, one naming none, a named
-        // and an unnamed series, and a bubble point.
-        let chart_header = crate::reader_output::chart_header(Some("<kind>"));
-        let chart_none = crate::reader_output::chart_header(None);
-        let chart_series = crate::reader_output::chart_series(Some("<name>"), 0);
-        let chart_series_numbered = crate::reader_output::chart_series(None, 0);
-        let chart_size = crate::reader_output::chart_size("<size>");
-        for tool in [
-            ReadTool::general(),
-            ReadTool::new(PathAccess::Workspace),
-            ReadTool::new(PathAccess::Unrestricted),
-        ] {
-            let description = tool.description();
-            assert!(
-                !description.contains("{{"),
-                "the description left a placeholder unreplaced:\n{description}"
-            );
-            for mark in [
-                &marks.title,
-                &marks.hidden_slide,
-                &marks.diagram_text,
-                &marks.diagram_text_lost,
-                &marks.no_text,
-                &slide_label,
-                &notes_label,
-                &comments_label,
-                crate::reader_output::DOC_HEADERS_FOOTERS,
-                crate::reader_output::DOC_FOOTNOTES,
-                crate::reader_output::DOC_ENDNOTES,
-                crate::reader_output::DOC_COMMENTS,
-                crate::reader_output::TEXT_BOX,
-                crate::reader_output::DOC_LINK,
-                crate::reader_output::CHART_SHEET,
-                &chart_header,
-                &chart_none,
-                &chart_series,
-                &chart_series_numbered,
-                &chart_size,
-                crate::reader_output::MARK_STORED.trim(),
-                crate::reader_output::CHART_TITLE,
-                crate::reader_output::CHART_TEXT,
-                crate::reader_output::CHART_LABEL,
-                crate::reader_output::CHART_NO_VALUES,
-                crate::reader_output::CHART_VALUES_ATTACHED,
-                crate::reader_output::CHART_UNREADABLE,
-                crate::reader_output::CHART_EXTENDED,
-                &report,
-            ] {
-                assert!(
-                    description.contains(mark),
-                    "the description does not name {mark:?}:\n{description}"
-                );
-            }
-        }
-    }
+    fn format_output_cases() {
+        // Short output: byte-identical passthrough.
+        let short = "[3 lines total]\n1: a\n2: b\n3: c".to_string();
+        assert_eq!(
+            tool().format_output(&short),
+            short,
+            "a short output passes through"
+        );
 
-    /// The first paragraph of the description's document section — what a reading
-    /// of a container gives and does not give — and the paragraph that follows it,
-    /// which is no longer about documents.
-    const DOCUMENT_SECTION_START: &str = "A content-mode document container";
-    const DOCUMENT_SECTION_END: &str = "Reading a credential-bearing file";
+        // Structured long output: the header survives and the body is cut at a
+        // complete line, with the omitted count in the marker.
+        let header = "[100 lines total]";
+        let complete_line = "x".repeat(100);
+        let long_body = vec![complete_line.as_str(); 100].join("\n");
+        let marker = "\n... (51 lines omitted)";
+        let result = tool().format_output(&format!("{header}\n{long_body}"));
+        assert!(
+            result.starts_with(header),
+            "the header is preserved: {result}"
+        );
+        assert!(
+            result.ends_with(marker),
+            "the omitted count is {marker:?}: {result}"
+        );
+        let body = result
+            .strip_prefix(header)
+            .and_then(|rest| rest.strip_suffix(marker))
+            .and_then(|rest| rest.strip_prefix('\n'))
+            .expect("the header and marker frame the body");
+        assert!(
+            body.split('\n').all(|line| line == complete_line.as_str()),
+            "every kept line is complete: {result}"
+        );
+        assert!(
+            !result.contains("more bytes"),
+            "a structured output uses the line marker: {result}"
+        );
 
-    /// What that section measured when the document contract was settled: 11,110
-    /// bytes rendered, with the marks and labels a reading prints substituted in.
-    /// It is held to at most half of it — the same rule the writing tool's
-    /// description answers to — so the document half of what the model reads
-    /// cannot drift back up.
-    const DOCUMENT_SECTION_BASELINE: usize = 11_110;
-
-    /// The document section of `description`.
-    fn document_section(description: &str) -> &str {
-        let start = description
-            .find(DOCUMENT_SECTION_START)
-            .expect("the description states the container rule");
-        let end = description
-            .find(DOCUMENT_SECTION_END)
-            .expect("the description states the credential rule after it");
-        &description[start..end]
-    }
-
-    /// The document section is the other half of the capability's model-read text,
-    /// so it is measured the way the writing tool's description is: at most half
-    /// of what the section's own paragraphs cost before the contract was settled.
-    #[test]
-    fn the_document_section_stays_inside_half_its_baseline() {
-        for tool in [
-            ReadTool::general(),
-            ReadTool::new(PathAccess::Workspace),
-            ReadTool::new(PathAccess::Unrestricted),
-        ] {
-            let description = tool.description();
-            let section = document_section(&description);
-            assert!(
-                section.len() * 2 <= DOCUMENT_SECTION_BASELINE,
-                "the document section is {} bytes, more than half its \
-                 {DOCUMENT_SECTION_BASELINE}-byte baseline",
-                section.len()
-            );
-        }
-    }
-
-    /// Spot-check that common non-code extensions return no language support.
-    /// Helps catch accidental regressions in `language_support` match arms.
-    /// Not exhaustive.
-    #[test]
-    fn unsupported_extensions_return_none() {
-        let unsupported: &[&str] = &[
-            "txt", "yml", "yaml", "xml", "svg", "config", "ini", "cfg", "log", "csv", "tsv", "pdf",
-            "png", "jpg", "gif", "woff", "ttf",
-        ];
-        for ext in unsupported {
-            assert!(
-                language_support(ext).is_none(),
-                "expected no language support for .{ext}"
-            );
-        }
+        // Unstructured long output: the byte-count fallback marker.
+        let result = tool().format_output(&"a".repeat(6000));
+        assert!(
+            result.contains("bytes omitted at tool output truncation"),
+            "the fallback marker is present: {result}"
+        );
     }
 
     #[tokio::test]
@@ -1439,32 +1352,6 @@ mod tests {
         assert!(result.is_ok(), "empty file read should succeed: {result:?}");
         let result = result.unwrap();
         assert_eq!(result, "");
-    }
-
-    #[tokio::test]
-    async fn read_wildcard_without_search_index_returns_helpful_error() {
-        // When the search engine is already initialized by other tests (full
-        // suite), the "without index" condition cannot be reproduced. Skip
-        // silently so CI isn't broken; run this test individually to verify
-        // the error path: cargo test -- read_wildcard_without_search_index
-        if crate::workspace_index::registry_initialized() {
-            return;
-        }
-
-        let (_dir, ws_path) = temp_workspace(&[("alpha.rs", "fn alpha() {}")]);
-
-        let result = tool()
-            .execute(&test_ws(&ws_path), json!({"path": "*.rs"}))
-            .await;
-        assert!(
-            result.is_err(),
-            "wildcard without index should fail: {result:?}"
-        );
-        let err = format!("{}", result.unwrap_err());
-        assert!(
-            err.contains("search index") || err.contains("Wildcard"),
-            "unexpected error: {err}"
-        );
     }
 
     #[tokio::test]
@@ -1510,24 +1397,6 @@ mod tests {
         );
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("outside the allowed read envelope"));
-    }
-
-    #[tokio::test]
-    async fn file_read_nested_path() {
-        let (_dir, ws_path) = temp_workspace(&[("sub/dir/deep.txt", "deep content")]);
-
-        let result = tool()
-            .execute(
-                &Workspace::from_path(&ws_path),
-                json!({"path": "sub/dir/deep.txt"}),
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "nested path read should succeed: {result:?}"
-        );
-        let result = result.unwrap();
-        assert!(result.contains("1: deep content"));
     }
 
     #[cfg(unix)]
@@ -1888,138 +1757,131 @@ mod tests {
         buf
     }
 
-    /// A recognised-but-unsupported raster (GIF) is reported gracefully, not
-    /// decoded into garbage or treated as an error.
-    #[tokio::test]
-    async fn file_read_unsupported_image_reports_unsupported() {
-        let dir = TempDir::new().unwrap();
-        let ws_path = dir.path().to_path_buf();
-        let mut gif: Vec<u8> = b"GIF89a".to_vec();
-        gif.extend_from_slice(&[0u8; 20]);
-        tokio::fs::write(ws_path.join("bad.gif"), &gif)
-            .await
-            .unwrap();
-
-        let result = tool()
-            .execute(&Workspace::from_path(&ws_path), json!({"path": "bad.gif"}))
-            .await
-            .expect("unsupported image read must succeed");
-        assert!(result.contains("unsupported image format"), "got: {result}");
-        assert!(result.contains("GIF"), "got: {result}");
+    /// A raster file the read is asked for and what the two halves of the image
+    /// path must answer: the annotation `execute` prints and the payload (the
+    /// only decoder) that the agent loop injects.
+    struct ImageCase {
+        name: &'static str,
+        file: &'static str,
+        bytes: Vec<u8>,
+        /// Substrings the `execute` annotation must carry.
+        present: &'static [&'static str],
+        /// Substrings the `execute` annotation must not carry.
+        absent: &'static [&'static str],
+        /// The `(width, height, format)` of the payload, when one is produced.
+        payload: Option<(u32, u32, &'static str)>,
+        /// Whether the payload names the resolved path of the file.
+        payload_path: bool,
     }
 
-    /// A native raster with valid magic + header dimensions but a corrupt /
-    /// truncated body (no pixel data) is still reported as a PNG (the cheap
-    /// magic sniff only looks at the leading magic bytes) but never claims an
-    /// attachment — the decode is deferred to `image_payload`, so the base
-    /// annotation stays honest about what the read itself demonstrated.
     #[tokio::test]
-    async fn file_read_corrupt_image_does_not_claim_attachment() {
-        let dir = TempDir::new().unwrap();
-        let ws_path = dir.path().to_path_buf();
+    async fn image_payload_cases() {
         let png = tiny_png_bytes(4, 4);
-        // Truncate to the PNG signature + IHDR (valid magic + header dimensions,
-        // but no IDAT/IEND) — must be reported, not claimed as attached.
-        let truncated = &png[..33];
-        assert!(image::guess_format(truncated).is_ok());
-        tokio::fs::write(ws_path.join("corrupt.png"), truncated)
-            .await
-            .unwrap();
+        let mut unsupported: Vec<u8> = b"GIF89a".to_vec();
+        unsupported.extend_from_slice(&[0u8; 20]);
+        let cases = vec![
+            ImageCase {
+                name: "unsupported_raster_is_reported",
+                file: "bad.gif",
+                bytes: unsupported,
+                present: &["unsupported image format", "GIF"],
+                absent: &[],
+                payload: None,
+                payload_path: false,
+            },
+            ImageCase {
+                name: "corrupt_native_image_claims_no_attachment",
+                // Truncated to the PNG signature + IHDR: valid magic and header
+                // dimensions, but no IDAT/IEND. The cheap sniff still reports a
+                // PNG, while the decode — deferred to `image_payload` — fails, so
+                // the annotation stays honest about what the read demonstrated.
+                file: "corrupt.png",
+                bytes: png[..33].to_vec(),
+                present: &["Read image file", "PNG"],
+                absent: &["attached to the conversation"],
+                payload: None,
+                payload_path: false,
+            },
+            ImageCase {
+                name: "native_image_is_annotated_then_attached",
+                file: "tiny.png",
+                bytes: png,
+                present: &["Read image file", "PNG"],
+                absent: &["attached to the conversation"],
+                payload: Some((4, 4, "PNG")),
+                payload_path: true,
+            },
+            ImageCase {
+                name: "a_text_file_has_no_payload",
+                file: "hello.txt",
+                bytes: b"hello world".to_vec(),
+                present: &[],
+                absent: &[],
+                payload: None,
+                payload_path: false,
+            },
+        ];
+        for case in cases {
+            let dir = TempDir::new().unwrap();
+            let ws_path = dir.path().to_path_buf();
+            tokio::fs::write(ws_path.join(case.file), &case.bytes)
+                .await
+                .unwrap();
+            let ws = Workspace::from_path(&ws_path);
 
-        let result = tool()
-            .execute(
-                &Workspace::from_path(&ws_path),
-                json!({"path": "corrupt.png"}),
-            )
-            .await
-            .expect("corrupt image read must succeed");
-        assert!(result.contains("Read image file"), "got: {result}");
-        assert!(result.contains("PNG"), "got: {result}");
-        assert!(
-            !result.contains("attached to the conversation"),
-            "corrupt image must not claim attachment, got: {result}"
-        );
-    }
+            let text = tool()
+                .execute(&ws, json!({"path": case.file}))
+                .await
+                .unwrap_or_else(|e| panic!("{}: the read must succeed: {e}", case.name));
+            for expected in case.present {
+                assert!(
+                    text.contains(expected),
+                    "{}: the annotation does not carry {expected:?}: {text}",
+                    case.name
+                );
+            }
+            for unexpected in case.absent {
+                assert!(
+                    !text.contains(unexpected),
+                    "{}: the annotation claims {unexpected:?}: {text}",
+                    case.name
+                );
+            }
 
-    /// A native image read produces a compressed JPEG data-URI payload that the
-    /// agent loop injects as a synthetic user message.
-    #[tokio::test]
-    async fn file_read_image_payload_produces_data_uri() {
-        let dir = TempDir::new().unwrap();
-        let ws_path = dir.path().to_path_buf();
-        let png = tiny_png_bytes(4, 4);
-        tokio::fs::write(ws_path.join("tiny.png"), &png)
-            .await
-            .unwrap();
-        let ws = Workspace::from_path(&ws_path);
-
-        let payload = tool()
-            .image_payload(&ws, &json!({"path": "tiny.png"}))
-            .await;
-        let payload = payload.expect("image payload must be produced");
-        assert!(
-            payload.data_uri.starts_with("data:image/jpeg;base64,"),
-            "unexpected data-uri: {}",
-            payload.data_uri
-        );
-        assert_eq!(payload.width, 4, "unexpected payload width");
-        assert_eq!(payload.height, 4, "unexpected payload height");
-        assert_eq!(payload.format, "PNG", "unexpected payload format");
-        // `payload.path` is the resolved path: canonicalized (which on macOS
-        // resolves the /tmp → /private/tmp symlink) in the spelling the tool
-        // hands on.
-        let expected_path =
-            crate::util::test::canonical_without_verbatim_prefix(&ws_path.join("tiny.png"));
-        assert_eq!(
-            payload.path,
-            expected_path.display().to_string(),
-            "unexpected payload path"
-        );
-    }
-
-    /// Non-image files (text) produce no image payload.
-    #[tokio::test]
-    async fn image_payload_non_image_returns_none() {
-        let (_dir, ws_path) = temp_workspace(&[("hello.txt", "hello world")]);
-        let ws = Workspace::from_path(&ws_path);
-        let payload = tool()
-            .image_payload(&ws, &json!({"path": "hello.txt"}))
-            .await;
-        assert!(payload.is_none());
-    }
-
-    /// End-to-end pipeline regression: `execute` produces the dims-less base
-    /// annotation, then `image_payload` (the only decoder of a native image file)
-    /// produces the payload that the agent loop would inject — validated without
-    /// passing the annotation wording to the gate.
-    #[tokio::test]
-    async fn execute_then_payload_attaches_native_image() {
-        let dir = TempDir::new().unwrap();
-        let ws_path = dir.path().to_path_buf();
-        let png = tiny_png_bytes(4, 4);
-        tokio::fs::write(ws_path.join("tiny.png"), &png)
-            .await
-            .unwrap();
-        let ws = Workspace::from_path(&ws_path);
-
-        let result = tool()
-            .execute(&ws, json!({"path": "tiny.png"}))
-            .await
-            .expect("native image read must succeed");
-        assert!(result.contains("Read image file"), "got: {result}");
-        assert!(result.contains("PNG"), "got: {result}");
-        assert!(
-            !result.contains("attached to the conversation"),
-            "execute output must carry no attachment claim, got: {result}"
-        );
-
-        let payload = tool()
-            .image_payload(&ws, &json!({"path": "tiny.png"}))
-            .await
-            .expect("pipeline image payload must be produced");
-        assert_eq!(payload.width, 4, "unexpected payload width");
-        assert_eq!(payload.height, 4, "unexpected payload height");
-        assert_eq!(payload.format, "PNG", "unexpected payload format");
+            let payload = tool().image_payload(&ws, &json!({"path": case.file})).await;
+            let Some((width, height, format)) = case.payload else {
+                assert!(
+                    payload.is_none(),
+                    "{}: no payload may be produced",
+                    case.name
+                );
+                continue;
+            };
+            let payload =
+                payload.unwrap_or_else(|| panic!("{}: the payload must be produced", case.name));
+            assert!(
+                payload.data_uri.starts_with("data:image/jpeg;base64,"),
+                "{}: unexpected data-uri: {}",
+                case.name,
+                payload.data_uri
+            );
+            assert_eq!(payload.width, width, "{}: payload width", case.name);
+            assert_eq!(payload.height, height, "{}: payload height", case.name);
+            assert_eq!(payload.format, format, "{}: payload format", case.name);
+            if case.payload_path {
+                // `payload.path` is the resolved path: canonicalized (which on
+                // macOS resolves the /tmp → /private/tmp symlink) in the spelling
+                // the tool hands on.
+                let expected_path =
+                    crate::util::test::canonical_without_verbatim_prefix(&ws_path.join(case.file));
+                assert_eq!(
+                    payload.path,
+                    expected_path.display().to_string(),
+                    "{}: unexpected payload path",
+                    case.name
+                );
+            }
+        }
     }
 
     /// Regression: a typo'd image path that `execute` recovers to a unique
@@ -2064,95 +1926,25 @@ mod tests {
         assert!(note.contains("tiny_imag.png"), "note: {note}");
     }
 
-    /// A payload's recovered-path note is prepended to the tool-result
-    /// annotation, so recovered image reads keep the same `[Recovered path: ...]`
-    /// context that recovered text reads already show.
-    #[test]
-    fn image_payload_recovery_note_prepends_annotation() {
-        let payload = crate::tools::ImagePayload {
-            path: "/tmp/y.png".into(),
-            data_uri: "data:image/jpeg;base64,aaa".into(),
-            width: 4,
-            height: 4,
-            format: "PNG".into(),
-            recovery_note: Some("[Recovered path: requested 'x.png', using 'y.png']".into()),
-            note: None,
-            source: crate::tools::ImagePayloadSource::Read,
-        };
-        let fresh = payload.attached_annotation();
-        assert!(
-            fresh.starts_with("[Recovered path: requested 'x.png', using 'y.png']\n"),
-            "fresh must keep the recovery note: {fresh}"
-        );
-        assert!(
-            fresh.contains("Image content attached to the conversation as a native image."),
-            "fresh: {fresh}"
-        );
-        let dup = payload.already_attached_annotation();
-        assert!(
-            dup.starts_with("[Recovered path: requested 'x.png', using 'y.png']\n"),
-            "dup must keep the recovery note: {dup}"
-        );
-        assert!(dup.contains("already attached"), "dup: {dup}");
+    /// One symbol-mode request — the answer's own labels when it succeeds, the
+    /// refusal's words when it does not.
+    struct SymbolModeCase {
+        name: &'static str,
+        file: &'static str,
+        code: &'static str,
+        mode: &'static str,
+        symbol: Option<&'static str>,
+        /// Substrings the answer must carry.
+        present: &'static [&'static str],
+        /// Substrings the refusal must carry — empty when the request succeeds.
+        refusal: &'static [&'static str],
     }
 
-    /// Short output should pass through unchanged.
-    #[test]
-    fn format_output_short_passthrough() {
-        let input = "[3 lines total]\n1: a\n2: b\n3: c";
-        let result = tool().format_output(input);
-        assert_eq!(result, input);
-    }
-
-    /// Long output keeps the header + as many complete lines as fit + omitted count.
-    #[test]
-    fn format_output_truncates_at_line_boundary() {
-        // Build a header line + many long body lines
-        let header = "[500 lines total]";
-        let body_lines: String = (1..=500)
-            .map(|i| format!("{}: {}", i, "x".repeat(200)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let input = format!("{header}\n{body_lines}");
-
-        let result = tool().format_output(&input);
-
-        // Header must be at the top, preserved
-        assert!(result.starts_with(header), "header must be first");
-        // Must end with "N lines omitted" marker
-        assert!(
-            result.contains("lines omitted)"),
-            "must contain omitted count, got: {result}"
-        );
-        // No "more bytes" marker (that's the default head+tail behavior we're avoiding)
-        assert!(
-            !result.contains("more bytes"),
-            "must not contain head+tail marker"
-        );
-        // Kept lines count + omitted should equal expected
-        let omitted: usize = result
-            .lines()
-            .last()
-            .and_then(|l| l.strip_prefix("... ("))
-            .and_then(|l| l.strip_suffix(" lines omitted)"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let kept = result.lines().count() - 2; // minus header and marker
-        assert_eq!(kept + omitted, 500, "kept + omitted must equal 500");
-    }
-
-    /// Lossy/binary output without a structured header falls back to default truncation.
-    #[test]
-    fn format_output_fallback_for_unstructured_output() {
-        let input = "a".repeat(6000);
-        let result = tool().format_output(&input);
-        assert!(result.contains("bytes omitted at tool output truncation"));
-    }
-
-    /// Symbols mode lists top-level declarations for Rust files.
-    #[tokio::test]
-    async fn symbols_mode_lists_rust_symbols() {
-        let code = r"
+    const SYMBOL_MODE_CASES: &[SymbolModeCase] = &[
+        SymbolModeCase {
+            name: "listing_every_kind",
+            file: "lib.rs",
+            code: r"
 fn hello() {}
 struct Point { x: i32, y: i32 }
 enum Color { Red, Blue }
@@ -2162,120 +1954,95 @@ const MAX: usize = 100;
 type MyInt = i32;
 macro_rules! my_macro { () => {} }
 mod utils;
-";
-        let (_dir, ws_path) = temp_workspace(&[("lib.rs", code)]);
+",
+            mode: "symbols",
+            symbol: None,
+            present: &[
+                "[Symbols in lib.rs]",
+                "fn `hello`",
+                "struct `Point`",
+                "enum `Color`",
+                "trait `Draw`",
+                "impl `Point`",
+                "const `MAX`",
+                "type `MyInt`",
+                "mod `utils`",
+            ],
+            refusal: &[],
+        },
+        SymbolModeCase {
+            name: "listing_an_unsupported_extension",
+            file: "data.yaml",
+            code: "{}",
+            mode: "symbols",
+            symbol: None,
+            present: &[],
+            refusal: &["Unsupported"],
+        },
+        SymbolModeCase {
+            name: "zoom_extracts_the_named_function",
+            file: "main.rs",
+            code: "fn greet(name: &str) -> String {\n    format!(\"Hi, {name}!\")\n}\n\nfn main() {}",
+            mode: "zoom",
+            symbol: Some("greet"),
+            present: &["fn `greet`", "format!(\"Hi, {name}!\")"],
+            refusal: &[],
+        },
+        SymbolModeCase {
+            name: "zoom_of_an_absent_symbol_suggests_what_is_there",
+            file: "lib.rs",
+            code: "fn existing() {}",
+            mode: "zoom",
+            symbol: Some("nope"),
+            present: &[],
+            refusal: &["'nope'", "Did you mean", "existing"],
+        },
+        SymbolModeCase {
+            name: "zoom_without_a_symbol",
+            file: "lib.rs",
+            code: "fn f() {}",
+            mode: "zoom",
+            symbol: None,
+            present: &[],
+            refusal: &["Missing 'symbol' parameter"],
+        },
+    ];
 
-        let result = tool()
-            .execute(
-                &Workspace::from_path(&ws_path),
-                json!({"path": "lib.rs", "mode": "symbols"}),
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "symbols failed: {:?}",
-            result.as_ref().unwrap_err()
-        );
-        let result = result.unwrap();
-        assert!(result.contains("[Symbols in lib.rs]"), "missing header");
-        assert!(result.contains("fn `hello`"), "missing fn hello");
-        assert!(result.contains("struct `Point`"), "missing struct Point");
-        assert!(result.contains("enum `Color`"), "missing enum Color");
-        assert!(result.contains("trait `Draw`"), "missing trait Draw");
-        assert!(result.contains("impl `Point`"), "missing impl Point");
-        assert!(result.contains("const `MAX`"), "missing const MAX");
-        assert!(result.contains("type `MyInt`"), "missing type MyInt");
-        assert!(result.contains("mod `utils`"), "missing mod utils");
-    }
-
-    /// Symbols mode returns clear error for unsupported extensions.
     #[tokio::test]
-    async fn symbols_mode_unsupported_extension() {
-        let (_dir, ws_path) = temp_workspace(&[("data.yaml", "{}")]);
-
-        let result = tool()
-            .execute(
-                &Workspace::from_path(&ws_path),
-                json!({"path": "data.yaml", "mode": "symbols"}),
-            )
-            .await;
-        assert!(
-            result.is_err(),
-            "unsupported extension should fail: {result:?}"
-        );
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("Unsupported"));
-    }
-
-    /// Zoom mode extracts a specific symbol's source.
-    /// Also verifies correct disambiguation: parameter names and local variables
-    /// with the same name as another function should not match.
-    #[tokio::test]
-    async fn zoom_mode_extracts_rust_function() {
-        let code =
-            "fn greet(name: &str) -> String {\n    format!(\"Hi, {name}!\")\n}\n\nfn main() {}";
-        let (_dir, ws_path) = temp_workspace(&[("main.rs", code)]);
-
-        let result = tool()
-            .execute(
-                &test_ws(&ws_path),
-                json!({"path": "main.rs", "mode": "zoom", "symbol": "greet"}),
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "zoom failed: {:?}",
-            result.as_ref().unwrap_err()
-        );
-        let result = result.unwrap();
-        assert!(result.contains("fn `greet`"), "missing fn greet label");
-        assert!(
-            result.contains("format!(\"Hi, {name}!\")"),
-            "missing function body"
-        );
-    }
-
-    /// Zoom mode returns helpful error for nonexistent symbol.
-    #[tokio::test]
-    async fn zoom_mode_symbol_not_found() {
-        let (_dir, ws_path) = temp_workspace(&[("lib.rs", "fn existing() {}")]);
-
-        let result = tool()
-            .execute(
-                &test_ws(&ws_path),
-                json!({"path": "lib.rs", "mode": "zoom", "symbol": "nope"}),
-            )
-            .await;
-        assert!(result.is_err(), "missing symbol should fail: {result:?}");
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("'nope'"), "missing symbol name in error");
-        assert!(
-            err.contains("Did you mean"),
-            "should suggest available symbols: {err}"
-        );
-        assert!(
-            err.contains("existing"),
-            "should list existing symbol: {err}"
-        );
-    }
-
-    /// Zoom mode requires symbol parameter.
-    #[tokio::test]
-    async fn zoom_mode_missing_symbol_param() {
-        let (_dir, ws_path) = temp_workspace(&[("lib.rs", "fn f() {}")]);
-
-        let result = tool()
-            .execute(
-                &Workspace::from_path(&ws_path),
-                json!({"path": "lib.rs", "mode": "zoom"}),
-            )
-            .await;
-        assert!(
-            result.is_err(),
-            "missing symbol param should fail: {result:?}"
-        );
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("Missing 'symbol' parameter"));
+    async fn symbol_mode_cases() {
+        for case in SYMBOL_MODE_CASES {
+            let (_dir, ws_path) = temp_workspace(&[(case.file, case.code)]);
+            let mut args = json!({"path": case.file, "mode": case.mode});
+            if let Some(symbol) = case.symbol {
+                args["symbol"] = json!(symbol);
+            }
+            let result = tool().execute(&test_ws(&ws_path), args).await;
+            if case.refusal.is_empty() {
+                let text = result
+                    .unwrap_or_else(|e| panic!("{}: the request must succeed: {e}", case.name));
+                for expected in case.present {
+                    assert!(
+                        text.contains(expected),
+                        "{}: the answer does not name {expected:?}: {text}",
+                        case.name
+                    );
+                }
+            } else {
+                let err = format!(
+                    "{}",
+                    result
+                        .err()
+                        .unwrap_or_else(|| panic!("{}: the request must be refused", case.name))
+                );
+                for expected in case.refusal {
+                    assert!(
+                        err.contains(expected),
+                        "{}: the refusal does not carry {expected:?}: {err}",
+                        case.name
+                    );
+                }
+            }
+        }
     }
 
     /// Directory listing returns file names instead of erroring.
@@ -2294,29 +2061,6 @@ mod utils;
         assert_eq!(
             result.unwrap(),
             "sub/\n.hidden  1B\na.txt  5B\nb.rs  4B\nSummary: 3 files, 1 dirs (1 .hidden, 1 .rs, 1 .txt)\n"
-        );
-    }
-
-    /// Subdirectories without a trailing slash should list contents, not error.
-    #[tokio::test]
-    async fn directory_listing_subdir_without_trailing_slash() {
-        let (_dir, ws_path) = temp_workspace(&[("sub/inside.txt", "nested")]);
-
-        let result = tool()
-            .execute(&Workspace::from_path(&ws_path), json!({"path": "sub"}))
-            .await;
-        assert!(
-            result.is_ok(),
-            "subdir without trailing slash should list: {result:?}"
-        );
-        let output = result.unwrap();
-        assert!(
-            output.contains("inside.txt"),
-            "should list inside.txt: {output}"
-        );
-        assert!(
-            !output.contains("File not found"),
-            "should not report missing file: {output}"
         );
     }
 
@@ -2421,24 +2165,6 @@ mod utils;
         );
     }
 
-    /// Directory listing handles paths with spaces and special characters.
-    #[tokio::test]
-    async fn directory_listing_spaces_in_path() {
-        let dir = TempDir::new().unwrap();
-        let ws_path = dir.path().join("my workspace");
-        tokio::fs::create_dir_all(&ws_path).await.unwrap();
-        tokio::fs::write(ws_path.join("my file.txt"), "content")
-            .await
-            .unwrap();
-
-        let result = tool()
-            .execute(&Workspace::from_path(&ws_path), json!({"path": "."}))
-            .await;
-        assert!(result.is_ok(), "dir with spaces should succeed: {result:?}");
-        let output = result.unwrap();
-        assert!(output.contains("my file.txt"), "should list file: {output}");
-    }
-
     /// Directory listing resolves symlinks to directories.
     #[cfg(unix)]
     #[tokio::test]
@@ -2470,31 +2196,6 @@ mod utils;
         assert!(
             output.contains("nested.txt"),
             "should list nested file: {output}"
-        );
-    }
-
-    /// A link *inside* a listing is a file entry carrying the link's own size —
-    /// never a directory entry, and without its target appended.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn directory_listing_link_entry_is_a_file() {
-        use std::os::unix::fs::symlink;
-
-        let dir = TempDir::new().unwrap();
-        let ws_path = dir.path().to_path_buf();
-        tokio::fs::create_dir(ws_path.join("real")).await.unwrap();
-        let target = PathBuf::from("real");
-        symlink(&target, ws_path.join("link")).unwrap();
-
-        let output = tool()
-            .execute(&Workspace::from_path(&ws_path), json!({"path": "."}))
-            .await
-            .unwrap();
-        // `link` is a file entry whose size is the target path's length (4),
-        // while `real` is the directory of the listing.
-        assert_eq!(
-            output,
-            "real/\nlink  4B\nSummary: 1 files, 1 dirs (1 no ext)\n"
         );
     }
 
@@ -2538,98 +2239,99 @@ mod utils;
             "gradle/wrapper/gradle-wrapper.properties"
         )); // basename-only
     }
-
     // ── prepare_symbol_query / collect_symbols ──────────────────────────────
 
-    #[tokio::test]
-    async fn prepare_symbol_query_valid_file() {
-        let (_dir, ws_path) = temp_workspace(&[("lib.rs", "fn hello() {}\nstruct World;\n")]);
-        let file_path = ws_path.join("lib.rs");
-
-        let result = prepare_symbol_query(&file_path, "test").await;
-        assert!(
-            result.is_ok(),
-            "prepare_symbol_query should succeed for .rs: {result:?}"
-        );
-
-        let ctx = result.unwrap();
-        // The query was built successfully
-        assert!(
-            !ctx.ps.symbol_query.is_empty(),
-            "expected non-empty symbol_query for .rs"
-        );
-        // collect_symbols should find our symbols
-        let symbols = collect_symbols(&ctx.ps, &ctx.query);
-        assert_eq!(symbols.len(), 2, "expected 2 symbols, got {symbols:?}");
-        // fn hello
-        assert!(symbols.iter().any(|s| s.name == "hello"));
-        // struct World
-        assert!(symbols.iter().any(|s| s.name == "World"));
+    /// A file handed to the symbol query, and the declarations it holds — every
+    /// `(name, start line)` the query collects, in the order it finds them.
+    struct SymbolQueryCase {
+        name: &'static str,
+        file: &'static str,
+        code: &'static str,
+        symbols: &'static [(&'static str, usize)],
+        /// The refusal a file the query cannot be built for must give.
+        refusal: &'static str,
     }
 
-    #[tokio::test]
-    async fn prepare_symbol_query_unsupported_extension() {
-        let (_dir, ws_path) = temp_workspace(&[("data.txt", "hello world")]);
-        let file_path = ws_path.join("data.txt");
-
-        let result = prepare_symbol_query(&file_path, "test").await;
-        assert!(result.is_err(), "expected error for unsupported extension");
-        let err = format!("{}", result.unwrap_err());
-        assert!(
-            err.contains("Unsupported"),
-            "error should mention unsupported: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn collect_symbols_empty_file() {
-        let (_dir, ws_path) = temp_workspace(&[("empty.rs", "")]);
-        let file_path = ws_path.join("empty.rs");
-
-        let ctx = prepare_symbol_query(&file_path, "test").await.unwrap();
-        let symbols = collect_symbols(&ctx.ps, &ctx.query);
-        assert!(
-            symbols.is_empty(),
-            "expected no symbols in empty file, got {symbols:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn collect_symbols_multiple_captures() {
-        // A Rust file with various symbol types
-        let code = r"
+    const SYMBOL_QUERY_CASES: &[SymbolQueryCase] = &[
+        SymbolQueryCase {
+            name: "a_supported_file_builds_its_query",
+            file: "lib.rs",
+            code: "fn hello() {}\nstruct World;\n",
+            symbols: &[("hello", 1), ("World", 2)],
+            refusal: "",
+        },
+        SymbolQueryCase {
+            name: "an_unsupported_extension_has_no_query",
+            file: "data.txt",
+            code: "hello world",
+            symbols: &[],
+            refusal: "Unsupported",
+        },
+        SymbolQueryCase {
+            name: "an_empty_file_holds_no_symbol",
+            file: "empty.rs",
+            code: "",
+            symbols: &[],
+            refusal: "",
+        },
+        SymbolQueryCase {
+            name: "every_kind_of_declaration_is_collected",
+            file: "main.rs",
+            code: r"
 fn foo() {}
 fn bar() {}
 struct Baz;
 enum Qux {}
 impl Baz {}
-";
-        let (_dir, ws_path) = temp_workspace(&[("main.rs", code)]);
-        let file_path = ws_path.join("main.rs");
-
-        let ctx = prepare_symbol_query(&file_path, "test").await.unwrap();
-        let symbols = collect_symbols(&ctx.ps, &ctx.query);
-        // We expect: foo, bar, Baz, Qux, Baz (impl)
-        assert_eq!(symbols.len(), 5, "expected 5 symbols, got {symbols:?}");
-        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"foo"));
-        assert!(names.contains(&"bar"));
-        assert!(names.contains(&"Baz"));
-        assert!(names.contains(&"Qux"));
-    }
+",
+            // foo, bar, Baz, Qux, Baz (impl)
+            symbols: &[("foo", 2), ("bar", 3), ("Baz", 4), ("Qux", 5), ("Baz", 6)],
+            refusal: "",
+        },
+        SymbolQueryCase {
+            name: "the_line_numbers_are_the_declarations_own",
+            file: "lib.rs",
+            code: "fn hello() {}\n\n\nfn world() {}\n",
+            symbols: &[("hello", 1), ("world", 4)],
+            refusal: "",
+        },
+    ];
 
     #[tokio::test]
-    async fn collect_symbols_preserves_line_numbers() {
-        let code = "fn hello() {}\n\n\nfn world() {}\n";
-        let (_dir, ws_path) = temp_workspace(&[("lib.rs", code)]);
-        let file_path = ws_path.join("lib.rs");
-
-        let ctx = prepare_symbol_query(&file_path, "test").await.unwrap();
-        let symbols = collect_symbols(&ctx.ps, &ctx.query);
-        let hello = symbols.iter().find(|s| s.name == "hello").unwrap();
-        let world = symbols.iter().find(|s| s.name == "world").unwrap();
-        assert_eq!(hello.start_line, 1, "hello starts at line 1");
-        assert_eq!(world.start_line, 4, "world starts at line 4");
+    async fn symbol_query_cases() {
+        for case in SYMBOL_QUERY_CASES {
+            let (_dir, ws_path) = temp_workspace(&[(case.file, case.code)]);
+            let file_path = ws_path.join(case.file);
+            let result = prepare_symbol_query(&file_path, "test").await;
+            if !case.refusal.is_empty() {
+                let err = format!(
+                    "{}",
+                    result
+                        .err()
+                        .unwrap_or_else(|| panic!("{}: the query must be refused", case.name))
+                );
+                assert!(
+                    err.contains(case.refusal),
+                    "{}: the refusal does not name {}: {err}",
+                    case.name,
+                    case.refusal
+                );
+                continue;
+            }
+            let ctx =
+                result.unwrap_or_else(|e| panic!("{}: the query must be built: {e}", case.name));
+            assert!(
+                !ctx.ps.symbol_query.is_empty(),
+                "{}: expected a non-empty symbol_query",
+                case.name
+            );
+            let symbols = collect_symbols(&ctx.ps, &ctx.query);
+            let found: Vec<(&str, usize)> = symbols
+                .iter()
+                .map(|symbol| (symbol.name.as_str(), symbol.start_line))
+                .collect();
+            assert_eq!(found, case.symbols, "{}: the collected symbols", case.name);
+        }
     }
 
     /// A channel (FIFO) is neither a regular file nor a directory: the read

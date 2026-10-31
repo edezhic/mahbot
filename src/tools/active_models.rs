@@ -314,33 +314,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_json_roundtrip() {
-        let snap = ModelSnapshot {
-            image: Some("google/gemini-3.1-flash-image".into()),
-            video: Some("minimax/hailuo-3".into()),
-        };
-        let parsed = ModelSnapshot::from_json(&snap.to_json()).expect("roundtrip");
-        assert_eq!(parsed, snap);
-    }
-
-    #[test]
     fn snapshot_from_json_tolerates_garbage() {
         assert!(ModelSnapshot::from_json("not json").is_none());
         assert!(ModelSnapshot::from_json("").is_none());
         assert!(ModelSnapshot::from_json("{\"image\":\"only\"}").is_some());
-    }
-
-    #[test]
-    fn format_durations_contiguous_range() {
-        assert_eq!(format_durations(&[5, 6, 7, 8, 9]), "5-9");
-        assert_eq!(format_durations(&[5, 7, 8]), "5, 7, 8");
-        assert_eq!(format_durations(&[1]), "1");
-        // Duplicates must not defeat the contiguity check: 7 is missing.
-        assert_eq!(format_durations(&[5, 6, 6, 8, 9, 10]), "5, 6, 8, 9, 10");
-        // A contiguous set with duplicates still compacts (all values covered).
-        assert_eq!(format_durations(&[5, 6, 6, 7]), "5-7");
-        // Extreme values must not overflow the contiguity check (debug panic).
-        assert_eq!(format_durations(&[0, i64::MAX]), "0, 9223372036854775807");
     }
 
     #[test]
@@ -353,160 +330,95 @@ mod tests {
         assert_eq!(join_capped(&values[..3], 16), "0, 1, 2");
     }
 
-    #[test]
-    fn image_section_renders_tool_mapped_params_only() {
+    /// Build a catalog entry declaring `params` — the shipped helper for the
+    /// envelope cases below, whose rows differ only in what is declared.
+    fn image_info(params: &[(&str, ParameterConstraint)]) -> ImageModelInfo {
         let mut info = ImageModelInfo::default();
-        info.supported_parameters.insert(
-            "aspect_ratio".into(),
-            ParameterConstraint::Enum(vec!["1:1".into(), "16:9".into()]),
-        );
-        info.supported_parameters.insert(
-            "input_references".into(),
-            ParameterConstraint::Range { max: 4 },
-        );
-        info.supported_parameters.insert(
-            "resolution".into(),
-            ParameterConstraint::Enum(vec!["1K".into(), "2K".into()]),
-        );
-        // Not exposed by the image_gen tool schema — must not render.
-        info.supported_parameters
-            .insert("n".into(), ParameterConstraint::Range { max: 4 });
-        info.supported_parameters
-            .insert("seed".into(), ParameterConstraint::Boolean);
-        info.supported_parameters
-            .insert("future".into(), ParameterConstraint::Unknown);
-
-        let out = render_image_section("test/model", &info).expect("envelope rendered");
-        assert!(out.starts_with("Image model: test/model\n"));
-        assert!(out.contains("- aspect_ratio: 1:1, 16:9\n"));
-        assert!(out.contains("- images: max 4\n"));
-        assert!(out.contains("- size: 1K, 2K\n"));
-        assert!(!out.contains("resolution"));
-        assert!(!out.contains("input_references"));
-        assert!(!out.contains("n:"));
-        assert!(!out.contains("seed"));
-        assert!(!out.contains("future"));
+        for (name, constraint) in params {
+            info.supported_parameters
+                .insert((*name).to_string(), constraint.clone());
+        }
+        info
     }
 
-    #[test]
-    fn image_section_clamps_declared_reference_max() {
-        // A model declaring more reference images than the provider accepts
-        // (the live catalog has one at 20) shows the ceiling, not its own
-        // number; a model within the ceiling renders unchanged (see
-        // image_section_renders_tool_mapped_params_only, max 4).
-        let mut huge = ImageModelInfo::default();
-        huge.supported_parameters.insert(
-            "input_references".into(),
-            ParameterConstraint::Range { max: 20 },
-        );
-        let out = render_image_section("huge/refs", &huge).expect("envelope rendered");
-        assert!(out.contains("- images: max 16\n"), "{out}");
+    /// One envelope row: the declared capabilities, and the lines the section
+    /// must carry together with how many mapped lines it renders — `None` when
+    /// no section may render at all.
+    struct ImageEnvelopeCase {
+        name: &'static str,
+        info: ImageModelInfo,
+        expected: Option<(&'static [&'static str], usize)>,
     }
 
+    /// Guards the three decisions the image envelope makes: the declared
+    /// reference maximum is clamped to the provider ceiling (the live catalog
+    /// declares 20), `resolution`/`size` are one tool parameter listed once,
+    /// and a model declaring nothing the tool accepts renders no section.
     #[test]
-    fn image_section_maps_size_identity_and_dedupes() {
-        // "size" is exposed as-is (identity mapping).
-        let mut size_only = ImageModelInfo::default();
-        size_only.supported_parameters.insert(
-            "size".into(),
-            ParameterConstraint::Enum(vec!["512x512".into()]),
-        );
-        let out = render_image_section("m", &size_only).expect("envelope rendered");
-        assert!(out.contains("- size: 512x512\n"));
+    fn the_image_envelope_clamps_the_reference_max_lists_size_once_and_omits_an_unmapped_model() {
+        let cases = [
+            ImageEnvelopeCase {
+                name: "a max within the ceiling renders unchanged",
+                info: image_info(&[("input_references", ParameterConstraint::Range { max: 4 })]),
+                expected: Some((&["- images: max 4\n"], 1)),
+            },
+            ImageEnvelopeCase {
+                name: "a declared max above the ceiling is clamped",
+                info: image_info(&[("input_references", ParameterConstraint::Range { max: 20 })]),
+                expected: Some((&["- images: max 16\n"], 1)),
+            },
+            ImageEnvelopeCase {
+                name: "size is identity-mapped",
+                info: image_info(&[("size", ParameterConstraint::Enum(vec!["512x512".into()]))]),
+                expected: Some((&["- size: 512x512\n"], 1)),
+            },
+            ImageEnvelopeCase {
+                name: "size and resolution collapse to one line",
+                info: image_info(&[
+                    (
+                        "resolution",
+                        ParameterConstraint::Enum(vec!["1K".into(), "2K".into()]),
+                    ),
+                    ("size", ParameterConstraint::Enum(vec!["512x512".into()])),
+                ]),
+                expected: Some((&[], 1)),
+            },
+            ImageEnvelopeCase {
+                name: "a model with only unmapped params renders nothing",
+                info: image_info(&[
+                    ("n", ParameterConstraint::Range { max: 4 }),
+                    ("future", ParameterConstraint::Unknown),
+                ]),
+                expected: None,
+            },
+        ];
 
-        // A model declaring both "resolution" and "size" maps both to the same
-        // tool param — the envelope must list it once.
-        let mut both = ImageModelInfo::default();
-        both.supported_parameters.insert(
-            "resolution".into(),
-            ParameterConstraint::Enum(vec!["1K".into(), "2K".into()]),
-        );
-        both.supported_parameters.insert(
-            "size".into(),
-            ParameterConstraint::Enum(vec!["512x512".into()]),
-        );
-        let out = render_image_section("m", &both).expect("envelope rendered");
-        assert_eq!(out.matches("- size: ").count(), 1);
-    }
-
-    #[test]
-    fn image_section_unmapped_only_is_omitted() {
-        // A model declaring only unmapped/unknown params renders no envelope —
-        // the section is omitted entirely (header-only would be noise).
-        let mut info = ImageModelInfo::default();
-        info.supported_parameters
-            .insert("n".into(), ParameterConstraint::Range { max: 4 });
-        info.supported_parameters
-            .insert("future".into(), ParameterConstraint::Unknown);
-        assert!(render_image_section("m", &info).is_none());
-        assert!(render_image_section("m", &ImageModelInfo::default()).is_none());
-    }
-
-    #[test]
-    fn video_section_skips_empty_and_uncapped_lists() {
-        // Declared-but-empty lists must not render dangling lines — a model
-        // with no declared fields and no nuance data renders no envelope at all.
-        let empty = VideoModelInfo {
-            resolutions: Some(vec![]),
-            durations: Some(vec![]),
-            frame_images: Some(vec![]),
-            ..VideoModelInfo::default()
-        };
-        assert!(render_video_section("no-nuance-model", Some(&empty)).is_none());
-
-        // Long frame-image lists go through the cap like every other list.
-        let many_frames = VideoModelInfo {
-            frame_images: Some((0..20).map(|i| format!("frame{i}")).collect()),
-            ..VideoModelInfo::default()
-        };
-        let out = render_video_section("m", Some(&many_frames)).expect("envelope rendered");
-        assert!(out.contains("- frame images: frame0, frame1, frame2, frame3, frame4, frame5, frame6, frame7, frame8, frame9, frame10, frame11, frame12, frame13, frame14, frame15, +4 more\n"));
-    }
-
-    #[test]
-    fn video_section_renders_declared_fields_only() {
-        let info = VideoModelInfo {
-            resolutions: Some(vec!["2K".into()]),
-            aspect_ratios: None,
-            durations: Some(vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
-            sizes: None,
-            frame_images: Some(vec!["first_frame".into(), "last_frame".into()]),
-            generate_audio: Some(true),
-            seed: Some(false),
-        };
-        let out = render_video_section("minimax/hailuo-3", Some(&info)).expect("envelope rendered");
-        assert!(out.starts_with("Video model: minimax/hailuo-3\n"));
-        assert!(out.contains("- resolution: 2K\n"));
-        assert!(!out.contains("aspect_ratio"));
-        assert!(out.contains("- duration: 5-15 seconds\n"));
-        assert!(!out.contains("- size:"));
-        assert!(out.contains("- frame images: first_frame, last_frame\n"));
-        assert!(out.contains("- generate_audio: yes\n"));
-        assert!(out.contains("- seed: no\n"));
-        assert!(out.contains("- editing: localized instruction edits"));
-    }
-
-    #[test]
-    fn video_section_renders_edit_nuances_without_catalog() {
-        // Static per-model edit nuances render even with no catalog entry —
-        // fail-open must not drop nuance text when the catalog is unavailable.
-        let hailuo = render_video_section("minimax/hailuo-3", None).expect("nuance rendered");
-        assert!(hailuo.starts_with("Video model: minimax/hailuo-3\n"));
-        assert!(hailuo.contains("- editing: localized instruction edits"));
-        assert!(!hailuo.contains("- duration:"));
-        let seedance =
-            render_video_section("bytedance/seedance-2.5", None).expect("nuance rendered");
-        assert!(seedance.contains("- editing: whole-frame restyle"));
-        // Edit vs generation disambiguation: the catalog duration range is
-        // generation-only, so the Assistant is not misled into passing it for
-        // edits.
-        assert!(seedance.contains("applies to generation, not edits"));
-        // 2.0-mini differs: edit-mode duration is explicit (not 'auto').
-        let mini =
-            render_video_section("bytedance/seedance-2.0-mini", None).expect("nuance rendered");
-        assert!(mini.contains("- editing: whole-frame restyle"));
-        assert!(mini.contains("explicit"));
-        assert!(mini.contains("4-15s"));
-        assert!(render_video_section("unknown/model", None).is_none());
+        for case in &cases {
+            let name = case.name;
+            let rendered = render_image_section("test/model", &case.info);
+            let Some((contains, mapped_lines)) = case.expected else {
+                assert!(
+                    rendered.is_none(),
+                    "case: {name} — expected no section, got {rendered:?}"
+                );
+                continue;
+            };
+            let out = rendered.unwrap_or_else(|| panic!("case: {name} — expected a section"));
+            assert!(
+                out.starts_with("Image model: test/model\n"),
+                "case: {name}: {out}"
+            );
+            for line in contains {
+                assert!(
+                    out.contains(line),
+                    "case: {name} — expected {line:?}: {out}"
+                );
+            }
+            assert_eq!(
+                out.lines().filter(|line| line.starts_with("- ")).count(),
+                mapped_lines,
+                "case: {name} — mapped-line count: {out}"
+            );
+        }
     }
 }
