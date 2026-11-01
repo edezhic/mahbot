@@ -273,6 +273,20 @@ pub const TEXT_14: f32 = 14.0;
 pub const TEXT_16: f32 = 16.0;
 pub const TEXT_24: f32 = 24.0;
 
+/// Glyph scale of the chat input panel. Every icon the panel draws — the
+/// action toolbar (send, attach, voice), the recording dot, the reply
+/// preview's dismiss control and the attachment chips — takes its size through
+/// [`composer_icon`], so one knob enlarges them all by the same factor and
+/// they keep their relative sizes. Text, padding, spacing and alignment stay
+/// on the shared rungs; only the panel's glyphs move.
+pub const COMPOSER_ICON_SCALE: f32 = 1.25;
+
+/// `size` at [`COMPOSER_ICON_SCALE`] — the composer's copy of a `TEXT_*` rung.
+#[must_use]
+pub const fn composer_icon(size: f32) -> f32 {
+    size * COMPOSER_ICON_SCALE
+}
+
 // ── De-facto 2px spacing grid (px) ───────────────────────────────
 pub const SPACE_1: f32 = 1.0;
 pub const SPACE_2: f32 = 2.0;

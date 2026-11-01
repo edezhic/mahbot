@@ -253,7 +253,7 @@ fn reply_lead_row(reply: &ReplyReference) -> iced::widget::Row<'_, HomeMessage> 
 fn reply_preview(reply: &ReplyReference) -> Element<'_, HomeMessage> {
     let dismiss = button(
         lucide::x::<iced::Theme, iced::Renderer>()
-            .size(theme::TEXT_12)
+            .size(theme::composer_icon(theme::TEXT_12))
             .color(theme::TEXT_MUTED),
     )
     .on_press(HomeMessage::CancelReply)
@@ -277,7 +277,7 @@ fn reply_preview(reply: &ReplyReference) -> Element<'_, HomeMessage> {
 fn attach_control(disabled: bool) -> Element<'static, HomeMessage> {
     super::widgets::icon_tooltip_button(
         lucide::paperclip::<iced::Theme, iced::Renderer>()
-            .size(theme::TEXT_14)
+            .size(theme::composer_icon(theme::TEXT_14))
             .color(if disabled {
                 theme::TEXT_MUTED
             } else {
@@ -340,7 +340,7 @@ fn mic_control(voice_status: &crate::audio::voice::VoiceStatus) -> Element<'stat
     };
     super::widgets::icon_tooltip_button(
         lucide::mic::<iced::Theme, iced::Renderer>()
-            .size(theme::TEXT_14)
+            .size(theme::composer_icon(theme::TEXT_14))
             .color(if recording_unavailable {
                 theme::TEXT_MUTED
             } else {
@@ -358,10 +358,14 @@ fn mic_control(voice_status: &crate::audio::voice::VoiceStatus) -> Element<'stat
 /// runs. Passive — it takes no press and shows no tooltip.
 #[cfg(target_os = "macos")]
 fn recording_dot() -> Element<'static, HomeMessage> {
-    // Padded so the dot sits at the height of the icon buttons beside it.
-    container(super::pulse::pulse_dot(theme::TEXT_10, theme::STATUS_ERROR))
-        .padding(theme::PAD_5)
-        .into()
+    // Padded and centred in the row of icon buttons beside it: the dot stays a
+    // step smaller than their glyphs, as it always has.
+    container(super::pulse::pulse_dot(
+        theme::composer_icon(theme::TEXT_10),
+        theme::STATUS_ERROR,
+    ))
+    .padding(theme::PAD_5)
+    .into()
 }
 
 /// Cancel control for the running recording — whichever way it started: it is
@@ -370,7 +374,7 @@ fn recording_dot() -> Element<'static, HomeMessage> {
 fn cancel_recording_control() -> Element<'static, HomeMessage> {
     super::widgets::icon_tooltip_button(
         lucide::circle_x::<iced::Theme, iced::Renderer>()
-            .size(theme::TEXT_14)
+            .size(theme::composer_icon(theme::TEXT_14))
             .color(theme::TEXT_SECONDARY),
         "cancel recording",
         Some(HomeMessage::StopVoiceRecordingDiscard),

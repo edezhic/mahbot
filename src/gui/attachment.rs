@@ -387,6 +387,7 @@ fn picture_tile<'a, M: Clone + 'a>(
         container(
             container(super::widgets::compact_x_button(
                 theme::TEXT_PRIMARY,
+                theme::composer_icon(theme::TEXT_12),
                 [theme::PAD_1, theme::PAD_4],
                 Some(remove),
                 Some("remove attachment"),
@@ -410,7 +411,7 @@ fn file_chip<'a, M: Clone + 'a>(name: &'a str, remove: M) -> Element<'a, M> {
         row![
             container(
                 iced_fonts::lucide::file_text::<iced::Theme, iced::Renderer>()
-                    .size(theme::TEXT_16)
+                    .size(theme::composer_icon(theme::TEXT_16))
                     .color(theme::TEXT_SECONDARY),
             )
             .width(Length::Fixed(CHIP_THUMB))
@@ -422,6 +423,7 @@ fn file_chip<'a, M: Clone + 'a>(name: &'a str, remove: M) -> Element<'a, M> {
                 .color(theme::TEXT_SECONDARY),
             super::widgets::compact_x_button(
                 theme::TEXT_SECONDARY,
+                theme::composer_icon(theme::TEXT_12),
                 [theme::PAD_1, theme::PAD_4],
                 Some(remove),
                 Some("remove attachment"),

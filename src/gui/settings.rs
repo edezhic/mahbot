@@ -118,6 +118,7 @@ fn model_entry_row(target: ModelPickerTarget, model: String) -> Element<'static,
         .push(Space::new().width(theme::SPACE_4))
         .push(widgets::compact_x_button(
             theme::TEXT_SECONDARY,
+            theme::TEXT_12,
             theme::SPACE_6,
             Some(SettingsMessage::ModelPicker {
                 target,
@@ -2484,6 +2485,7 @@ impl SettingsState {
                             } else {
                                 widgets::compact_x_button(
                                     theme::TEXT_SECONDARY,
+                                    theme::TEXT_12,
                                     button::DEFAULT_PADDING,
                                     Some(SettingsMessage::UserMsg(
                                         users::UsersMessage::UnbindChannel(

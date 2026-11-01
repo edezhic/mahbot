@@ -47,6 +47,7 @@ pub fn dialog_title_row<'a, Message: Clone + 'a>(
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
         super::widgets::compact_x_button(
             theme::TEXT_SECONDARY,
+            theme::TEXT_12,
             theme::SPACE_6,
             Some(on_close),
             None,
