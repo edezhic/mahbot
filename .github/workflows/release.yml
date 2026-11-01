@@ -39,7 +39,8 @@
 #
 # Every release also carries a body: a `### Changelog` heading over the titles of the
 # commits made since the last ordinary release, oldest first, one bullet per commit,
-# with the machine's own version bumps left out. A release with no title to list has
+# with the machine's own version bumps and the maintenance (`[maint] `) commits left
+# out. A release with no title to list has
 # an empty body, heading and all. That same text is published as `changelog.txt` when
 # it is not empty, and an empty asset is never uploaded: GitHub refuses one, and the
 # product reads an absent file exactly like an empty list. Everything the updater
@@ -303,16 +304,17 @@ jobs:
           )"
 
           # The machine's own version bumps are what the release does, not what it
-          # says changed, and the maintainer's `[maintenance] ` commits are code
-          # tidying rather than product changes (that prefix is written by the
-          # sanitation commit path); every other title is kept exactly as it is
-          # written and becomes one bullet. A commit with no title at all (`NF`
+          # says changed, and `[maint] ` commits are code tidying rather than
+          # product changes (that prefix is written by the sanitation commit path
+          # from the ticket's label); every other title is kept exactly as it is
+          # written — a pipeline commit already leads with its `[feat] `/`[fix] `
+          # label — and becomes one bullet. A commit with no title at all (`NF`
           # zero) becomes no bullet, so the list cannot pick up a blank entry.
           # `%s` is the title folded onto a single line, so a title written over
           # several lines is still one bullet here. With nothing kept the file
           # stays empty: the heading belongs to the list, not to the release.
           git log --reverse --pretty=format:%s "$base..$TAG" \
-            | awk '!/^Bump version to / && !/^\[maintenance\] / && NF { item[kept++] = "* " $0 }
+            | awk '!/^Bump version to / && !/^\[maint\] / && NF { item[kept++] = "* " $0 }
                    END {
                      if (kept == 0) exit
                      print "### Changelog\n"

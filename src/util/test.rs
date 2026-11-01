@@ -35,7 +35,9 @@
 #![cfg(test)]
 
 use crate::db;
-use crate::pipeline::board::{BoardStore, Ticket, TicketComment, TicketParams, TicketPhase};
+use crate::pipeline::board::{
+    BoardStore, Ticket, TicketComment, TicketLabel, TicketParams, TicketPhase,
+};
 use crate::util::UnwrapPoison;
 use crate::workspace::test_ws_named;
 use std::path::{Path, PathBuf};
@@ -899,6 +901,7 @@ impl<'a> TicketBuilder<'a> {
                 prerequisites: self.prereqs,
                 reporter: self.reporter,
                 priority: self.priority,
+                label: TicketLabel::Feat,
             },
         )
     }
@@ -928,6 +931,7 @@ impl TicketFixture {
             reporter: "test".into(),
             is_archived: false,
             priority: 0,
+            label: TicketLabel::Feat,
             reviewed_head: None,
             reviewed_tree: None,
             done_at: None,
@@ -947,6 +951,10 @@ impl TicketFixture {
 
     pub(crate) fn archived(mut self, archived: bool) -> Self {
         self.0.is_archived = archived;
+        self
+    }
+    pub(crate) fn label(mut self, label: TicketLabel) -> Self {
+        self.0.label = label;
         self
     }
 

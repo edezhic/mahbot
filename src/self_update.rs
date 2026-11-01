@@ -3412,12 +3412,13 @@ mod tests {
     }
 
     /// The changelog's filter as it ships — the awk program is read out of the
-    /// workflow — keeps every subject except version bumps, blank titles and the
-    /// maintainer's prefixed commits; the sample subjects are built from the same
-    /// constant the commit path writes.
+    /// workflow — keeps every subject except version bumps, blank titles and
+    /// `[maint] ` commits; the sample subjects are built from the same label
+    /// tokens the commit path writes.
     #[cfg(unix)]
     #[test]
-    fn test_the_changelog_skips_maintenance_commits() {
+    fn test_the_changelog_skips_maint_commits() {
+        use crate::pipeline::board::TicketLabel;
         use std::io::Write as _;
 
         let workflow = std::fs::read_to_string(
@@ -3431,15 +3432,15 @@ mod tests {
             .map(|(program, _)| program)
             .expect("the changelog step holds its awk program");
 
-        let prefix = crate::pipeline::sanitation::MAINTENANCE_COMMIT_PREFIX;
+        let label = |label: TicketLabel, title: &str| format!("{}{title}", label.commit_prefix());
         let subjects = [
             "Bump version to 1.2.3".to_string(),
-            format!("{prefix}Remove the dead helper"),
-            "Add the real fix".to_string(),
+            label(TicketLabel::Maint, "Remove the dead helper"),
+            label(TicketLabel::Feat, "Add the real fix"),
             String::new(),
-            "Document the [maintenance] prefix".to_string(),
-            format!("{prefix}Rename the helper"),
-            "Fix the second bug".to_string(),
+            "Document the [maint] prefix".to_string(),
+            label(TicketLabel::Maint, "Rename the helper"),
+            label(TicketLabel::Fix, "Fix the second bug"),
         ];
         let mut child = std::process::Command::new("awk")
             .arg(program)
@@ -3457,8 +3458,8 @@ mod tests {
         assert!(output.status.success(), "awk rejected the workflow program");
         assert_eq!(
             String::from_utf8(output.stdout).expect("utf-8 output"),
-            "### Changelog\n\n* Add the real fix\n* Document the [maintenance] prefix\n\
-             * Fix the second bug\n",
+            "### Changelog\n\n* [feat] Add the real fix\n* Document the [maint] prefix\n\
+             * [fix] Fix the second bug\n",
         );
     }
 

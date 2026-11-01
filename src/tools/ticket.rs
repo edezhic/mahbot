@@ -6,7 +6,7 @@
 use crate::Role;
 use crate::Workspace;
 use crate::pipeline::board::store as board_store;
-use crate::pipeline::board::{TicketParams, TicketPhase};
+use crate::pipeline::board::{TicketLabel, TicketParams, TicketPhase};
 use crate::tools::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -91,6 +91,13 @@ impl CreateTicketTool {
         }
     }
 
+    /// Whether this holder states the management arguments — `priority` and
+    /// `label`. Only the Manager does; every other creator gets the fixed
+    /// defaults.
+    fn is_manager(&self) -> bool {
+        self.reporter == crate::Role::Manager.as_str()
+    }
+
     /// Build a [`TicketParams`] from the shared fields used by both creation branches.
     fn build_params(
         &self,
@@ -98,6 +105,7 @@ impl CreateTicketTool {
         description: &str,
         prerequisites: &[String],
         priority: i64,
+        label: TicketLabel,
     ) -> TicketParams {
         TicketParams {
             title: title.to_string(),
@@ -107,6 +115,7 @@ impl CreateTicketTool {
             prerequisites: prerequisites.to_vec(),
             reporter: self.reporter.clone(),
             priority,
+            label,
         }
     }
 }
@@ -115,6 +124,17 @@ impl CreateTicketTool {
 impl Tool for CreateTicketTool {
     fn name(&self) -> &'static str {
         "create_ticket"
+    }
+
+    /// The shared instructions, plus the Manager-only fragment for the
+    /// arguments only the Manager states. A holder without them never learns
+    /// they exist.
+    fn description(&self) -> String {
+        let mut parts = vec![crate::prompt::load_prompt("tool/create_ticket.md")];
+        if self.is_manager() {
+            parts.push(crate::prompt::load_prompt("tool/create_ticket_manager.md"));
+        }
+        parts.join("\n\n")
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -151,9 +171,11 @@ impl Tool for CreateTicketTool {
             }),
         );
 
-        // Only Manager sees the priority parameter — Maintainer always uses
-        // a hardcoded value and must not have it in the schema.
-        if self.reporter == "manager" {
+        // The two management arguments belong to the Manager alone: the
+        // Maintainer's priority is a hardcoded value and every ticket it files
+        // is `maint`, so neither argument exists for it.
+        let mut required = vec!["title", "description"];
+        if self.is_manager() {
             props.insert(
                 "priority".into(),
                 json!({
@@ -161,9 +183,18 @@ impl Tool for CreateTicketTool {
                     "description": "Priority level: 0 = highest urgency, 1 (default), 2, 3, ... Higher numbers = lower priority"
                 }),
             );
+            props.insert(
+                "label".into(),
+                json!({
+                    "type": "string",
+                    "enum": ["feat", "fix", "maint"],
+                    "description": "Classification label: `feat` adds a capability, `fix` repairs a problem, `maint` is everything else"
+                }),
+            );
+            required.push("label");
         }
 
-        super::tool_params_schema(&serde_json::Value::Object(props), &["title", "description"])
+        super::tool_params_schema(&serde_json::Value::Object(props), &required)
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
@@ -179,9 +210,19 @@ impl Tool for CreateTicketTool {
             .map(|s| resolve_ticket_id(&self.ws_name, s))
             .transpose()?;
 
+        // Label: the Manager states it and a value outside the three is
+        // refused here; every other creator files a maintenance ticket. Set
+        // once at creation — nothing writes it again, and a superseding
+        // ticket states its own.
+        let label = if self.is_manager() {
+            super::get_str(&args, "label")?.parse::<TicketLabel>()?
+        } else {
+            TicketLabel::Maint
+        };
+
         // Priority: Manager can set explicitly; otherwise inherit from the
         // superseded ticket (if superseding) or use the role default.
-        let explicit_priority = if self.reporter == "manager" {
+        let explicit_priority = if self.is_manager() {
             super::get_opt_i64(&args, "priority")?
         } else {
             None
@@ -219,7 +260,7 @@ impl Tool for CreateTicketTool {
             }
         };
 
-        let params = self.build_params(title, description, &prerequisites, priority);
+        let params = self.build_params(title, description, &prerequisites, priority, label);
         if let Some(supersede_id) = supersede_id {
             guard_not_pipeline_occupied(store, &supersede_id).await?;
 
@@ -579,6 +620,7 @@ mod tests {
                     "prerequisites": null,
                     "supersede": null,
                     "priority": null,
+                    "label": "feat",
                 }),
                 expected: CreateArgsExpect::Created {
                     starts_with: "Created ticket ",
@@ -593,6 +635,7 @@ mod tests {
                     "title": "Bad priority",
                     "description": "desc",
                     "priority": "high",
+                    "label": "feat",
                 }),
                 expected: CreateArgsExpect::Usage(&[
                     "usage: ",
@@ -643,6 +686,76 @@ mod tests {
                 (_, other) => panic!("[{}] unexpected outcome: {other:?}", case.name),
             }
         }
+    }
+
+    /// The label is the Manager's to state: required, refused outside the three
+    /// values, and never offered to a creator that does not state it — whose
+    /// tickets are `maint`.
+    #[tokio::test]
+    async fn create_ticket_labels() {
+        crate::util::test::init_test_stores().await;
+        let store = board_store();
+        let ws = test_ws("/tmp/test_ws_labels");
+        let args = |title: &str| json!({ "title": title, "description": "desc" });
+        let created_id = |answer: &str| {
+            answer
+                .strip_prefix("Created ticket ")
+                .and_then(|rest| rest.split(':').next())
+                .expect("the answer names the created ticket")
+                .to_string()
+        };
+
+        let manager = CreateTicketTool::new("manager", &ws);
+        assert!(
+            manager.parameters_schema()["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|name| name.as_str() == Some("label"))),
+            "the manager must be required to state a label"
+        );
+        let err = manager
+            .execute(&ws, args("No label"))
+            .await
+            .expect_err("a manager's ticket without a label is refused")
+            .to_string();
+        assert!(err.contains("missing required argument \"label\""), "{err}");
+
+        let mut bad = args("Bad label");
+        bad["label"] = json!("docs");
+        let err = manager
+            .execute(&ws, bad)
+            .await
+            .expect_err("a label outside the three is refused")
+            .to_string();
+        assert!(err.contains("feat, fix, maint"), "{err}");
+
+        let mut fix = args("Fix it");
+        fix["label"] = json!("fix");
+        let answer = manager
+            .execute(&ws, fix)
+            .await
+            .expect("the ticket is created");
+        assert_eq!(
+            expect_ticket(store, &created_id(&answer)).await.label,
+            TicketLabel::Fix
+        );
+
+        // A holder that never states the label does not learn the argument
+        // exists, and files `maint`.
+        let maintainer = CreateTicketTool::new("maintainer", &ws);
+        assert!(
+            maintainer.parameters_schema()["properties"]
+                .get("label")
+                .is_none()
+        );
+        assert!(!maintainer.description().contains("label"));
+        let answer = maintainer
+            .execute(&ws, args("Tidy up"))
+            .await
+            .expect("the ticket is created");
+        assert_eq!(
+            expect_ticket(store, &created_id(&answer)).await.label,
+            TicketLabel::Maint
+        );
     }
 
     #[tokio::test]
@@ -1022,6 +1135,9 @@ mod tests {
                 "title": "Replacement",
                 "description": "superseding the old ticket",
                 "supersede": &old_id,
+                // The replacement states its own label; it inherits neither
+                // priority nor label from the old ticket.
+                "label": "fix",
             });
             if let Some(priority) = case.explicit {
                 args["priority"] = json!(priority);
@@ -1048,6 +1164,13 @@ mod tests {
                 "[{}] replacement priority",
                 case.name
             );
+            assert_eq!(
+                new_ticket.label,
+                TicketLabel::Fix,
+                "[{}] the replacement states its own label",
+                case.name
+            );
+            assert_eq!(old_ticket.label, TicketLabel::Feat);
         }
     }
 

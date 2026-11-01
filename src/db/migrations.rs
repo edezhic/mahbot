@@ -103,8 +103,15 @@
 //! stored provider choice that names that removed provider, matched regardless
 //! of letter case and surrounding whitespace (a no-op on fresh installs, which
 //! have neither row: see [`drop_firecrawl_search_settings`]).
+//! `77` adds `tickets.label` — the one classification label every ticket
+//! carries (`feat`, `fix`, `maint`), fixed at creation and prefixed to every
+//! pipeline commit for the ticket. The column's default is a default for rows
+//! that never state anything, not a rule: the three values are enforced where
+//! a ticket is created. Every ticket already in the database — including the
+//! ones the Maintainer filed — is backfilled as `feat`, and a fresh install
+//! gets the column from entry `24`'s `CREATE TABLE`, so this is a no-op there.
 //!
-//! Future schema changes resume the chain at id `77` with monotonically
+//! Future schema changes resume the chain at id `78` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -189,6 +196,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     reporter         TEXT NOT NULL DEFAULT '',
     is_archived      INTEGER NOT NULL DEFAULT 0,
     priority         INTEGER NOT NULL DEFAULT 1,
+    label            TEXT NOT NULL DEFAULT 'feat',
     reviewed_head    TEXT,
     reviewed_tree    TEXT,
     done_at          TEXT,
@@ -1299,6 +1307,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Rust(drop_firecrawl_search_settings),
     },
+    Migration {
+        id: "77",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_tickets_label),
+    },
 ];
 
 /// Apply the migration catalog to `conn` for one physical database.
@@ -2342,6 +2355,22 @@ async fn run_drop_firecrawl_search_settings(conn: &Connection) -> anyhow::Result
     Ok(())
 }
 
+fn add_tickets_label(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_tickets_label(conn))
+}
+
+/// Catalog `77`: add `tickets.label` and backfill every existing ticket as
+/// `feat` — the column default is what performs the backfill, deliberately
+/// covering the Maintainer's tickets and finished ones alike. Only the creation
+/// path writes a different value, so nothing can re-label a ticket later.
+/// Fresh installs get the column from entry `24`'s `CREATE TABLE`, so the probe
+/// makes this a no-op there. Guarded by [`add_column_if_missing`], so this body
+/// is idempotent (non-transactional like every Rust body, re-runnable until
+/// recorded).
+async fn run_add_tickets_label(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "tickets", "label", "TEXT NOT NULL DEFAULT 'feat'").await
+}
+
 fn add_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_alarms_command(conn))
 }
@@ -3196,6 +3225,7 @@ mod tests {
                 "reporter",
                 "is_archived",
                 "priority",
+                "label",
                 "reviewed_head",
                 "reviewed_tree",
                 "done_at",
@@ -4256,7 +4286,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ── Tests ──────────────────────────────────────────────────────────
 
     /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`57`/`59`–`63`/`65`–`76` tail, and converges to the exact current
+    /// upfills and the `36`–`57`/`59`–`63`/`65`–`77` tail, and converges to the exact current
     /// core shape: the table set (which also proves the required absences of
     /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
     /// the per-table column sets (which prove the absences of `assigned_to` /
@@ -4286,10 +4316,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
                 "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-                "70", "72", "73", "74", "75", "76"
+                "70", "72", "73", "74", "75", "76", "77"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–76 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–77 tail exactly"
         );
     }
 
@@ -4955,7 +4985,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`57`/`59`–`63`/`65`–`75`) as a
+    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`57`/`59`–`63`/`65`–`77`) as a
     /// STRICT no-op except the delta-27 `workspaces.maintainer_recommendations`
     /// column upfill, the delta-28 `jobs.caller_agent_id` /
     /// `session_metadata.created_at` column upfills, the delta-29 per-user model
@@ -5036,7 +5066,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-            "70", "72", "73", "74", "75", "76",
+            "70", "72", "73", "74", "75", "76", "77",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -5045,7 +5075,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–76"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–77"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -5225,10 +5255,22 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_tickets_cols = before.cols["tickets"].clone();
         expected_tickets_cols.retain(|column| column != "embedding");
         expected_tickets_cols.push("last_transition_actor".to_string());
+        expected_tickets_cols.push("label".to_string());
         assert_eq!(
             after_tickets_cols["tickets"], expected_tickets_cols,
-            "reopen must append last_transition_actor and drop the retired embedding \
-             column from tickets columns"
+            "reopen must append last_transition_actor and label, and drop the retired \
+             embedding column from tickets columns"
+        );
+        // The column's default backfills the ticket that predates it.
+        let backfilled_label: String = conn
+            .query("SELECT label FROM tickets WHERE id = 'T1'", ())
+            .await
+            .unwrap()[0]
+            .get(0)
+            .unwrap();
+        assert_eq!(
+            backfilled_label, "feat",
+            "every pre-existing ticket is backfilled as feat"
         );
         let after_chronicle_cols = column_sets(&conn, &["ticket_chronicle"]).await;
         let mut expected_chronicle_cols = before.cols["ticket_chronicle"].clone();
@@ -5364,7 +5406,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `chat_history.broadcast_id`,
     /// and entry `34` adds
     /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. The tail is
-    /// entries `36`–`57`/`59`–`63`/`65`–`75`: the data migrations (detaching guests from
+    /// entries `36`–`57`/`59`–`63`/`65`–`77`: the data migrations (detaching guests from
     /// shared workspaces, rewriting the legacy `DeepSeek` routing slug,
     /// deleting the command-armed alarm rows, rewriting the retired
     /// `in_review`/`in_qa` stages to `verification`, invalidating the
@@ -5499,7 +5541,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-            "70", "72", "73", "74", "75", "76",
+            "70", "72", "73", "74", "75", "76", "77",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -5508,7 +5550,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–76"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–77"
         );
 
         let after_users_cols = column_names(&conn, "users").await;

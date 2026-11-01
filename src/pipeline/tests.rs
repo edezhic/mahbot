@@ -158,6 +158,7 @@ async fn claim_queued_unblocked_by_superseding_failed_sibling() {
                 prerequisites: Vec::new(),
                 reporter: "manager".to_string(),
                 priority: 1,
+                label: crate::pipeline::board::TicketLabel::Feat,
             },
             "manager",
         )
@@ -254,6 +255,7 @@ async fn done_ticket_phase_is_immutable() {
                 prerequisites: Vec::new(),
                 reporter: "manager".to_string(),
                 priority: 1,
+                label: crate::pipeline::board::TicketLabel::Feat,
             },
             "manager",
         )

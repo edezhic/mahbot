@@ -14,12 +14,6 @@ use super::{
     with_comment_and_transition,
 };
 
-/// Fixed commit-message prefix for the tickets the maintainer filed — their
-/// work is code cleanup, so the commit is recognisable from its first
-/// characters. The release changelog filters every subject that starts with
-/// it; the ticket title itself is never changed.
-pub(crate) const MAINTENANCE_COMMIT_PREFIX: &str = "[maintenance] ";
-
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     if guard_job_phase(&ticket.id, TicketPhase::InSanitation, &job_id).await {
         return;
@@ -67,11 +61,7 @@ async fn missing_repo_reason(ws: &Workspace) -> Option<&'static str> {
 }
 
 fn commit_message(ticket: &Ticket) -> String {
-    if ticket.filed_by_maintainer() {
-        format!("{MAINTENANCE_COMMIT_PREFIX}{}", ticket.title)
-    } else {
-        ticket.title.clone()
-    }
+    format!("{}{}", ticket.label.commit_prefix(), ticket.title)
 }
 
 /// Shared sanitation finalize tail: clear the implementation roster and
@@ -391,21 +381,27 @@ async fn process_sanitation_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::board::TicketLabel;
     use crate::util::test::TicketFixture;
 
-    /// The commit path uses the prefix only for maintainer-filed tickets.
+    /// Every ticket's commit subject starts with its own label.
     #[test]
-    fn only_a_maintainer_ticket_gets_the_maintenance_prefix() {
-        let manager_filed = TicketFixture::new("t1", TicketPhase::InSanitation)
-            .title("Remove the dead helper")
-            .build();
-        assert_eq!(commit_message(&manager_filed), "Remove the dead helper");
-
-        let mut maintainer_filed = manager_filed.clone();
-        maintainer_filed.reporter = Role::Maintainer.as_str().to_string();
-        assert_eq!(
-            commit_message(&maintainer_filed),
-            "[maintenance] Remove the dead helper"
-        );
+    fn the_commit_subject_carries_the_ticket_label() {
+        let ticket = |label| {
+            TicketFixture::new("t1", TicketPhase::InSanitation)
+                .title("Remove the dead helper")
+                .label(label)
+                .build()
+        };
+        for (label, prefix) in [
+            (TicketLabel::Feat, "[feat] "),
+            (TicketLabel::Fix, "[fix] "),
+            (TicketLabel::Maint, "[maint] "),
+        ] {
+            assert_eq!(
+                commit_message(&ticket(label)),
+                format!("{prefix}Remove the dead helper")
+            );
+        }
     }
 }

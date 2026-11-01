@@ -57,7 +57,7 @@ Every request/ticket has a lifecycle with **redundant checks**:
 | **→ Development** | Engineer implements the ticket (or the required fixes) |
 | **→ Verification** | Deterministic checks with code reviewers and a tester |
 | **→ Sanitation** | Audit untracked/new files in the working tree |
-| **→ Done** | Auto git commit with the ticket's title |
+| **→ Done** | Auto git commit of the ticket's title behind its label (`[feat] `, `[fix] ` or `[maint] `) |
 
 Circuit breaker pauses the work if a ticket goes through too many bounces, escalates to the manager and he handles from there.
 

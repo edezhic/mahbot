@@ -92,6 +92,7 @@ crate::columns! {
         REPORTER               => "reporter",
         IS_ARCHIVED            => "is_archived",
         PRIORITY               => "priority",
+        LABEL                  => "label",
         REVIEWED_HEAD          => "reviewed_head",
         REVIEWED_TREE          => "reviewed_tree",
         DONE_AT                => "done_at",
@@ -264,6 +265,7 @@ pub(crate) struct TicketParams {
     pub prerequisites: Vec<String>,
     pub reporter: String,
     pub priority: i64,
+    pub label: TicketLabel,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -306,6 +308,10 @@ pub struct Ticket {
     /// Whether this ticket has been archived (hidden from normal listings).
     pub is_archived: bool,
     pub priority: i64,
+    /// Classification label, fixed when the ticket is created and never
+    /// written again. It prefixes every commit the pipeline makes for the
+    /// ticket and selects whether the release changelog keeps that commit.
+    pub label: TicketLabel,
     /// HEAD commit hash of the content the code reviewers were handed, as
     /// written by `verification::record_reviewed_base` — a round whose code
     /// review ran and which then moved the ticket on. `None` until the first
@@ -507,6 +513,59 @@ impl Ticket {
         format!("\n  [{}] ({}): {}", c.role, ts, content)
     }
 }
+
+/// The single classification label every ticket carries: `feat` for work that
+/// adds a capability, `fix` for work that repairs a problem, `maint` for
+/// everything else.
+///
+/// Stated once, when the ticket is created (see
+/// [`CreateTicketTool`](crate::tools::ticket::CreateTicketTool)); no writer
+/// updates it afterwards, so it never changes for the ticket's whole life. The
+/// product does not read it beyond the `[feat] `/`[fix] `/`[maint] ` prefix it
+/// puts on the ticket's pipeline commits.
+///
+/// Stored exactly like [`TicketPhase`]: lowercase snake_case strings matching
+/// the DB column values.
+#[derive(Debug, Clone, Copy, PartialEq, strum::Display, strum::AsRefStr, strum::EnumIter)]
+#[strum(serialize_all = "snake_case")]
+pub enum TicketLabel {
+    Feat,
+    Fix,
+    Maint,
+}
+
+impl TicketLabel {
+    /// The tag the subject of every commit the pipeline makes for a ticket
+    /// starts with — `[feat] `, `[fix] ` or `[maint] `, before the title.
+    #[must_use]
+    pub(crate) fn commit_prefix(self) -> String {
+        format!("[{self}] ")
+    }
+}
+
+/// Valid label names, pre-computed once for the refusal message.
+static ALL_TICKET_LABEL_NAMES: LazyLock<String> = LazyLock::new(|| {
+    <TicketLabel as strum::IntoEnumIterator>::iter()
+        .map(|label| label.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+});
+
+impl std::str::FromStr for TicketLabel {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        <TicketLabel as strum::IntoEnumIterator>::iter()
+            .find(|label| label.as_ref() == s)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid ticket label '{s}'. Valid labels: {}",
+                    *ALL_TICKET_LABEL_NAMES
+                )
+            })
+    }
+}
+
 /// Lowercase snake_case strings matching the DB column values — no schema
 /// migration needed. Display, AsRefStr (the borrow-side token), IntoStaticStr
 /// (the same strings with a `'static` lifetime — the `jobs.kind` vocabulary) and
@@ -749,8 +808,8 @@ impl BoardStore {
         let prereqs_json = serde_json::to_string(&params.prerequisites)?;
         tx.execute(
             "INSERT INTO tickets (id, title, description, phase, workspace_name, \
-             created_at, updated_at, prerequisites, supersedes, reporter, priority) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             created_at, updated_at, prerequisites, supersedes, reporter, priority, label) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             db::params![
                 ticket_id,
                 params.title.as_str(),
@@ -763,6 +822,7 @@ impl BoardStore {
                 supersedes,
                 params.reporter.as_str(),
                 params.priority,
+                params.label.as_ref(),
             ],
         )
         .await?;
@@ -1012,6 +1072,9 @@ impl BoardStore {
             reporter: row.get::<String>(COL_TICKET_REPORTER)?,
             is_archived: row.get::<bool>(COL_TICKET_IS_ARCHIVED)?,
             priority: row.get::<i64>(COL_TICKET_PRIORITY)?,
+            label: row
+                .get::<String>(COL_TICKET_LABEL)?
+                .parse::<TicketLabel>()?,
             reviewed_head: row.get(COL_TICKET_REVIEWED_HEAD)?,
             reviewed_tree: row.get(COL_TICKET_REVIEWED_TREE)?,
             done_at: row.get(COL_TICKET_DONE_AT)?,

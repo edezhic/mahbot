@@ -443,6 +443,7 @@ mod tests {
                 prerequisites: Vec::new(),
                 reporter: "cli-test".to_string(),
                 priority: 1,
+                label: crate::pipeline::board::TicketLabel::Feat,
             })
             .await
             .expect("create the ticket the operations act on");
