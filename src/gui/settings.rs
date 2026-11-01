@@ -3163,7 +3163,6 @@ impl SettingsState {
         target: PasswordTarget,
         placeholder: &'static str,
         key: &'static str,
-        hint: Option<&'static str>,
         highlight: bool,
     ) -> Element<'a, SettingsMessage> {
         let field = format!("config:{key}");
@@ -3180,7 +3179,7 @@ impl SettingsState {
                 move |action| SettingsMessage::PasswordFieldAction { key, action },
                 SettingsMessage::TogglePasswordVisibility(target),
             ),
-            hint,
+            None,
             error,
         )
     }
@@ -3255,7 +3254,6 @@ impl SettingsState {
                 PasswordTarget::ProviderKey,
                 "sk-or-v1-...",
                 CONFIG_KEY_PROVIDER_KEY,
-                None,
                 api_key_unset,
             ),
             field_row(
@@ -3289,7 +3287,6 @@ impl SettingsState {
                 PasswordTarget::EndpointKey,
                 "Leave empty for keyless servers",
                 CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
-                None,
                 false,
             ));
         }
@@ -3670,9 +3667,6 @@ impl SettingsState {
                 PasswordTarget::DeepSeekKey,
                 "sk-...",
                 CONFIG_KEY_DEEPSEEK_KEY,
-                Some(
-                    "DeepSeek platform key for web search — not the OpenRouter key used by models"
-                ),
                 false,
             ),
             self.config_password_field(
@@ -3680,7 +3674,6 @@ impl SettingsState {
                 PasswordTarget::ExaKey,
                 "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
                 CONFIG_KEY_EXA_KEY,
-                None,
                 false,
             ),
             self.config_password_field(
@@ -3688,7 +3681,6 @@ impl SettingsState {
                 PasswordTarget::TelegramToken,
                 "123:abc",
                 CONFIG_KEY_TELEGRAM_BOT_TOKEN,
-                None,
                 false,
             ),
         ];
@@ -4017,7 +4009,7 @@ fn section_impl<'a>(
 /// Left pad aligning inline messages with a field row's input column (180px label + 8px).
 const FIELD_ROW_INLINE_PAD: f32 = 188.0;
 
-/// Label on the left, input on the right, optional hint below.
+/// Label on the left, input on the right, optional hint inline after the input.
 fn field_row<'a>(
     label: &'static str,
     input: Element<'a, SettingsMessage>,
