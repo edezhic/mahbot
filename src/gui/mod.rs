@@ -811,8 +811,8 @@ impl Dashboard {
     /// settles one, and after the last project is deleted it keeps naming that project while the
     /// map is empty. A failed read must not look like an empty map, so it leaves the bar and its
     /// failure report where they are. Hidden, the bar's content moves into the rail: voice status
-    /// under the nav icons, the running-agent indicators above the bottom nav
-    /// ([`Self::render_sidebar_mid`]), the update entry above Settings.
+    /// under the nav icons and the running-agent indicators above the bottom nav
+    /// ([`Self::render_sidebar_mid`]).
     fn footer_hidden(&self) -> bool {
         self.workspaces_error.is_none()
             && self
@@ -3027,24 +3027,6 @@ pub(crate) enum WindowAction {
     Close,
 }
 
-/// The update affordance both places draw: its wording, its action, and the colour its glyph
-/// takes there.
-struct UpdateControl {
-    color: iced::Color,
-    tooltip: String,
-    on_press: Option<Message>,
-}
-
-impl UpdateControl {
-    /// The glyph at `size`: each place draws it at its own.
-    fn glyph(&self, size: f32) -> Element<'static, Message> {
-        lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-            .size(size)
-            .color(self.color)
-            .into()
-    }
-}
-
 impl Dashboard {
     /// The rail: the window's own chrome where the title bar is hidden, the top nav icons, the
     /// voice status while the footer is hidden, the stretch in between
@@ -3061,7 +3043,7 @@ impl Dashboard {
         }
         let rail = container(
             col.push(Self::render_sidebar_mid(footer_hidden))
-                .push(self.render_sidebar_bottom_nav(footer_hidden)),
+                .push(self.render_sidebar_bottom_nav()),
         )
         .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
         .height(Length::Fill)
@@ -3221,14 +3203,11 @@ impl Dashboard {
     }
 
     /// The bottom nav icons ([`Page::sidebar_bottom_pages`]), with the self-update entry
-    /// directly above them while the footer is hidden — the only place the update is offered
-    /// with no bar to carry it.
-    fn render_sidebar_bottom_nav(&self, footer_hidden: bool) -> Element<'_, Message> {
+    /// directly above them — its only home.
+    fn render_sidebar_bottom_nav(&self) -> Element<'_, Message> {
         let mut col = Column::new().spacing(theme::SPACE_2);
-        if footer_hidden {
-            if let Some(entry) = Self::render_sidebar_update() {
-                col = col.push(entry);
-            }
+        if let Some(entry) = Self::render_sidebar_update() {
+            col = col.push(entry);
         }
         col = col.push(self.sidebar_nav_column(Page::sidebar_bottom_pages(), NavColumn::Bottom));
         col.into()
@@ -3444,14 +3423,14 @@ impl Dashboard {
         )
     }
 
-    /// The update affordance — tooltip and press (none while an update is in flight) — shared
-    /// by the footer button and the rail entry so the two never read as different controls.
-    /// `None` when no update is offered.
+    /// The rail's self-update entry, directly above the bottom nav (where Settings lives): the
+    /// refresh glyph at the rail's own glyph size, its tooltip and its press (none while an
+    /// update is in flight), or `None` when no update is offered.
     ///
     /// Visibility comes entirely from the shared availability cache, with no platform gate: a
     /// downloaded copy puts this system's ready-made file at the standard location everywhere,
     /// and replacing a file in use is the platform's own rename-aside.
-    fn update_control() -> Option<UpdateControl> {
+    fn render_sidebar_update() -> Option<Element<'static, Message>> {
         let availability = crate::self_update::update_availability();
         // Shown while an update is in flight even if `available` was transiently clobbered,
         // so "Updating…" is never hidden mid-update.
@@ -3467,35 +3446,14 @@ impl Dashboard {
             };
             (theme::ACCENT, tooltip, Some(Message::UpdateBot))
         };
-        Some(UpdateControl {
-            color,
+        let glyph = lucide::refresh_cw::<iced::Theme, iced::Renderer>()
+            .size(RAIL_ICON_SIZE)
+            .color(color)
+            .into();
+        Some(Self::sidebar_rail_item(
+            glyph,
             tooltip,
             on_press,
-        })
-    }
-
-    /// The self-update button in the footer bar, or `None` when it is not available.
-    fn render_update_button() -> Option<Element<'static, Message>> {
-        let control = Self::update_control()?;
-        Some(widgets::icon_tooltip_button(
-            control.glyph(theme::TEXT_24),
-            control.tooltip,
-            control.on_press,
-            theme::PAD_3,
-            theme::button_text,
-            tooltip::Position::Top,
-        ))
-    }
-
-    /// The same control in the rail, for a window whose footer is hidden — the only place an
-    /// update is offered then. Directly above the bottom nav (where Settings lives), at the
-    /// rail's own glyph size.
-    fn render_sidebar_update() -> Option<Element<'static, Message>> {
-        let control = Self::update_control()?;
-        Some(Self::sidebar_rail_item(
-            control.glyph(RAIL_ICON_SIZE),
-            control.tooltip,
-            control.on_press,
             RailEntry::Item,
         ))
     }
@@ -3865,14 +3823,11 @@ impl Dashboard {
         }
     }
 
-    /// The 42px footer bar: update/picker/toggle chrome and git on the left, active agents on
-    /// the right.
+    /// The 42px footer bar: picker/toggle chrome and git on the left, active agents on the
+    /// right.
     fn footer_view(&self) -> Element<'_, Message> {
-        let mut left_elements: Vec<Element<'_, Message>> = Vec::with_capacity(5);
+        let mut left_elements: Vec<Element<'_, Message>> = Vec::with_capacity(4);
 
-        if let Some(el) = Self::render_update_button() {
-            left_elements.push(el);
-        }
         if let Some(el) = self.render_workspace_picker() {
             left_elements.push(el);
         }
